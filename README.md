@@ -1,3 +1,5 @@
+
+
 # Kestrel（红隼）— RK3588 边缘 LLM 推理引擎
 
 **纯 C11、零第三方运行时依赖的 RK3588 (aarch64) 边缘 LLM 推理引擎。**
@@ -108,10 +110,12 @@ vllm_kestrel 是一个从零自研、面向边缘设备（RK3588 / 4×Cortex-A76
 ├── build_rk3588.sh            # RK3588 构建 + 自检入口
 ├── cmake/toolchain-aarch64-rk3588.cmake   # x86 主机交叉编译工具链
 ├── include/  src/             # C11 源码（common/core/media/model/npu/serve）
+│   ├── common/                # 通用设施（密码学国密、设备检测、平台抽象）
 │   ├── core/                  # 推理内核（NTT/FHE/CKKS/tp/matmul/attention…）
 │   ├── model/                 # 权重加载（VQF/GGUF/safetensors）、视觉、分词
-│   ├── serve/                 # HTTP/管理页/批处理/可验证推理(attest)
-│   └── media/                 # H.264/MP4 解码（独立模块，默认构建不启用）
+│   ├── media/                 # H.264/MP4 解码（独立模块，默认构建不启用）
+│   ├── npu/                   # NPU 直驱（/dev/rknpu）与 SDK 粘合层
+│   └── serve/                 # HTTP/管理页/批处理/可验证推理(attest)
 ├── tools/                     # 自研工具
 │   ├── gen_embedded_web.py    # HTML → 内嵌字节数组生成器
 │   ├── build_vocab_bin.py     # tokenizer.json → vocab.bin（字节解码修复版）
