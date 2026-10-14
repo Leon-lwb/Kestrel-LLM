@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>云端模型配置（可选）· vLLM-Kestrel 边缘云协调平台</title>
+<style>
+:root{--bg:#0f1419;--panel:#1a212b;--panel2:#202a36;--bd:#2c3a4a;--tx:#d7e0ea;--tx2:#8ea0b4;--acc:#4da3ff;--ok:#3ecf8e;--bad:#ff6b6b;--warn:#ffb020}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 "SF Mono",Consolas,"Microsoft YaHei",monospace}
+header{display:flex;align-items:center;gap:14px;padding:12px 20px;background:var(--panel);border-bottom:1px solid var(--bd)}
+header h1{font-size:16px;margin:0;font-weight:600}
+.badge{font-size:11px;border:1px solid var(--warn);color:var(--warn);border-radius:999px;padding:2px 9px}
+.navlink{color:var(--tx2);font-size:12px;text-decoration:none;border:1px solid var(--bd);border-radius:6px;padding:3px 10px}
+.navlink:hover{color:var(--acc);border-color:var(--acc)}
+main{display:grid;grid-template-columns:1fr 1fr;gap:14px;padding:14px 20px;max-width:1400px;margin:0 auto}
+@media(max-width:980px){main{grid-template-columns:1fr}}
+.card{background:var(--panel);border:1px solid var(--bd);border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:6px}
+.card.wide{grid-column:1/-1}
+.card h2{font-size:13px;margin:0 0 4px;color:var(--tx2);font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+label.fld{display:block;margin:6px 0}
+label.fld .t{display:flex;justify-content:space-between;font-size:12px;color:var(--tx2);margin-bottom:3px}
+input[type=text],select{width:100%;background:var(--panel2);border:1px solid var(--bd);color:var(--tx);border-radius:6px;padding:6px 8px;font-size:13px;font-family:inherit}
+button{background:var(--panel2);color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:7px 14px;font-size:13px;cursor:pointer;font-family:inherit}
+button:hover{border-color:var(--acc);color:var(--acc)}
+button.primary{background:var(--acc);border-color:var(--acc);color:#08131f}
+button.primary:hover{filter:brightness(1.1);color:#08131f}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px}
+.msg{padding:8px 10px;border-radius:6px;margin-top:8px;font-size:12px;display:none}
+.msg.show{display:block}
+.msg.ok{background:#14301f;color:var(--ok);border:1px solid #1f4a30}
+.msg.err{background:#33191c;color:var(--bad);border:1px solid #5c2c30}
+pre{background:#0a0e13;border:1px solid var(--bd);border-radius:8px;padding:10px;font-size:12px;color:var(--tx);overflow:auto;max-height:320px;white-space:pre-wrap;word-break:break-all;margin:6px 0 0}
+.note{font-size:11px;color:var(--tx2);line-height:1.6}
+.warnbox{border-left:3px solid var(--warn);background:#241d0e;padding:8px 10px;border-radius:0 6px 6px 0;font-size:12px;color:#f0d9a8}
+.small{font-size:11px;color:var(--tx2)}
+</style>
+</head>
+<body>
+<header>
+  <h1>云端模型配置</h1>
+  <span class="badge">可选功能</span>
+  <span style="flex:1"></span>
+  <a class="navlink" href="/admin/">← 返回管理页 /admin/</a>
+</header>
+<main>
+  <div class="card wide">
+    <h2>云端回退（Uplink）配置 · 保存后重启引擎生效</h2>
+    <div class="warnbox">
+      云端为<b>可选</b>能力，默认关闭（<code>never</code>）。开启后，边缘节点在
+      <b>模型未就绪</b>或<b>始终</b>两种策略下把 OpenAI 兼容请求转发到云端上游；
+      响应会显式带 <code>x-kestrel-source: cloud</code> 标记并记 <code>[UPLINK]</code> 日志，
+      <b>转发失败返回显式 502，绝不静默退回本地</b>。
+    </div>
+    <div class="grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px;margin-top:6px">
+      <label class="fld"><span class="t"><span>回退模式（--cloud-fallback）</span></span>
+        <select id="f_cloud_fallback">
+          <option value="never">never · 关闭（默认，云端不参与）</option>
+          <option value="on-unready">on-unready · 模型未就绪时回退云端</option>
+          <option value="always">always · 始终转发云端</option>
+        </select></label>
+      <label class="fld"><span class="t"><span>云端上游地址（--cloud-endpoint）</span></span>
+        <input type="text" id="f_cloud_endpoint" placeholder="http://192.168.1.10:8000（仅明文 http）"></label>
+      <label class="fld"><span class="t"><span>转发时覆盖模型名（--cloud-model，可空）</span></span>
+        <input type="text" id="f_cloud_model" placeholder="qwen3-30b（留空则透传客户端 model）"></label>
+    </div>
+    <div class="row">
+      <button class="primary" onclick="saveCfg()">保存配置（重启生效）</button>
+      <span class="small" id="cfgPath"></span>
+    </div>
+    <div class="msg" id="cfgMsg"></div>
+    <div class="note" style="margin-top:8px">
+      · 凭据（Bearer Key）<b>不写入 config.json</b>：请通过环境变量 <code>VLLM_CLOUD_KEY</code> 注入，避免明文落盘。<br>
+      · 边界（诚实）：出站客户端<b>只支持明文 http://</b>；<code>https://</code> 会返回显式 502。需 TLS 时，请在边缘侧部署反向代理/网关终止 TLS。
+    </div>
+  </div>
+
+  <div class="card wide">
+    <h2>连通性测试（POST /admin/api/cloud/test）</h2>
+    <div class="row" style="margin-top:0">
+      <button class="primary" onclick="runTest()">测试云端连通</button>
+      <span class="small">按上方表单值（未保存也可）向云端发一条 1-token 探针请求，验证地址/鉴权/模型是否可用。</span>
+    </div>
+    <div class="msg" id="testMsg"></div>
+    <pre id="testOut">（尚未测试）</pre>
+  </div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+function showMsg(el, text, ok){ el.textContent = text; el.className = "msg show " + (ok ? "ok" : "err"); }
+
+async function loadCfg(){
+  try{
+    const r = await fetch("/admin/api/config"); const j = await r.json();
+    const c = j.config || {};
+    if (c.cloud_fallback) $("f_cloud_fallback").value = c.cloud_fallback;
+    $("f_cloud_endpoint").value = c.cloud_endpoint || "";
+    $("f_cloud_model").value = c.cloud_model || "";
+    $("cfgPath").textContent = j.config_path ? ("配置文件: " + j.config_path) : "";
+  }catch(e){ showMsg($("cfgMsg"), "读取配置失败: " + e, false); }
+}
+async function saveCfg(){
+  const body = {
+    cloud_endpoint: $("f_cloud_endpoint").value.trim(),
+    cloud_model: $("f_cloud_model").value.trim(),
+    cloud_fallback: $("f_cloud_fallback").value
+  };
+  try{
+    const r = await fetch("/admin/api/config/patch", {method:"POST",
+      headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+    const j = await r.json();
+    showMsg($("cfgMsg"), j.error ? ("失败: " + j.error) : ("已保存到 " + j.path + "（重启引擎生效）"), !j.error);
+    loadCfg();
+  }catch(e){ showMsg($("cfgMsg"), "请求失败: " + e, false); }
+}
+async function runTest(){
+  const body = { endpoint: $("f_cloud_endpoint").value.trim() };
+  const m = $("f_cloud_model").value.trim(); if (m) body.model = m;
+  showMsg($("testMsg"), "测试中…", true);
+  $("testOut").textContent = "";
+  try{
+    const r = await fetch("/admin/api/cloud/test", {method:"POST",
+      headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+    const j = await r.json();
+    if (j.ok){
+      showMsg($("testMsg"), "连通 OK · HTTP " + j.status + " · " + (j.ms != null ? j.ms.toFixed(0) : "-") + " ms", true);
+    } else {
+      showMsg($("testMsg"), "失败：" + (j.error || ("HTTP " + j.status)), false);
+    }
+    $("testOut").textContent = j.raw || JSON.stringify(j, null, 2);
+  }catch(e){ showMsg($("testMsg"), "请求失败: " + e, false); }
+}
+
+loadCfg();
+</script>
+</body>
+</html>

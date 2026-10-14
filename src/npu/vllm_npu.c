@@ -56,7 +56,49 @@ int vllm_npu_gemm_gw(vllm_npu_t *npu, float *out,
     (void)G; (void)prec; (void)wkey;
     return 0;
 }
+int vllm_npu_gemm_gw_ex(vllm_npu_t *npu, float *out,
+                        const int8_t *Aq, const float *a_scale,
+                        const int8_t *Wq, const float *b_scale,
+                        int M, int N, int K, int G, int prec,
+                        uint64_t wkey, int nt_hint) {
+    (void)npu; (void)out; (void)Aq; (void)a_scale;
+    (void)Wq; (void)b_scale; (void)M; (void)N; (void)K;
+    (void)G; (void)prec; (void)wkey; (void)nt_hint;
+    return 0;
+}
 int vllm_npu_selftest(vllm_npu_t *npu) { (void)npu; return 0; }
+int vllm_npu_conv_i32(vllm_npu_t *npu, int32_t *out,
+                      const int8_t *feat_q, const int8_t *wq,
+                      int C_al, int Hband, int W, int KH, int KW,
+                      int stride, int pad, int OH_band, int OW, int OC,
+                      int OC_off, int wbank_hint) {
+    (void)npu; (void)out; (void)feat_q; (void)wq; (void)C_al; (void)Hband;
+    (void)W; (void)KH; (void)KW; (void)stride; (void)pad; (void)OH_band;
+    (void)OW; (void)OC; (void)OC_off; (void)wbank_hint;
+    return -1;   /* no NPU on the x86/Windows stub */
+}
+/* K-YOLO-003：整网 RKNN（x86/Windows 无 librknnrt ⇒ 一律不可用，调用方回退）。 */
+vllm_npu_rknn *vllm_npu_rknn_open(vllm_npu_t *npu, const char *path, int core_mask) {
+    (void)npu; (void)path; (void)core_mask;
+    return NULL;
+}
+void vllm_npu_rknn_close(vllm_npu_rknn *m) { (void)m; }
+int vllm_npu_rknn_sdk(const vllm_npu_rknn *m, char *buf, int len) {
+    (void)m; if (buf && len > 0) buf[0] = '\0'; return -1;
+}
+int vllm_npu_rknn_input_hwc(const vllm_npu_rknn *m, int *h, int *w, int *c) {
+    (void)m; (void)h; (void)w; (void)c; return -1;
+}
+int vllm_npu_rknn_n_outputs(const vllm_npu_rknn *m) { (void)m; return -1; }
+int vllm_npu_rknn_output_dims(const vllm_npu_rknn *m, int i,
+                              int *n_dims, int *dims, int max_dims) {
+    (void)m; (void)i; (void)n_dims; (void)dims; (void)max_dims; return -1;
+}
+void vllm_npu_rknn_dump(const vllm_npu_rknn *m) { (void)m; }
+int vllm_npu_rknn_run(vllm_npu_rknn *m, const uint8_t *in,
+                      float **out_data, int *out_nelems) {
+    (void)m; (void)in; (void)out_data; (void)out_nelems; return -1;
+}
 #else
 
 #include "vllm_npu.h"
@@ -75,57 +117,98 @@ int vllm_npu_selftest(vllm_npu_t *npu) { (void)npu; return 0; }
 /* ================================================================
  * RKNN ABI (field-order compatible with rknn_api.h - do not reorder)
  * ================================================================ */
-typedef int32_t rknn_context_t;
+/* rknn_context：官方头在 32 位 ARM 上是 uint32，其余（含 aarch64/x86_64）是
+ * uint64。旧版固定 int32 ⇒ rknn_init 写 8 字节破坏栈、ctx 被截断（K-YOLO-003 修正）。 */
+#if defined(__arm__) && !defined(__aarch64__)
+typedef uint32_t rknn_context_t;
+#else
+typedef uint64_t rknn_context_t;
+#endif
 
+/* Query commands — values match rknn_api.h v2.3.2 (K-YOLO-003 修正：
+ * 旧表把 SDK_VERSION 当 0，实际 0=IN_OUT_NUM，导致版本查询取错结构）。 */
 typedef enum {
-    RKNN_QUERY_SDK_VERSION = 0,
-    RKNN_QUERY_CORE_COUNT   = 1
+    RKNN_QUERY_IN_OUT_NUM   = 0,
+    RKNN_QUERY_INPUT_ATTR   = 1,
+    RKNN_QUERY_OUTPUT_ATTR  = 2,
+    RKNN_QUERY_PERF_RUN     = 4,
+    RKNN_QUERY_SDK_VERSION  = 5
 } rknn_query_cmd_t;
 
+/* Tensor data types — official order (旧表 INT16/UINT8 互换，已修正). */
 typedef enum {
     RKNN_TENSOR_FLOAT32 = 0,
     RKNN_TENSOR_FLOAT16 = 1,
     RKNN_TENSOR_INT8    = 2,
-    RKNN_TENSOR_INT16   = 3,
-    RKNN_TENSOR_UINT8   = 4,
+    RKNN_TENSOR_UINT8   = 3,
+    RKNN_TENSOR_INT16   = 4,
     RKNN_TENSOR_UINT16  = 5,
-    RKNN_TENSOR_BOOL    = 6,
-    RKNN_TENSOR_INT64   = 7
+    RKNN_TENSOR_INT32   = 6,
+    RKNN_TENSOR_UINT32  = 7,
+    RKNN_TENSOR_INT64   = 8,
+    RKNN_TENSOR_BOOL    = 9
 } rknn_tensor_type_t;
 
+/* Tensor layouts — official order NCHW=0 / NHWC=1 (旧表两者颠倒，已修正). */
 typedef enum {
-    RKNN_TENSOR_NHWC = 0,
-    RKNN_TENSOR_NCHW = 1
+    RKNN_TENSOR_NCHW      = 0,
+    RKNN_TENSOR_NHWC      = 1,
+    RKNN_TENSOR_NC1HWC2   = 2,
+    RKNN_TENSOR_UNDEFINED = 3
 } rknn_tensor_format_t;
 
-typedef struct {                /* rknn_input */
+/* rknn_input (v2.3.2)：{index, buf, size, pass_through, type, fmt}
+ * （旧表把 attr 塞进结构且顺序不同，已按官方头修正。） */
+typedef struct {
     uint32_t index;
-    void     *buf;
+    void    *buf;
     uint32_t size;
+    uint8_t  pass_through;
+    rknn_tensor_type_t   type;
     rknn_tensor_format_t fmt;
-    rknn_tensor_type_t  type;
-    void     *attr;             /* rknn_tensor_attr* (unused, may be NULL) */
-    uint32_t pass_through;
 } rknn_input_t;
 
-typedef struct {                /* rknn_output */
+/* rknn_output (v2.3.2)：{want_float, is_prealloc, index, buf, size}
+ * （旧表多出 pass_through/align_size/attr 三个字段，与官方头不符，已修正。） */
+typedef struct {
     uint8_t  want_float;
     uint8_t  is_prealloc;
-    uint8_t  pass_through;
-    uint8_t  align_size;
     uint32_t index;
-    uint32_t size;
     void    *buf;
-    void    *attr;
+    uint32_t size;
 } rknn_output_t;
 
-typedef struct {                /* rknn_sdk_version (query SDK_VERSION) */
-    int    major;
-    int    minor;
-    int    micro;
-    char   api_version[256];
-    char   driver_version[256];
+/* rknn_sdk_version (v2.3.2)：两个定长字符串（旧表多了 3 个 int，已修正）。 */
+typedef struct {
+    char api_version[256];
+    char drv_version[256];
 } rknn_sdk_version_t;
+
+/* rknn_input_output_num (v2.3.2)。 */
+typedef struct {
+    uint32_t n_input;
+    uint32_t n_output;
+} rknn_input_output_num_t;
+
+/* rknn_tensor_attr (v2.3.2) — 供整网模型查询输入/输出几何。 */
+typedef struct {
+    uint32_t index;
+    uint32_t n_dims;
+    uint32_t dims[16];
+    char     name[256];
+    uint32_t n_elems;
+    uint32_t size;
+    rknn_tensor_format_t fmt;
+    rknn_tensor_type_t   type;
+    uint32_t qnt_type;
+    int8_t   fl;
+    int32_t  zp;
+    float    scale;
+    uint32_t w_stride;
+    uint32_t size_with_stride;
+    uint8_t  pass_through;
+    uint32_t h_stride;
+} rknn_tensor_attr_t;
 
 typedef int32_t rknn_npu_core_mask_t;
 
@@ -235,8 +318,8 @@ int vllm_npu_init(vllm_npu_t **out, const vllm_npu_cfg_t *cfg) {
                 rknn_sdk_version_t ver;
                 memset(&ver, 0, sizeof(ver));
                 if (n->api.rknn_query(0, RKNN_QUERY_SDK_VERSION, &ver, sizeof(ver)) == 0) {
-                    snprintf(n->sdk_version, sizeof(n->sdk_version), "%d.%d.%d %s",
-                             ver.major, ver.minor, ver.micro, ver.api_version);
+                    snprintf(n->sdk_version, sizeof(n->sdk_version), "%s (drv %s)",
+                             ver.api_version, ver.drv_version);
                 } else {
                     snprintf(n->sdk_version, sizeof(n->sdk_version), "queried");
                 }
@@ -292,6 +375,15 @@ int vllm_npu_gemm_gw(vllm_npu_t *n, float *out,
                      const int8_t *Wq, const float *b_scale,
                      int M, int N, int K, int G, int prec,
                      uint64_t wkey) {
+    return vllm_npu_gemm_gw_ex(n, out, Aq, a_scale, Wq, b_scale,
+                               M, N, K, G, prec, wkey, 0);
+}
+
+int vllm_npu_gemm_gw_ex(vllm_npu_t *n, float *out,
+                        const int8_t *Aq, const float *a_scale,
+                        const int8_t *Wq, const float *b_scale,
+                        int M, int N, int K, int G, int prec,
+                        uint64_t wkey, int nt_hint) {
     /* Diagnostic: VLLM_NPU_FORCE_CPU=1 keeps the NPU initialized but makes
      * every offload point fall back to the CPU - separates "NPU init side
      * effect" from "NPU output used" as the source of a wrong result. */
@@ -307,8 +399,21 @@ int vllm_npu_gemm_gw(vllm_npu_t *n, float *out,
         return 0;
 
     int rc = vllm_npu_direct_gemm_gw(n->direct, out, Aq, a_scale, Wq, b_scale,
-                                     M, N, K, G, prec, wkey);
+                                     M, N, K, G, prec, wkey, nt_hint);
     return (rc == 0) ? 1 : 0;   /* -2 (uncalibrated regcmd) -> CPU fallback */
+}
+
+int vllm_npu_conv_i32(vllm_npu_t *n, int32_t *out,
+                      const int8_t *feat_q, const int8_t *wq,
+                      int C_al, int Hband, int W, int KH, int KW,
+                      int stride, int pad, int OH_band, int OW, int OC,
+                      int OC_off, int wbank_hint) {
+    if (getenv("VLLM_NPU_FORCE_CPU")) return -1;
+    if (!n || !n->ok || n->backend != VLLM_NPU_BACKEND_DIRECT || !n->direct)
+        return -1;
+    return vllm_npu_direct_conv_i32(n->direct, out, feat_q, wq, C_al, Hband, W,
+                                    KH, KW, stride, pad, OH_band, OW, OC,
+                                    OC_off, wbank_hint);
 }
 
 /* ================================================================
@@ -444,6 +549,169 @@ int vllm_npu_gemm_i8(vllm_npu_t *n, float *out,
     if (n->api.rknn_outputs_get(m->ctx, 1, outd, NULL) != 0) return 0;
     n->api.rknn_outputs_release(m->ctx, 1, outd);
     return 1;
+}
+
+/* ================================================================
+ * K-YOLO-003：整网 RKNN 模型（官方 .rknn 检测路径，opt-in 第二路径）
+ *
+ * 复用上面 dlopen 出来的 librknnrt 函数表，加载 Rockchip 官方**整网** .rknn
+ * （如 rknn_model_zoo 的 yolov8.rknn），喂 uint8 NHWC 图像、取回 N 个 fp32 输出；
+ * 家族化的解码/NMS 留在 YOLO 层（本层只管张量）。
+ * 与 DIRECT/VQF 默认路径并存：打不开就返回 NULL，调用方显式回退，绝不静默降级。
+ * ================================================================ */
+struct vllm_npu_rknn {
+    rknn_api_t         *api;
+    rknn_context_t      ctx;
+    int                 n_in, n_out;
+    int                 in_h, in_w, in_c;
+    rknn_tensor_attr_t *out_attr;      /* [n_out] */
+    char                sdk[160];
+};
+
+vllm_npu_rknn *vllm_npu_rknn_open(vllm_npu_t *n, const char *path, int core_mask) {
+    if (!n || !n->ok || !path || !n->api.rknn_init) return NULL;
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "[RKNN-YOLO] cannot open %s\n", path); return NULL; }
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (sz <= 0) { fclose(f); return NULL; }
+    void *mb = malloc((size_t)sz);
+    if (!mb) { fclose(f); return NULL; }
+    if (fread(mb, 1, (size_t)sz, f) != (size_t)sz) { free(mb); fclose(f); return NULL; }
+    fclose(f);
+
+    vllm_npu_rknn *m = (vllm_npu_rknn *)calloc(1, sizeof(*m));
+    if (!m) { free(mb); return NULL; }
+    m->api = &n->api;
+    if (n->api.rknn_init(&m->ctx, mb, (uint32_t)sz, 0, NULL) != 0) {
+        fprintf(stderr, "[RKNN-YOLO] rknn_init failed: %s\n", path);
+        free(mb); free(m); return NULL;
+    }
+    free(mb);   /* rknn_init copies the model */
+    if (n->api.rknn_set_core_mask && core_mask != 0)
+        n->api.rknn_set_core_mask(m->ctx, (rknn_npu_core_mask_t)core_mask);
+
+    rknn_sdk_version_t ver; memset(&ver, 0, sizeof(ver));
+    if (n->api.rknn_query(m->ctx, RKNN_QUERY_SDK_VERSION, &ver, sizeof(ver)) == 0)
+        snprintf(m->sdk, sizeof(m->sdk), "%s (drv %s)", ver.api_version, ver.drv_version);
+
+    rknn_input_output_num_t ioc; memset(&ioc, 0, sizeof(ioc));
+    if (n->api.rknn_query(m->ctx, RKNN_QUERY_IN_OUT_NUM, &ioc, sizeof(ioc)) != 0 ||
+        ioc.n_input < 1 || ioc.n_output < 1) {
+        fprintf(stderr, "[RKNN-YOLO] IN_OUT_NUM query failed\n");
+        n->api.rknn_destroy(m->ctx); free(m); return NULL;
+    }
+    m->n_in = (int)ioc.n_input;
+    m->n_out = (int)ioc.n_output;
+
+    rknn_tensor_attr_t ia; memset(&ia, 0, sizeof(ia));
+    if (n->api.rknn_query(m->ctx, RKNN_QUERY_INPUT_ATTR, &ia, sizeof(ia)) == 0 && ia.n_dims == 4) {
+        m->in_h = (int)ia.dims[1]; m->in_w = (int)ia.dims[2]; m->in_c = (int)ia.dims[3];
+    }
+    if (m->in_h <= 0 || m->in_w <= 0 || m->in_c != 3) {
+        fprintf(stderr, "[RKNN-YOLO] unsupported input geometry (h=%d w=%d c=%d)\n",
+                m->in_h, m->in_w, m->in_c);
+        n->api.rknn_destroy(m->ctx); free(m); return NULL;
+    }
+
+    m->out_attr = (rknn_tensor_attr_t *)calloc((size_t)m->n_out, sizeof(*m->out_attr));
+    if (!m->out_attr) { n->api.rknn_destroy(m->ctx); free(m); return NULL; }
+    for (int i = 0; i < m->n_out; i++) {
+        m->out_attr[i].index = (uint32_t)i;
+        if (n->api.rknn_query(m->ctx, RKNN_QUERY_OUTPUT_ATTR,
+                              &m->out_attr[i], sizeof(m->out_attr[i])) != 0)
+            m->out_attr[i].n_dims = 0;
+    }
+    fprintf(stderr, "[RKNN-YOLO] full-network model ready: %s "
+            "(in %dx%dx%d, %d outputs, sdk %s)\n",
+            path, m->in_h, m->in_w, m->in_c, m->n_out,
+            m->sdk[0] ? m->sdk : "?");
+    return m;
+}
+
+void vllm_npu_rknn_close(vllm_npu_rknn *m) {
+    if (!m) return;
+    if (m->api && m->api->rknn_destroy) m->api->rknn_destroy(m->ctx);
+    free(m->out_attr);
+    free(m);
+}
+
+int vllm_npu_rknn_sdk(const vllm_npu_rknn *m, char *buf, int len) {
+    if (!m || !buf || len <= 0) return -1;
+    int l = (int)strlen(m->sdk);
+    if (l >= len) l = len - 1;
+    memcpy(buf, m->sdk, (size_t)l); buf[l] = 0;
+    return l;
+}
+
+int vllm_npu_rknn_input_hwc(const vllm_npu_rknn *m, int *h, int *w, int *c) {
+    if (!m) return -1;
+    if (h) *h = m->in_h;
+    if (w) *w = m->in_w;
+    if (c) *c = m->in_c;
+    return 0;
+}
+
+int vllm_npu_rknn_n_outputs(const vllm_npu_rknn *m) { return m ? m->n_out : -1; }
+
+int vllm_npu_rknn_output_dims(const vllm_npu_rknn *m, int i,
+                              int *n_dims, int *dims, int max_dims) {
+    if (!m || i < 0 || i >= m->n_out) return -1;
+    if (n_dims) *n_dims = (int)m->out_attr[i].n_dims;
+    if (dims) {
+        int nd = (int)m->out_attr[i].n_dims;
+        if (nd > max_dims) nd = max_dims;
+        for (int j = 0; j < nd; j++) dims[j] = (int)m->out_attr[i].dims[j];
+    }
+    return 0;
+}
+
+void vllm_npu_rknn_dump(const vllm_npu_rknn *m) {
+    if (!m) return;
+    fprintf(stderr, "[RKNN-YOLO] input %dx%dx%d (NHWC uint8); %d outputs:\n",
+            m->in_h, m->in_w, m->in_c, m->n_out);
+    for (int i = 0; i < m->n_out; i++) {
+        const rknn_tensor_attr_t *a = &m->out_attr[i];
+        fprintf(stderr, "[RKNN-YOLO]   OUT[%d] nd=%u dims=", i, a->n_dims);
+        for (uint32_t j = 0; j < a->n_dims && j < 8; j++) fprintf(stderr, "%u ", a->dims[j]);
+        fprintf(stderr, "nelems=%u zp=%d scale=%g\n", a->n_elems, a->zp, a->scale);
+    }
+}
+
+int vllm_npu_rknn_run(vllm_npu_rknn *m, const uint8_t *in,
+                      float **out_data, int *out_nelems) {
+    if (!m || !in || !out_data || !out_nelems) return -1;
+    rknn_input_t inrec; memset(&inrec, 0, sizeof(inrec));
+    inrec.index        = 0;
+    inrec.buf          = (void *)in;
+    inrec.size         = (uint32_t)(m->in_h * m->in_w * m->in_c);
+    inrec.pass_through = 0;                       /* RKNN 自行量化 */
+    inrec.type         = RKNN_TENSOR_UINT8;
+    inrec.fmt          = RKNN_TENSOR_NHWC;
+    if (m->api->rknn_inputs_set(m->ctx, 1, &inrec) != 0) return -2;
+    if (m->api->rknn_run(m->ctx, NULL) != 0) return -3;
+
+    rknn_output_t *outs = (rknn_output_t *)calloc((size_t)m->n_out, sizeof(rknn_output_t));
+    if (!outs) return -4;
+    for (int i = 0; i < m->n_out; i++) {
+        outs[i].index       = (uint32_t)i;
+        outs[i].want_float  = 1;                  /* 取 fp32，省去手写 dequant */
+        outs[i].is_prealloc = 0;
+    }
+    if (m->api->rknn_outputs_get(m->ctx, (uint32_t)m->n_out, outs, NULL) != 0) {
+        free(outs); return -5;
+    }
+    int rc = 0;
+    for (int i = 0; i < m->n_out; i++) {
+        int ne = (int)(outs[i].size / 4);
+        float *d = (float *)malloc((size_t)(ne > 0 ? ne : 1) * sizeof(float));
+        if (!d) { rc = -6; break; }
+        if (ne > 0 && outs[i].buf) memcpy(d, outs[i].buf, (size_t)ne * sizeof(float));
+        out_data[i] = d;
+        out_nelems[i] = ne;
+    }
+    m->api->rknn_outputs_release(m->ctx, (uint32_t)m->n_out, outs);
+    free(outs);
+    return rc;
 }
 
 /* ================================================================

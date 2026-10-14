@@ -100,6 +100,31 @@ typedef struct VLLMServerCtx {
      * caller so /admin can report and persist the engine's core config
      * without reaching into main.c statics). */
     const char *model_dir;     /* --model path (may be repointed to model_dir_buf) */
+    const char *laya_pack;     /* --laya-pack dir (K-LAYA-001): enables POST /v1/systemone
+                                * (independent ModernBERT decision path; NULL = route off) */
+    const char *yolo_model;    /* --yolo-model <x.vqf> (K-YOLO-001): enables POST /v1/detect
+                                * (independent detection path, own VQF v4; NULL = route off) */
+    int         yolo_backend;  /* K-YOLO-003: 0 = VQF v4（默认）, 1 = 官方 .rknn（opt-in） */
+    struct vllm_npu_s *yolo_npu; /* yolo_backend==1 时的 RKNN 句柄（librknnrt）；否则 NULL */
+    int         yolo_core_mask;  /* RKNN core mask（0 = runtime 默认） */
+    /* K-ADMIN-001 配置管理页回填：这些是 CLI-only 项，引擎不消费但需在 /admin 可见 */
+    const char *yolo_rknn_lib;   /* --rknn-lib <librknnrt.so> */
+    float       yolo_conf, yolo_iou; /* --yolo-conf / --yolo-iou（0 = 引擎内置默认） */
+    /* K-E2E-005 视频源检测：默认视频源 + 单次抽帧帧数 + 常驻拉流间隔 */
+    const char *yolo_video_src;        /* --yolo-video-src：file|dir|http://|rtsp://（NULL = 未配，请求必须带 source） */
+    int         yolo_video_frames;     /* --yolo-video-frames：/v1/detect_video 默认帧数（0 = 8） */
+    int         yolo_video_interval_ms;/* --yolo-video-interval-ms：常驻拉流抽帧间隔（0 = 500） */
+    const char *kb_root;         /* --kb-root：知识库根目录（管理页浏览/新建 .vkb） */
+    /* 云边协同：云端上游回退（--cloud-endpoint 等）。默认关，零回归；
+     * 触发时**显式**标记 x-kestrel-source: cloud 并记 [UPLINK] 日志，禁止静默。 */
+    const char *cloud_endpoint;  /* --cloud-endpoint http://host[:port]（NULL = 关，明文 http 仅） */
+    const char *cloud_model;     /* --cloud-model：转发时覆盖的 model 名（可选） */
+    const char *cloud_key;       /* --cloud-key：Authorization: Bearer 令牌（可选） */
+    int         cloud_fallback;  /* --cloud-fallback 0=never(默认) 1=on-unready 2=always */
+    /* 拒答与转人工（K-E2E-003→K-E2E-004）：证据不足时拒绝作答并可回调外部工单系统。
+     * 默认关（kb_abstain=0 且 handoff_url=NULL），零回归。 */
+    float       kb_abstain;      /* --kb-abstain <ev_min>（0 = 关；>0 时 /v1/rag 证据分低于此值即拒答） */
+    const char *handoff_url;     /* --handoff-url http://host/path：拒答/escalate 时 POST 通知（NULL = 不回调） */
     char   model_dir_buf[1024];/* writable copy set by /admin/api/model/load (portable
                                 * manual-load mode: the packaged exe may start with no
                                 * model on disk; the admin page supplies the path) */
@@ -244,6 +269,20 @@ typedef struct VLLMServerCtx {
      * 升降档。默认值由 vllm_res_defaults 装配；动作在 policy tick / admin
      * API 中以 inf_lock 串行执行（与推理互斥）。 */
     VLLMResPolicy res;
+
+    /* K-COLLAB-001 P2：专用 embedding 模型槽位（最小 2 槽位：主 chat + 专用
+     * embedding 两个 causal-LM 推理状态共存）。--embed-model <dir> 非空时，
+     * /v1/embeddings 用独立 tok/ist/w/cfg 出向量（与主 chat 解耦）；为 NULL
+     * 时回退主模型（现有行为，零回归）。embedding 与 chat 共用 inf_lock 串行，
+     * embed_lock 仅保护本槽位的加载/释放。 */
+    const char *embed_model_dir;  /* --embed-model <dir>（NULL = 复用主模型） */
+    STModelWeights       *embed_w;
+    STModelConfig        *embed_cfg;
+    QwenTokenizer        *embed_tok;
+    STQwenInferenceState *embed_ist;
+    pthread_mutex_t       embed_lock;
+    int                   embed_loaded;   /* 0=未加载 1=就绪 -1=失败 */
+    char                  embed_error[256];
 } VLLMServerCtx;
 
 /* One on-disk KV checkpoint registered in ctx->dkv. */
@@ -289,6 +328,13 @@ int vllm_serve_unload_model_self(VLLMServerCtx *ctx);
  * background load if needed and waits for it to finish. Returns 0 = ready,
  * -1 = cannot load (no model_dir / load failed). Impl in main.c. */
 int vllm_serve_load_on_use(VLLMServerCtx *ctx);
+
+/* K-ADMIN-001：管理面复用的「单条文本 → embedding 向量」入口。
+ * 与 /v1/rag 同路径（专用 --embed-model 槽位，缺省复用主模型；内部取 inf_lock
+ * 与推理串行）。out 须至少容纳 dim 个 float（dim 由模型决定，调用方按 1024 预留）。
+ * 返回实际维度（>0）成功；负值失败（-1 参数/-2 模型未就绪/-3 忙/-4 加载失败）。
+ * Impl in vllm_server.c。 */
+int vllm_serve_embed_text(VLLMServerCtx *ctx, const char *txt, float *out);
 
 /* Free the server-side session state tied to the loaded model: continuous
  * batching scheduler, the in-RAM prefix-KV sequence (last_ids) and the disk

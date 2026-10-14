@@ -553,11 +553,14 @@ static int run_convert(const char *model_dir, const char *out) {
         int q_out = cfg.n_heads * cfg.head_dim;
         int k_out = cfg.n_kv_heads * cfg.head_dim;
         int wm = g_wmode;
-        /* M4 (Q4 4x4)：任一 Q4 矩阵几何不满足 vc/q_out/k_out%4 且 dim/ff%32
-         * 则全局禁用（引擎 2669-2672）。 */
-        if (!(vc % 4 == 0 && q_out % 4 == 0 && k_out % 4 == 0 &&
-              dim % 32 == 0 && ff % 32 == 0))
-            g_st_q4_repack = 0;
+        (void)vc; (void)q_out; (void)k_out; (void)dim; (void)ff;
+        /* M4 (Q4 4x4)：引擎**不做全局几何门**——g_st_q4_repack 恒为 1（vqf.c
+         * vqf_cur_flags 据此要求文件带 VQF_FLAG_Q4_4X4），只在内核调用处按
+         * (rows & 3) == 0 逐矩阵门控（如 lm_head 行数 vocab%4≠0 时退回 legacy）。
+         * 故转换器也必须**保持全局标志为 1**，否则奇数 vocab（如
+         * Qwen3-Embedding-0.6B, vocab=151669）会写出 flags 缺 Q4_4X4 的文件，
+         * 被引擎 vqf_load 的 layout 校验拒绝。逐矩阵 repack_q4_0_4x4_inplace
+         * 自带 rows%4/cols%32 门控，几何不合的矩阵自动跳过，与引擎一致。 */
         /* M4e (Q8 tiled)：wm3(q4i) 预解包 int8，repack 永不适用（引擎 2700）；
          * 否则 VLLM_DISABLE_Q8_REPACK 显式关闭；几何按 8x8(默认) 或 4x4
          * (VLLM_Q8_8X8=0) 门控（引擎 2702-2713）。 */
@@ -932,9 +935,8 @@ static int run_convert_stream(const char *model_dir, const char *out) {
         int dim = cfg.dim, ff = cfg.ffn_dim, vc = cfg.vocab_size;
         int q_out = cfg.n_heads * cfg.head_dim;
         int k_out = cfg.n_kv_heads * cfg.head_dim;
-        if (!(vc % 4 == 0 && q_out % 4 == 0 && k_out % 4 == 0 &&
-              dim % 32 == 0 && ff % 32 == 0))
-            g_st_q4_repack = 0;
+        (void)vc; (void)q_out; (void)k_out; (void)dim; (void)ff;
+        /* Q4 4x4：与引擎一致不做全局几何门（见 run_convert 同段注释）。 */
         if (wm == 3) {
             g_st_q8_repack = 0;
         } else if (g_st_q8_repack) {

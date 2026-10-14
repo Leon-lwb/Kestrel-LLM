@@ -308,6 +308,7 @@ enum {
 #define CNA_CONV_CON1          0x100C
 #define CNA_CONV_CON2          0x1010
 #define CNA_CONV_CON3          0x1014
+#define CNA_CONV_CON4          0x1018
 #define CNA_DATA_SIZE0         0x1020
 #define CNA_DATA_SIZE1         0x1024
 #define CNA_DATA_SIZE2         0x1028
@@ -490,6 +491,22 @@ struct vllm_npu_direct_s {
     uint8_t *wq_packed;         /* full-N NPU layout (N rows), NULL = none */
     size_t  wq_packed_cap;      /* allocated bytes */
     size_t  wq_packed_bytes;
+    /* Per-call GEMM scratch (cacheable CPU buffers, grown on demand). These
+     * were malloc/free'd per conv call; glibc serves >128 KB via mmap/munmap,
+     * so 3 alloc+free pairs per conv cost syscalls on the hot path (setup was
+     * 25 ms of a 63-conv forward, K-YOLO-001 §9 #4). Keep them resident. */
+    int8_t  *sc_apad;  size_t sc_apad_cap;
+    void    *sc_tbuf;  size_t sc_tbuf_cap;
+    int32_t *sc_tmps;  size_t sc_tmps_cap;
+    /* Per-call GEMM BOs, kept resident and REUSED across conv calls (each
+     * vllm_npu_direct_bo_alloc is a MEM_CREATE + MEM_MAP ioctl + mmap and the
+     * M2 path allocates 3 per conv = 189 allocs / forward ~= 20 ms of setup,
+     * K-YOLO-001 §9 #4). Ownership MOVES into the locals for the duration of a
+     * call (the cache is emptied on entry) and MOVES back on the success path,
+     * so no error path can leave a dangling cached mapping. */
+    vllm_npu_bo_t cbo_in, cbo_w, cbo_out;
+    size_t   cbo_in_cap, cbo_w_cap, cbo_out_cap;
+    uint32_t cbo_in_fl, cbo_w_fl, cbo_out_fl;
     /* Persistent weight-BO cache (shared-input fusion): full-N packed weights
      * pre-uploaded into cacheable BOs and reused across gemm_gw calls (decode
      * walks the same layers every token, so the weights are a shared input
@@ -515,6 +532,12 @@ struct vllm_npu_direct_s {
      * (correctness over offload) instead of blindly retrying on a wedged
      * device. */
     int broken;
+
+    /* M3 Phase-2 native-conv scratch BOs (grown on demand, reused across the
+     * bands/OC-blocks of a convolution so a per-band submit does not pay a
+     * fresh GEM alloc + mmap). */
+    vllm_npu_bo_t conv_in_bo, conv_w_bo, conv_out_bo;
+    size_t        conv_in_cap, conv_w_cap, conv_out_cap;
 };
 
 /* DRM backend helpers --------------------------------------------------- */
@@ -707,6 +730,13 @@ void vllm_npu_direct_close(vllm_npu_direct_t *d) {
         d->cache_ok = 0;
     }
     free(d->wq_packed); d->wq_packed = NULL; d->wq_packed_cap = 0;
+    free(d->sc_apad); d->sc_apad = NULL; d->sc_apad_cap = 0;
+    free(d->sc_tbuf); d->sc_tbuf = NULL; d->sc_tbuf_cap = 0;
+    free(d->sc_tmps); d->sc_tmps = NULL; d->sc_tmps_cap = 0;
+    /* Per-call GEMM BO reuse cache (npu_bo_acquire/release). */
+    if (d->cbo_in.mapped)  { vllm_npu_direct_bo_free(d, &d->cbo_in);  d->cbo_in_cap = 0;  d->cbo_in_fl = 0; }
+    if (d->cbo_w.mapped)   { vllm_npu_direct_bo_free(d, &d->cbo_w);   d->cbo_w_cap = 0;   d->cbo_w_fl = 0; }
+    if (d->cbo_out.mapped) { vllm_npu_direct_bo_free(d, &d->cbo_out); d->cbo_out_cap = 0; d->cbo_out_fl = 0; }
     if (d->wc) {
         for (int i = 0; i < d->wc_n; i++)
             vllm_npu_direct_bo_free(d, &d->wc[i].bo);
@@ -808,6 +838,50 @@ void vllm_npu_direct_bo_free(vllm_npu_direct_t *d, vllm_npu_bo_t *bo) {
             ioctl(d->fd, RKNPU_FREE_MEM, &m);
         }
     }
+    memset(bo, 0, sizeof(*bo));
+}
+
+/* ----------------------------------------------------------------
+ * Per-call GEMM BO reuse.
+ *
+ * The M2 GEMM path allocates 3 BOs per conv (bo_in/bo_w/bo_out) and frees
+ * them at the end. Each alloc is a MEM_CREATE + MEM_MAP ioctl + mmap, so on
+ * a YOLO forward (~63 conv calls) that is ~189 create/destroy round trips of
+ * pure driver/setup overhead (K-YOLO-001 §9 #4). We keep the last-used BO for
+ * each of the 3 slots resident on the device struct and hand it back when its
+ * mapped capacity and memory flags still match the next request.
+ *
+ * MOVE semantics: acquire MOVES the cached BO into *bo and empties the cache
+ * slot, so any early-error return in the caller that frees *bo simply destroys
+ * it - the cache can never hold a dangling mapping. release is only called on
+ * the success path and MOVES *bo back into the cache. The cache is owned by
+ * the device and torn down in vllm_npu_direct_close().
+ *
+ * Capacity is tracked as the BO's actual mapped size (>= requested), so a
+ * later call that needs less still reuses it.
+ * ---------------------------------------------------------------- */
+static int npu_bo_acquire(vllm_npu_direct_t *d, vllm_npu_bo_t *cache,
+                          size_t *cache_cap, uint32_t *cache_fl,
+                          vllm_npu_bo_t *bo, size_t need, uint32_t flags) {
+    memset(bo, 0, sizeof(*bo));
+    if (cache->mapped && *cache_cap >= need && *cache_fl == flags) {
+        *bo = *cache;
+        memset(cache, 0, sizeof(*cache));
+        *cache_cap = 0; *cache_fl = 0;
+        return 0;
+    }
+    if (cache->mapped) { vllm_npu_direct_bo_free(d, cache); *cache_cap = 0; *cache_fl = 0; }
+    return vllm_npu_direct_bo_alloc_ex(d, bo, need, flags);
+}
+
+static void npu_bo_release(vllm_npu_direct_t *d, vllm_npu_bo_t *bo,
+                           vllm_npu_bo_t *cache, size_t *cache_cap,
+                           uint32_t *cache_fl, uint32_t flags) {
+    if (!bo->mapped) return;                 /* e.g. bo_w aliased to a cached weight */
+    if (cache->mapped) { vllm_npu_direct_bo_free(d, cache); *cache_cap = 0; *cache_fl = 0; }
+    *cache = *bo;
+    *cache_cap = bo->size;
+    *cache_fl = flags;
     memset(bo, 0, sizeof(*bo));
 }
 
@@ -1098,6 +1172,12 @@ static void npu_pack_weight_int8(int8_t *dst, const int8_t *B, int N, int K) {
      * become a 64B table; dst position (Kwithin=r, Nwithin=c) holds
      * src row (bi*8+c) col (bj*8+r) - pure layout repack, NO transpose. */
     const int ngrp = N / 32, kgrp = K / 32;
+    /* N-groups write disjoint dst regions (kg*1024 + ng*32*K), so the outer
+     * ng loop parallelises with no cross-iteration dependency. Serialising
+     * this repack measured ~83 ms for one yolov8n forward (K-YOLO-001 §9 #1). */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if(ngrp > 2)
+#endif
     for (int ng = 0; ng < ngrp; ng++) {
         for (int kg = 0; kg < kgrp; kg++) {
             const int8_t *src = B + (size_t)ng * 32 * K + (size_t)kg * 32;
@@ -1420,7 +1500,7 @@ int vllm_npu_direct_gemm_gw(vllm_npu_direct_t *d, float *out,
                             const int8_t *Aq, const float *a_scale,
                             const int8_t *Wq, const float *b_scale,
                             int M, int N, int K, int G, int prec,
-                            uint64_t wkey) {
+                            uint64_t wkey, int nt_hint) {
 #ifndef VLLM_NPU_DIRECT_READY
     /* Calibration contract: the regcmd table is not yet validated on the
      * target. Returning nonzero makes every offload point fall back to the
@@ -1428,7 +1508,7 @@ int vllm_npu_direct_gemm_gw(vllm_npu_direct_t *d, float *out,
      * explicit calibration flow (selftest / VLLM_NPU_CALIBRATE=1). */
     if (!npu_calib_ok()) {
         (void)d; (void)out; (void)Aq; (void)a_scale; (void)Wq; (void)b_scale;
-        (void)M; (void)N; (void)K; (void)G; (void)prec; (void)wkey;
+        (void)M; (void)N; (void)K; (void)G; (void)prec; (void)wkey; (void)nt_hint;
         return -2;
     }
 #endif
@@ -1445,6 +1525,7 @@ int vllm_npu_direct_gemm_gw(vllm_npu_direct_t *d, float *out,
     struct timespec tw0, ts0;
     double t_setup = 0.0;      /* BO alloc + sentinel memset + scratch malloc */
     double t_gen = 0.0, t_sb = 0.0, t_aff = 0.0;  /* hide breakdown */
+    double t_outz = 0.0, t_wstg = 0.0;            /* hide breakdown: memset(out) / weight staging+pack */
     double t_p1m = 0.0, t_p1t = 0.0;              /* p1 memcpy vs transpose */
     clock_gettime(CLOCK_MONOTONIC, &tw0);
 #endif
@@ -1475,6 +1556,11 @@ int vllm_npu_direct_gemm_gw(vllm_npu_direct_t *d, float *out,
             int v = atoi(e);
             if (v >= 64 && v <= 1024 && (v % n_align) == 0) Nt = v;
         }
+        /* Per-call hint (nt_hint > 0) takes precedence: many-small-GEMM
+         * callers (conv-as-GEMM) tune Nt together with G to minimise the
+         * submit count; 0 keeps the env/default. */
+        if (nt_hint >= 64 && nt_hint <= 1024 && (nt_hint % n_align) == 0)
+            Nt = nt_hint;
     }
     int n_tiles = (N + Nt - 1) / Nt;
     int Np_tile = ((Nt + n_align - 1) / n_align) * n_align;
@@ -1562,13 +1648,15 @@ int vllm_npu_direct_gemm_gw(vllm_npu_direct_t *d, float *out,
             g_in_uc = (!eu || eu[0] == '\0' || eu[0] == '1');
         }
         if (g_in_uc) {
-            if (vllm_npu_direct_bo_alloc(d, &bo_in, in_seg * NB) != 0) return -1;
-        } else if (vllm_npu_direct_bo_alloc_ex(d, &bo_in, in_seg * NB,
-                                               NPU_MEM_CACHEABLE) != 0) {
+            if (npu_bo_acquire(d, &d->cbo_in, &d->cbo_in_cap, &d->cbo_in_fl,
+                               &bo_in, in_seg * NB, 0) != 0) return -1;
+        } else if (npu_bo_acquire(d, &d->cbo_in, &d->cbo_in_cap, &d->cbo_in_fl,
+                                  &bo_in, in_seg * NB, NPU_MEM_CACHEABLE) != 0) {
             return -1;
         }
     }
-    if (!wbo && vllm_npu_direct_bo_alloc(d, &bo_w, w_seg * NB) != 0) {
+    if (!wbo && npu_bo_acquire(d, &d->cbo_w, &d->cbo_w_cap, &d->cbo_w_fl,
+                               &bo_w, w_seg * NB, 0) != 0) {
         vllm_npu_direct_bo_free(d, &bo_in); return -1;
     }
     /* out BO: cacheable lets the accumulate read from cache (a DMA-written
@@ -1584,20 +1672,25 @@ int vllm_npu_direct_gemm_gw(vllm_npu_direct_t *d, float *out,
             g_out_uc = (!eu || eu[0] == '\0' || eu[0] == '1');
         }
         if (g_out_uc) {
-            if (vllm_npu_direct_bo_alloc_ex(d, &bo_out, (out_seg + 64) * NB,
-                                            0) != 0) {
+            if (npu_bo_acquire(d, &d->cbo_out, &d->cbo_out_cap, &d->cbo_out_fl,
+                               &bo_out, (out_seg + 64) * NB, 0) != 0) {
                 vllm_npu_direct_bo_free(d, &bo_w);
                 vllm_npu_direct_bo_free(d, &bo_in); return -1;
             }
-        } else if (vllm_npu_direct_bo_alloc_ex(d, &bo_out, (out_seg + 64) * NB,
-                                               NPU_MEM_CACHEABLE) != 0) {
+        } else if (npu_bo_acquire(d, &d->cbo_out, &d->cbo_out_cap, &d->cbo_out_fl,
+                                  &bo_out, (out_seg + 64) * NB,
+                                  NPU_MEM_CACHEABLE) != 0) {
             vllm_npu_direct_bo_free(d, &bo_w);
             vllm_npu_direct_bo_free(d, &bo_in); return -1;
         }
     }
-    /* CALIB-DIAG sentinel: pre-fill the output BO so a submit that never
-     * reaches the DPU write stage leaves a recognizable pattern. */
-    memset((void *)(uintptr_t)bo_out.vaddr, 0x7F, (out_seg + 64) * NB);
+    /* CALIB-DIAG sentinel (env-gated, default OFF - pure diagnostic): pre-fill
+     * the output BO so a submit that never reaches the DPU write stage leaves a
+     * recognizable 0x7F pattern. The pattern is never read by the engine, so it
+     * only costs time (writing an UNCACHED BO); enable with VLLM_NPU_SENTINEL=1
+     * when investigating a suspected no-write submit. */
+    if (getenv("VLLM_NPU_SENTINEL"))
+        memset((void *)(uintptr_t)bo_out.vaddr, 0x7F, (out_seg + 64) * NB);
     /* Flush the sentinel to DRAM before the NPU overwrites it (cacheable BO) -
      * a dirty line written back later would clobber the DPU result. Uncached
      * BOs are not coherent with the CPU cache and need no flush (the driver
@@ -1655,18 +1748,26 @@ int vllm_npu_direct_gemm_gw(vllm_npu_direct_t *d, float *out,
      * (Weights no longer need a staging slice: they are pre-packed into
      * d->wq_packed and only memcpy'd per tile.) */
     enum { NPU_WPAD_MAX = 3 };
-    int8_t *apad = (int8_t *)malloc((size_t)M * (size_t)Kb * NPU_WPAD_MAX);
-    void *tbuf = NULL;                      /* int32 (prec=0) / int16 (prec=1) */
-    if (prec == 0)
-        tbuf = malloc((size_t)M * (size_t)ncur_max * sizeof(int32_t));
-    else
-        tbuf = malloc((size_t)M * (size_t)ncur_max * sizeof(int16_t));
-    /* p1 staging: one sub-block of the cube in a plain cached buffer so the
-     * transpose reads L2 instead of paying a DRAM round trip per 64B line of
-     * the DMA-written output BO (VLLM_P1=3 memcpy path; see below). */
-    int32_t *tmps = (int32_t *)malloc((size_t)M * 128 * sizeof(int32_t));
+    const size_t apad_need = (size_t)M * (size_t)Kb * NPU_WPAD_MAX;
+    const size_t tbuf_need = (size_t)M * (size_t)ncur_max *
+                             (prec == 0 ? sizeof(int32_t) : sizeof(int16_t));
+    const size_t tmps_need = (size_t)M * 128 * sizeof(int32_t);
+    if (d->sc_apad_cap < apad_need) {
+        free(d->sc_apad); d->sc_apad = (int8_t *)malloc(apad_need);
+        d->sc_apad_cap = d->sc_apad ? apad_need : 0;
+    }
+    if (d->sc_tbuf_cap < tbuf_need) {
+        free(d->sc_tbuf); d->sc_tbuf = malloc(tbuf_need);
+        d->sc_tbuf_cap = d->sc_tbuf ? tbuf_need : 0;
+    }
+    if (d->sc_tmps_cap < tmps_need) {
+        free(d->sc_tmps); d->sc_tmps = (int32_t *)malloc(tmps_need);
+        d->sc_tmps_cap = d->sc_tmps ? tmps_need : 0;
+    }
+    int8_t *apad = d->sc_apad;              /* int32 (prec=0) / int16 (prec=1) */
+    void   *tbuf = d->sc_tbuf;
+    int32_t *tmps = d->sc_tmps;
     if (!apad || !tbuf || !tmps) {
-        free(apad); free(tbuf); free(tmps);
         vllm_npu_direct_bo_free(d, &bo_out);
         vllm_npu_direct_bo_free(d, &bo_w);
         vllm_npu_direct_bo_free(d, &bo_in);
@@ -1686,7 +1787,14 @@ int vllm_npu_direct_gemm_gw(vllm_npu_direct_t *d, float *out,
     double t_bc = 0.0, t_p1 = 0.0, t_p2 = 0.0;   /* t_acc breakdown (dbg) */
     int tacc_cpu_dbg = -1;                        /* A76 pin diagnostic */
 #endif
+#ifdef __linux__
+    { struct timespec z0, z1; clock_gettime(CLOCK_MONOTONIC, &z0);
+      memset(out, 0, (size_t)M * (size_t)N * sizeof(float));
+      clock_gettime(CLOCK_MONOTONIC, &z1);
+      t_outz += (z1.tv_sec - z0.tv_sec) + 1e-9 * (z1.tv_nsec - z0.tv_nsec); }
+#else
     memset(out, 0, (size_t)M * (size_t)N * sizeof(float));
+#endif
     int rc = 0;
 
     /* Build the full-N packed weight into d->wq_packed (shared staging). On a
@@ -1711,20 +1819,38 @@ int vllm_npu_direct_gemm_gw(vllm_npu_direct_t *d, float *out,
             vllm_npu_direct_bo_free(d, &bo_in);
             return -1;   /* OOM -> CPU */
         }
+#ifdef __linux__
+        struct timespec w0, w1; clock_gettime(CLOCK_MONOTONIC, &w0);
+#endif
+        /* nb==1 && no N-pad: the staged row-major slice is byte-identical to
+         * Wq (row stride K == Kb), so skip the staging memcpy and pack straight
+         * from Wq. (The removed *_stride variant only thrashed L2 for the
+         * G256 K=4096 case where the source row stride far exceeds Kb; here the
+         * stride matches the pack's working set.) */
+        const int no_pad = (prec == 0 && n_blocks == 1 && Np == N);
         for (int g = 0; g < n_blocks; g++) {
-            /* Stage the block's [Np][Kb] slice (row-major contiguous,
-             * rows N..Np-1 zero so HW N-pad contributes nothing). */
-            for (int n = 0; n < N; n++)
-                memcpy(stg + (size_t)n * Kb,
-                       Wq + (size_t)n * K + (size_t)g * Kb, (size_t)Kb);
-            if (Np != N)
-                memset(stg + (size_t)N * Kb, 0, (size_t)(Np - N) * (size_t)Kb);
+            const int8_t *B = stg;
+            if (no_pad) {
+                B = Wq;
+            } else {
+                /* Stage the block's [Np][Kb] slice (row-major contiguous,
+                 * rows N..Np-1 zero so HW N-pad contributes nothing). */
+                for (int n = 0; n < N; n++)
+                    memcpy(stg + (size_t)n * Kb,
+                           Wq + (size_t)n * K + (size_t)g * Kb, (size_t)Kb);
+                if (Np != N)
+                    memset(stg + (size_t)N * Kb, 0, (size_t)(Np - N) * (size_t)Kb);
+            }
             if (prec == 1)
                 npu_pack_weight_int4(d->wq_packed + (size_t)g * wblk, stg, N, Kb);
             else
                 npu_pack_weight_int8((int8_t *)d->wq_packed + (size_t)g * wblk,
-                                     stg, Np, Kb);
+                                     B, Np, Kb);
         }
+#ifdef __linux__
+        clock_gettime(CLOCK_MONOTONIC, &w1);
+        t_wstg += (w1.tv_sec - w0.tv_sec) + 1e-9 * (w1.tv_nsec - w0.tv_nsec);
+#endif
         d->wq_packed_bytes = wneed;
         free(stg);
         wq_src = d->wq_packed;
@@ -2211,15 +2337,17 @@ int vllm_npu_direct_gemm_gw(vllm_npu_direct_t *d, float *out,
             struct timespec tw1;
             clock_gettime(CLOCK_MONOTONIC, &tw1);
             double t_wall = (tw1.tv_sec - tw0.tv_sec) + 1e-9 * (tw1.tv_nsec - tw0.tv_nsec);
-            double t_hide = t_wall - t_setup - t_pack - t_sub - t_acc - t_gen - t_sb - t_aff;
+            double t_hide = t_wall - t_setup - t_pack - t_sub - t_acc - t_gen - t_sb - t_aff
+                            - t_outz - t_wstg;
             printf("[NPU-DIRECT] M=%d N=%d K=%d G=%d prec=%d t_pack=%.0fus "
                    "t_sub=%.0fus t_acc=%.0fus submits=%d setup=%.0fus "
-                   "wall=%.0fus hide=%.0fus gen=%.0fus sb=%.0fus aff=%.0fus p1m=%.0fus p1t=%.0fus",
+                   "wall=%.0fus hide=%.0fus gen=%.0fus sb=%.0fus aff=%.0fus p1m=%.0fus p1t=%.0fus "
+                   "outz=%.0fus wstg=%.0fus",
                    M, N, K, G, prec, t_pack * 1e6, t_sub * 1e6, t_acc * 1e6,
                    n_tiles * ((n_blocks + NB - 1) / NB),
                    t_setup * 1e6, t_wall * 1e6, t_hide * 1e6,
                    t_gen * 1e6, t_sb * 1e6, t_aff * 1e6,
-                   t_p1m * 1e6, t_p1t * 1e6);
+                   t_p1m * 1e6, t_p1t * 1e6, t_outz * 1e6, t_wstg * 1e6);
         }
         const char *tv2 = getenv("VLLM_NPU_TIMING2");
         if (tv2 && tv2[0] && tv2[0] != '0')
@@ -2230,12 +2358,20 @@ int vllm_npu_direct_gemm_gw(vllm_npu_direct_t *d, float *out,
     }
 #endif
 
-    free(apad);
-    free(tbuf);
-    free(tmps);
-    vllm_npu_direct_bo_free(d, &bo_out);
-    vllm_npu_direct_bo_free(d, &bo_w);
-    vllm_npu_direct_bo_free(d, &bo_in);
+    /* Scratch buffers stay resident in the device struct (sc_*); the per-call
+     * BOs MOVE back into the per-device reuse cache (same capacity/flags match
+     * next call). Recomputed flags must match the acquire site above. */
+    {
+        const char *eu_in = getenv("VLLM_IN_UC");
+        int in_uc = (!eu_in || eu_in[0] == '\0' || eu_in[0] == '1');
+        const char *eu_out = getenv("VLLM_OUT_UC");
+        int out_uc = (!eu_out || eu_out[0] == '\0' || eu_out[0] == '1');
+        npu_bo_release(d, &bo_out, &d->cbo_out, &d->cbo_out_cap, &d->cbo_out_fl,
+                       out_uc ? 0u : NPU_MEM_CACHEABLE);
+        npu_bo_release(d, &bo_w, &d->cbo_w, &d->cbo_w_cap, &d->cbo_w_fl, 0);
+        npu_bo_release(d, &bo_in, &d->cbo_in, &d->cbo_in_cap, &d->cbo_in_fl,
+                       in_uc ? 0u : NPU_MEM_CACHEABLE);
+    }
     return rc;
 }
 
@@ -2413,7 +2549,7 @@ int vllm_npu_direct_selftest(vllm_npu_direct_t *d, const char *sdk_tag) {
                     ref[m * N + nn] = (float)acc;
                 }
             int rc = vllm_npu_direct_gemm_gw(d, out, Aq, a_scale, Wq, b_scale,
-                                             M, N, K, G, prec, 0);
+                                             M, N, K, G, prec, 0, 0);
             /* Diagnostic: append the kernel messages the submit triggered
              * (driver timeout / irq-status diagnostics) to the app log. */
             system("dmesg | tail -60 >> /root/calib.log 2>&1");
@@ -2451,4 +2587,762 @@ int vllm_npu_direct_selftest(vllm_npu_direct_t *d, const char *sdk_tag) {
         fflush(stdout);
     }
     return failures;
+}
+
+/* ================================================================
+ * M3 Phase-1: native regular convolution (CNA CONV_MODE=0)
+ *
+ * Self-contained path: geometry-specific packing + regcmd generator + a
+ * one-shot submit, exercised by `--npu-calib-conv`. The calibrated matmul
+ * path (npu_direct_gen_matmul_regs / vllm_npu_direct_gemm_gw) is NOT touched.
+ *
+ * Every uncertain field is env-overridable (VLLM_NPU_CONV_*) so the target
+ * board can be swept without a rebuild - exactly like the matmul generator's
+ * VLLM_NPU_* knobs. Defaults follow the Mesa rkt_regcmd RK3568 reference
+ * (adapted to RK3588 units) and this driver's calibrated matmul forms.
+ * ================================================================ */
+
+/* Feature NC1HWC2 (C2=16): dst[((c/16)*H*W + h*W + w)*16 + (c%16)] = feat[c][h][w] */
+static void npu_pack_feature_conv(int8_t *dst, const int8_t *feat,
+                                  int C, int H, int W) {
+    for (int c = 0; c < C; c++)
+        for (int h = 0; h < H; h++)
+            for (int w = 0; w < W; w++)
+                dst[((c / 16) * H * W + h * W + w) * 16 + (c % 16)] =
+                    feat[(c * H + h) * W + w];
+}
+
+/* Regular-conv weight cube, signed int8 (CVT bypass sign domain, NO 0x80):
+ *   pos(oc,ky,kx,ic) = (oc/16)*KH*KW*16*icb + (ky*KW+kx)*16*icb
+ *                    + (oc%16)*icb + ic,   icb = align(C,16) */
+static void npu_pack_weight_conv(int8_t *dst, const int8_t *w,
+                                 int C, int KH, int KW, int OC) {
+    const int icb = ((C + 15) / 16) * 16;
+    for (int oc = 0; oc < OC; oc++)
+        for (int ky = 0; ky < KH; ky++)
+            for (int kx = 0; kx < KW; kx++)
+                for (int ic = 0; ic < C; ic++) {
+                    int pos = (oc / 16) * KH * KW * 16 * icb
+                            + (ky * KW + kx) * 16 * icb
+                            + (oc % 16) * icb + ic;
+                    dst[pos] = w[((oc * KH + ky) * KW + kx) * C + ic];
+                }
+}
+
+/* Regular-conv regcmd (CNA CONV_MODE=0, int8 -> int32). Mirrors the matmul
+ * generator's block order/trailer; only the geometry-bearing fields and the
+ * conv-only registers differ. Returns word count, or -1 on overflow. */
+static int npu_direct_gen_conv_regs(uint64_t *ops, int cap,
+                                    uint32_t in_dma, uint32_t w_dma,
+                                    uint32_t out_dma,
+                                    int C, int H, int W,
+                                    int KH, int KW, int stride, int pad,
+                                    int OC) {
+    int i = 0;
+#define EMIT(op, val, reg) do { \
+        if (i >= cap) return -1; \
+        ops[i++] = NPUOP((op), (uint32_t)(val), (reg)); \
+    } while (0)
+
+    const int OH   = (H + 2 * pad - KH) / stride + 1;
+    const int OW   = (W + 2 * pad - KW) / stride + 1;
+    const int C_al = ((C + 15) / 16) * 16;
+    const int OCp  = ((OC + 15) / 16) * 16;
+    const char *e;
+
+    /* ---- calibration knobs (env, read per generation) ---- */
+    uint32_t en_reg = 0x0008u;
+    uint32_t en_val = 0x1du;              /* CNA|CORE|DPU|DPU_RDMA (matmul) */
+    int      no_rdma = 0;
+    if ((e = getenv("VLLM_NPU_OP_EN_REG"))) en_reg = (uint32_t)strtoul(e, NULL, 0);
+    if ((e = getenv("VLLM_NPU_OP_EN_VAL"))) en_val = (uint32_t)strtoul(e, NULL, 0);
+    if ((e = getenv("VLLM_NPU_NO_RDMA")) && e[0] && e[0] != '0') no_rdma = 1;
+    if (no_rdma) en_val &= ~0x10u;
+
+    /* FEATURE_GRAINS: start at stride_y+kh; the reference formula adds
+     * stride_y*((Wout<28)+(Wout<14)) for narrow outputs. */
+    unsigned grains = (unsigned)(stride + KH);
+    if ((e = getenv("VLLM_NPU_CONV_GRAINS"))) grains = (unsigned)strtoul(e, NULL, 0);
+
+    /* RGB_BYTELENGTH: non-ARGB value unused but MUST be non-zero to release
+     * the CNA OP_ENABLE (reference comment) - W*H*C is a safe input-byte count. */
+    uint32_t rgblen = (uint32_t)(W * H * C);
+    if ((e = getenv("VLLM_NPU_CONV_RGBLEN"))) rgblen = (uint32_t)strtoul(e, NULL, 0);
+
+    /* CVT_CON0: keep this engine's signed matmul domain (0xB = DATA_SIGN |
+     * CVT_TYPE | BYPASS); the reference non-ARGB branch is 0xa + scale 1. */
+    uint32_t cvt0 = 0xBu;
+    if ((e = getenv("VLLM_NPU_CONV_CVT0"))) cvt0 = (uint32_t)strtoul(e, NULL, 0);
+
+    /* DMA strides (RK3588 unit is calibrated empirically; default follows the
+     * matmul form: line_stride = row_bytes/4 = W*4, surf via the same helper). */
+    uint32_t line_stride = (uint32_t)(W * 4);
+    uint32_t surf_stride = (uint32_t)npu_feature_surf_stride(W * 4, H);
+    if ((e = getenv("VLLM_NPU_CONV_LINE_STRIDE"))) line_stride = (uint32_t)strtoul(e, NULL, 0);
+    if ((e = getenv("VLLM_NPU_CONV_SURF_STRIDE"))) surf_stride = (uint32_t)strtoul(e, NULL, 0);
+
+    uint32_t dma0 = 0x00171c07u;          /* bit20 MUST be 1 (MAC fetch) */
+    if ((e = getenv("VLLM_NPU_CONV_DMA0"))) dma0 = (uint32_t)strtoul(e, NULL, 0);
+
+    /* DPU output surface geometry (matmul form with M -> OW*OH pixels). */
+    uint32_t dst_surf_stride = (uint32_t)((unsigned)(OW * OH) << 4);
+    uint32_t surf_add        = (uint32_t)((unsigned)(OW * OH) * 8u << 4);
+    if ((e = getenv("VLLM_NPU_CONV_DST_SURF_STRIDE"))) dst_surf_stride = (uint32_t)strtoul(e, NULL, 0);
+    if ((e = getenv("VLLM_NPU_CONV_SURFACE_ADD"))) surf_add = (uint32_t)strtoul(e, NULL, 0);
+    /* DPU cube / WDMA extent (sweepable to locate the write geometry). */
+    unsigned cube_w = (unsigned)(OW - 1);
+    unsigned cube_h = (unsigned)(OH - 1);
+    unsigned wdma_w = (unsigned)(OW - 1);
+    unsigned wdma_h = (unsigned)(OH - 1);
+    if ((e = getenv("VLLM_NPU_CONV_CUBE_W"))) cube_w = (unsigned)strtoul(e, NULL, 0);
+    if ((e = getenv("VLLM_NPU_CONV_CUBE_H"))) cube_h = (unsigned)strtoul(e, NULL, 0);
+    if ((e = getenv("VLLM_NPU_CONV_WDMA_W"))) wdma_w = (unsigned)strtoul(e, NULL, 0);
+    if ((e = getenv("VLLM_NPU_CONV_WDMA_H"))) wdma_h = (unsigned)strtoul(e, NULL, 0);
+    unsigned core_w = (unsigned)(OW - 1);
+    /* RK3588 (calibrated 2026-10-11): the CORE output-height field is in
+     * units of TWO output rows for this driver: setting OH-1 writes only
+     * OH/2 rows (the DPU leaves the rest of each surface at the sentinel);
+     * 2*OH-1 writes the full OH rows. Value is capped by the DPU cube. */
+    unsigned core_h = (unsigned)(2 * OH - 1);
+    unsigned atomics = (unsigned)(OW * OH);
+    if ((e = getenv("VLLM_NPU_CONV_CORE_W"))) core_w = (unsigned)strtoul(e, NULL, 0);
+    if ((e = getenv("VLLM_NPU_CONV_CORE_H"))) core_h = (unsigned)strtoul(e, NULL, 0);
+    if ((e = getenv("VLLM_NPU_CONV_ATOMICS"))) atomics = (unsigned)strtoul(e, NULL, 0);
+
+    /* ---- CBUF banks ---- */
+    unsigned fd_bytes = (unsigned)C_al * (unsigned)H * (unsigned)W;
+    unsigned w_bytes  = (unsigned)KH * (unsigned)KW * (unsigned)C_al * (unsigned)OCp;
+    unsigned data_bank, weight_bank;
+    {
+        unsigned fd_banks = (fd_bytes + NPU_CBUF_BANK_SIZE - 1) / NPU_CBUF_BANK_SIZE;
+        unsigned w_banks  = (w_bytes  + NPU_CBUF_BANK_SIZE - 1) / NPU_CBUF_BANK_SIZE;
+        if (fd_banks + 1 > NPU_CBUF_BANKS - 1) return -1;
+        data_bank   = fd_banks + 1;                 /* int8 slack (matmul form) */
+        weight_bank = NPU_CBUF_BANKS - data_bank;
+        if (w_banks > weight_bank) return -1;
+    }
+    /* data_entries = ceil(W * ceil(C/16) / 4)  (16-ch atomics, 4 per entry) */
+    unsigned entries = (unsigned)(W * ((C + 15) / 16));
+    entries = (entries + 3) / 4;
+
+    EMIT(OP_REG_DPU, NPU_S_POINTER, DPU_S_POINTER);
+    if (!no_rdma)
+        EMIT(OP_REG_DPU_RDMA, NPU_S_POINTER, DPU_RDMA_S_POINTER);
+
+    /* ---- CNA ---- */
+    uint32_t conv1 = (uint32_t)(((NPU_PREC_INT8 & 7) << 7) | ((NPU_PREC_INT8 & 7) << 4) | 0u);
+    if ((e = getenv("VLLM_NPU_CONV_CONV1"))) conv1 = (uint32_t)strtoul(e, NULL, 0);
+    EMIT(OP_REG_CNA, conv1,
+         CNA_CONV_CON1);                                   /* int8, CONV_MODE=0 */
+    EMIT(OP_REG_CNA, (grains & 0x3FF) << 4, CNA_CONV_CON2);
+    /* CONV_CON3: X/Y stride (3 bits each). Phase-1 only exercised stride 1;
+     * the Phase-2 native path drives this from the geometry. */
+    EMIT(OP_REG_CNA, (((unsigned)stride & 7) << 3) | ((unsigned)stride & 7),
+         CNA_CONV_CON3);
+    EMIT(OP_REG_CNA, rgblen & 0xFFFFFF, CNA_CONV_CON4);
+    EMIT(OP_REG_CNA, (((unsigned)W & 0x7FF) << 16) | ((unsigned)H & 0x7FF),
+         CNA_DATA_SIZE0);
+    EMIT(OP_REG_CNA, (((unsigned)(C_al - 1) & 0x3FFF) << 16) | ((unsigned)C_al & 0xFFFF),
+         CNA_DATA_SIZE1);
+    EMIT(OP_REG_CNA, (unsigned)OW & 0x7FF, CNA_DATA_SIZE2);
+    EMIT(OP_REG_CNA, atomics & 0x3FFFF, CNA_DATA_SIZE3);
+    EMIT(OP_REG_CNA, (uint32_t)((unsigned)KH * (unsigned)KW * (unsigned)C_al * (unsigned)OCp),
+         CNA_WEIGHT_SIZE0);
+    EMIT(OP_REG_CNA, (uint32_t)((unsigned)KH * (unsigned)KW * (unsigned)C_al) & 0x7FFFF,
+         CNA_WEIGHT_SIZE1);
+    EMIT(OP_REG_CNA, (((unsigned)KW & 0x1F) << 24) | (((unsigned)KH & 0x1F) << 16) |
+                     ((unsigned)OCp & 0x3FFF), CNA_WEIGHT_SIZE2);
+    uint32_t cbuf_con0 = (uint32_t)((weight_bank << 4) | data_bank);
+    uint32_t cbuf_con1 = (uint32_t)(((unsigned)W & 0x3FF) << 16) | (entries & 0x3FFF);
+    if ((e = getenv("VLLM_NPU_CONV_CBUF_CON0"))) cbuf_con0 = (uint32_t)strtoul(e, NULL, 0);
+    if ((e = getenv("VLLM_NPU_CONV_CBUF_CON1"))) cbuf_con1 = (uint32_t)strtoul(e, NULL, 0);
+    EMIT(OP_REG_CNA, cbuf_con0, CNA_CBUF_CON0);
+    EMIT(OP_REG_CNA, cbuf_con1, CNA_CBUF_CON1);
+    EMIT(OP_REG_CNA, cvt0, CNA_CVT_CON0);
+    EMIT(OP_REG_CNA, 0x00010000u, CNA_CVT_CON1);
+    EMIT(OP_REG_CNA, 0x00010000u, CNA_CVT_CON2);
+    EMIT(OP_REG_CNA, 0x00010000u, CNA_CVT_CON3);
+    EMIT(OP_REG_CNA, 0x00010000u, CNA_CVT_CON4);
+    EMIT(OP_REG_CNA, 0u, CNA_FC_CON0);
+    EMIT(OP_REG_CNA, 0u, CNA_FC_CON1);
+    /* pad value = input_zero_point - 0x80 = 0 (signed int8, zero_point 0x80) */
+    EMIT(OP_REG_CNA, (((0u) & 0xFFFF) << 16) |
+                     (((unsigned)pad & 0xF) << 4) | ((unsigned)pad & 0xF),
+         CNA_PAD_CON0);
+    EMIT(OP_REG_CNA, in_dma, CNA_FEATURE_DATA_ADDR);
+    EMIT(OP_REG_CNA, 0u, CNA_FC_CON2);
+    EMIT(OP_REG_CNA, dma0, CNA_DMA_CON0);
+    EMIT(OP_REG_CNA, line_stride & 0xFFFFFFF, CNA_DMA_CON1);
+    EMIT(OP_REG_CNA, surf_stride & 0xFFFFFFF, CNA_DMA_CON2);
+    EMIT(OP_REG_CNA, (((unsigned)W & 0x3FFF) << 16) | ((unsigned)H & 0x7FF),
+         CNA_FC_DATA_SIZE0);
+    EMIT(OP_REG_CNA, (unsigned)C_al & 0xFFFF, CNA_FC_DATA_SIZE1);
+    EMIT(OP_REG_CNA, 0u, CNA_DCOMP_CTRL);
+    EMIT(OP_REG_CNA, 0u, CNA_DCOMP_REGNUM);
+    EMIT(OP_REG_CNA, w_dma, CNA_DCOMP_ADDR0);
+    for (int a = 0; a < 16; a++)
+        EMIT(OP_REG_CNA, 0u, CNA_DCOMP_AMOUNT + (uint32_t)a * 4);
+    EMIT(OP_REG_CNA, 0u, CNA_CVT_CON5);
+    EMIT(OP_REG_CNA, 0u, CNA_PAD_CON1);
+
+    /* ---- CORE ---- */
+    uint32_t core_misc = (uint32_t)((NPU_PREC_INT8 & 7) << 8);
+    uint32_t core_sz1  = (uint32_t)((unsigned)(OCp - 1) & 0xFFFF);
+    if ((e = getenv("VLLM_NPU_CONV_CORE_MISC"))) core_misc = (uint32_t)strtoul(e, NULL, 0);
+    if ((e = getenv("VLLM_NPU_CONV_CORE_SZ1")))  core_sz1  = (uint32_t)strtoul(e, NULL, 0);
+    EMIT(OP_REG_CORE, core_misc, CORE_MISC_CFG);
+    EMIT(OP_REG_CORE, ((core_h & 0xFFFF) << 16) | (core_w & 0xFFFF),
+         CORE_DATAOUT_SIZE_0);
+    EMIT(OP_REG_CORE, core_sz1, CORE_DATAOUT_SIZE_1);
+    EMIT(OP_REG_CORE, 0u, CORE_CLIP_TRUNCATE);
+    EMIT(OP_REG_CORE, 0u, CORE_3030);
+
+    /* ---- DPU (matmul stage config; output geometry -> conv) ---- */
+    uint32_t dpu_feat = (0xFu << 5) | (0u << 3) | (2u << 1) | 0u;
+    uint32_t dpu_fmt  = ((NPU_PREC_INT32 & 7) << 29) | ((NPU_PREC_INT8 & 7) << 26) |
+                        (NPU_PREC_INT8 & 7);
+    uint32_t dpu_bs   = (1u << 6) | (1u << 4) | (1u << 1) | 1u;
+    uint32_t dpu_bn   = (1u << 6) | (1u << 4) | (1u << 1) | 1u;
+    uint32_t dpu_ew   = (1u << 9) | (1u << 8) | (1u << 7) | (1u << 1) | 1u;
+    if ((e = getenv("VLLM_NPU_CONV_DPU_FEAT"))) dpu_feat = (uint32_t)strtoul(e, NULL, 0);
+    if ((e = getenv("VLLM_NPU_CONV_DPU_FMT")))  dpu_fmt  = (uint32_t)strtoul(e, NULL, 0);
+    if ((e = getenv("VLLM_NPU_CONV_DPU_BS")))   dpu_bs   = (uint32_t)strtoul(e, NULL, 0);
+    if ((e = getenv("VLLM_NPU_CONV_DPU_BN")))   dpu_bn   = (uint32_t)strtoul(e, NULL, 0);
+    if ((e = getenv("VLLM_NPU_CONV_DPU_EW")))   dpu_ew   = (uint32_t)strtoul(e, NULL, 0);
+    EMIT(OP_REG_DPU, dpu_feat, DPU_FEATURE_MODE_CFG);
+    EMIT(OP_REG_DPU, dpu_fmt, DPU_DATA_FORMAT);
+    EMIT(OP_REG_DPU, 0u, DPU_OFFSET_PEND);
+    EMIT(OP_REG_DPU, out_dma, DPU_DST_BASE_ADD);
+    EMIT(OP_REG_DPU, dst_surf_stride, DPU_DST_SURF_STRIDE);
+    EMIT(OP_REG_DPU, cube_w & 0x1FFF, DPU_DATA_CUBE_WIDTH);
+    EMIT(OP_REG_DPU, cube_h & 0x1FFF, DPU_DATA_CUBE_HEIGHT);
+    EMIT(OP_REG_DPU, 0u, DPU_DATA_CUBE_NOTCH_ADDR);
+    EMIT(OP_REG_DPU, (((unsigned)(OCp - 1) & 0x1FFF) << 16) | ((unsigned)(OCp - 1) & 0x1FFF),
+         DPU_DATA_CUBE_CHANNEL);
+    EMIT(OP_REG_DPU, dpu_bs, DPU_BS_CFG);
+    EMIT(OP_REG_DPU, 0u, DPU_BS_ALU_CFG);
+    EMIT(OP_REG_DPU, 0u, DPU_BS_MUL_CFG);
+    EMIT(OP_REG_DPU, 0u, DPU_BS_RELUX_CMP_VALUE);
+    EMIT(OP_REG_DPU, (0u << 27) | (7u << 8) | (7u << 5) | (7u << 2) | (1u << 1),
+         DPU_BS_OW_CFG);
+    EMIT(OP_REG_DPU, 0u, DPU_BS_OW_OP);
+    EMIT(OP_REG_DPU, (0u << 27) | (0u << 16) | ((unsigned)(OCp - 1) & 0x1FFF),
+         DPU_WDMA_SIZE_0);
+    EMIT(OP_REG_DPU, ((wdma_h & 0x1FFF) << 16) | (wdma_w & 0x1FFF),
+         DPU_WDMA_SIZE_1);
+    EMIT(OP_REG_DPU, dpu_bn, DPU_BN_CFG);
+    EMIT(OP_REG_DPU, 0u, DPU_BN_ALU_CFG);
+    EMIT(OP_REG_DPU, 0u, DPU_BN_MUL_CFG);
+    EMIT(OP_REG_DPU, 0u, DPU_BN_RELUX_CMP_VALUE);
+    EMIT(OP_REG_DPU, dpu_ew, DPU_EW_CFG);
+    EMIT(OP_REG_DPU, 0u, DPU_EW_CVT_OFFSET_VALUE);
+    EMIT(OP_REG_DPU, 1u, DPU_EW_CVT_SCALE_VALUE);
+    EMIT(OP_REG_DPU, 0u, DPU_EW_RELUX_CMP_VALUE);
+    EMIT(OP_REG_DPU, 0u, DPU_OUT_CVT_OFFSET);
+    EMIT(OP_REG_DPU, (0u << 16) | 1u, DPU_OUT_CVT_SCALE);
+    EMIT(OP_REG_DPU, 0u, DPU_OUT_CVT_SHIFT);
+    for (int a = 0; a < 8; a++)
+        EMIT(OP_REG_DPU, 0u, DPU_EW_OP_VALUE_0 + (uint32_t)a * 4);
+    EMIT(OP_REG_DPU, surf_add, DPU_SURFACE_ADD);
+    EMIT(OP_REG_DPU, 0u, DPU_40C4);
+    EMIT(OP_REG_DPU, 0u, DPU_LUT_ACCESS_CFG);
+    EMIT(OP_REG_DPU, 0u, DPU_LUT_ACCESS_DATA);
+    EMIT(OP_REG_DPU, 0u, DPU_LUT_CFG);
+    EMIT(OP_REG_DPU, 0u, DPU_LUT_INFO);
+    EMIT(OP_REG_DPU, 0u, DPU_LUT_LE_START);
+    EMIT(OP_REG_DPU, 0u, DPU_LUT_LE_END);
+    EMIT(OP_REG_DPU, 0u, DPU_LUT_LO_START);
+    EMIT(OP_REG_DPU, 0u, DPU_LUT_LO_END);
+    EMIT(OP_REG_DPU, 0u, DPU_LUT_LE_SLOPE_SCALE);
+    EMIT(OP_REG_DPU, 0u, DPU_LUT_LE_SLOPE_SHIFT);
+    EMIT(OP_REG_DPU, 0u, DPU_LUT_LO_SLOPE_SCALE);
+    EMIT(OP_REG_DPU, 0u, DPU_LUT_LO_SLOPE_SHIFT);
+
+    /* ---- DPU_RDMA (armed + disabled, matmul-trap avoidance; geometry=conv) */
+    if (!no_rdma) {
+        EMIT(OP_REG_DPU_RDMA, ((unsigned)(OW - 1)) & 0x1FFF, DPU_RDMA_DATA_CUBE_WIDTH);
+        EMIT(OP_REG_DPU_RDMA, ((unsigned)(OH - 1)) & 0x1FFF, DPU_RDMA_DATA_CUBE_HEIGHT);
+        EMIT(OP_REG_DPU_RDMA, ((unsigned)(OCp - 1)) & 0x1FFF, DPU_RDMA_DATA_CUBE_CHANNEL);
+        EMIT(OP_REG_DPU_RDMA, 0u, DPU_RDMA_SRC_BASE_ADDR);
+        EMIT(OP_REG_DPU_RDMA, 0u, DPU_RDMA_BRDMA_CFG);
+        EMIT(OP_REG_DPU_RDMA, 0u, DPU_RDMA_BS_BASE_ADDR);
+        EMIT(OP_REG_DPU_RDMA, 0u, DPU_RDMA_NRDMA_CFG);
+        EMIT(OP_REG_DPU_RDMA, 0u, DPU_RDMA_BN_BASE_ADDR);
+        EMIT(OP_REG_DPU_RDMA, RDMA_ERDMA_DISABLE, DPU_RDMA_ERDMA_CFG);
+        EMIT(OP_REG_DPU_RDMA, 0u, DPU_RDMA_EW_BASE_ADDR);
+        EMIT(OP_REG_DPU_RDMA, 0u, DPU_RDMA_EW_SURF_STRIDE);
+        EMIT(OP_REG_DPU_RDMA, RDMA_FMC_BURST_LEN(15) | RDMA_FMC_MRDMA_DISABLE(1),
+             DPU_RDMA_FEATURE_MODE_CFG);
+        EMIT(OP_REG_DPU_RDMA, 0u, DPU_RDMA_SRC_DMA_CFG);
+        EMIT(OP_REG_DPU_RDMA, 0u, DPU_RDMA_SURF_NOTCH);
+        EMIT(OP_REG_DPU_RDMA, 0u, DPU_RDMA_PAD_CFG);
+        EMIT(OP_REG_DPU_RDMA, RDMA_WEIGHT_ALL1, DPU_RDMA_WEIGHT);
+        EMIT(OP_REG_DPU_RDMA, 0u, DPU_RDMA_EW_SURF_NOTCH);
+    }
+
+    /* ---- PC trailer (4 words) ---- */
+    EMIT(OP_NONE, 0u, 0u);
+    EMIT(OP_REG_PC, 0u, PC_REGISTER_AMOUNTS);
+    EMIT(OP_40, 0u, 0u);
+    EMIT(OP_ENABLE, en_val, en_reg);
+#undef EMIT
+    return i;
+}
+
+/* One-shot PC submit (NO retry: a timed-out job can leave the 0.9.x driver
+ * wedged in its abort path). Mirrors the critical task/submit setup of
+ * drm_submit_pc for a single task on one core. Returns 0 on success. */
+static int npu_conv_submit_once(vllm_npu_direct_t *d, uint64_t rc_haddr,
+                                uint32_t n_words) {
+    struct rknpu_task *tasks = (struct rknpu_task *)(uintptr_t)d->task_bo.vaddr;
+    memset(&tasks[0], 0, sizeof(tasks[0]));
+    tasks[0].flags        = 0;
+    tasks[0].op_idx       = 1;
+    tasks[0].enable_mask  = 0x7f;
+    tasks[0].int_mask     = 0x30;      /* DPU group0|group1 completion */
+    tasks[0].int_clear    = 0x1ffff;   /* RKNPU_INT_CLEAR */
+    tasks[0].regcfg_amount = n_words;  /* one task's 64-bit NPUOP word count */
+    tasks[0].regcmd_addr  = rc_haddr;
+
+    struct rknpu_submit sub;
+    memset(&sub, 0, sizeof(sub));
+    sub.flags         = NPU_JOB_PC;    /* blocking */
+    sub.timeout       = npu_submit_timeout_ms();
+    sub.task_start    = 0;
+    sub.task_number   = 1;
+    sub.task_obj_addr = d->task_bo.obj_addr;
+    sub.task_base_addr = 0;            /* absolute-IOVA scheme */
+    sub.core_mask     = (uint32_t)d->core_mask;
+    sub.fence_fd      = -1;
+    sub.subcore_task[0].task_start  = 0;
+    sub.subcore_task[0].task_number = 1;
+
+    if (ioctl(d->fd, DRM_RKNPU_IOWR(DRM_RKNPU_SUBMIT, struct rknpu_submit),
+              &sub) != 0)
+        return -1;
+    if (sub.task_counter != sub.task_number) return -2;
+    return 0;
+}
+
+/* ================================================================
+ * M3 Phase-2: reusable native-convolution entry (one submit -> int32)
+ *
+ * Reuses the Phase-1 geometry (npu_direct_gen_conv_regs). The caller
+ * pre-packs the NC1HWC2 (C2=16) feature band and the weight cube
+ * (vllm_npu_direct_pack_feature_conv / _pack_weight_conv). One CNA
+ * CONV_MODE=0 pass computes out[oc][oh][ow] and the DPU leaves the raw
+ * int32 accumulator (no on-NPU quantisation/scaling).
+ *
+ * NO RETRY: a timed-out job can wedge the 0.9.x driver (see calib); any
+ * failure returns nonzero and the caller falls back (silent_fallback_
+ * false_pass).
+ * ================================================================ */
+
+/* Feature [C][H][W] (int8, C = C_al multiple of 16) -> NC1HWC2 C2=16.
+ * (Public wrapper kept for callers that pack features themselves.) */
+void vllm_npu_direct_pack_feature_conv(int8_t *dst, const int8_t *feat,
+                                       int C, int H, int W) {
+    npu_pack_feature_conv(dst, feat, C, H, W);
+}
+
+/* Grow a scratch BO to at least n bytes; returns 0 on success. */
+static int npu_conv_bo_grow(vllm_npu_direct_t *d, vllm_npu_bo_t *bo,
+                            size_t *cap, size_t n) {
+    if (bo->mapped && *cap >= n) return 0;
+    if (bo->mapped) { vllm_npu_direct_bo_free(d, bo); *cap = 0; }
+    if (vllm_npu_direct_bo_alloc(d, bo, n) != 0) return -1;
+    *cap = n;
+    return 0;
+}
+
+int vllm_npu_direct_conv_i32(vllm_npu_direct_t *d, int32_t *out,
+                             const int8_t *feat_q, const int8_t *wq,
+                             int C_al, int Hband, int W,
+                             int KH, int KW, int stride, int pad,
+                             int OH_band, int OW, int OC, int OC_off,
+                             int wbank_hint) {
+    (void)OC_off; (void)wbank_hint;
+    if (!d || d->fd < 0 || d->broken) return -1;
+    if (!out || !feat_q || !wq) return -1;
+    if (C_al <= 0 || (C_al % 16) || Hband <= 0 || W <= 0 || OC <= 0) return -1;
+    if (stride < 1 || pad < 0 || KH < 1 || KW < 1) return -1;
+
+    const int OCp = ((OC + 15) / 16) * 16;
+    const int oh = (Hband + 2 * pad - KH) / stride + 1;
+    const int ow = (W + 2 * pad - KW) / stride + 1;
+    if (oh != OH_band || ow != OW || oh <= 0 || ow <= 0) return -1;
+
+    const size_t in_bytes  = (size_t)C_al * (size_t)Hband * (size_t)W;
+    const size_t w_bytes   = (size_t)KH * (size_t)KW * (size_t)C_al * (size_t)OCp;
+    const size_t out_int   = (size_t)OCp * (size_t)oh * (size_t)ow;
+    const size_t out_bytes = out_int * 4 + 64;
+
+    if (vllm_npu_direct_ensure_cache(d) != 0) return -1;
+    if (npu_conv_bo_grow(d, &d->conv_in_bo,  &d->conv_in_cap,  in_bytes)  != 0 ||
+        npu_conv_bo_grow(d, &d->conv_w_bo,   &d->conv_w_cap,   w_bytes)   != 0 ||
+        npu_conv_bo_grow(d, &d->conv_out_bo, &d->conv_out_cap, out_bytes) != 0)
+        return -1;
+    if (((d->conv_in_bo.haddr | d->conv_w_bo.haddr | d->conv_out_bo.haddr |
+          d->rc_bo.haddr) >> 32))
+        return -1;
+
+    memcpy((void *)(uintptr_t)d->conv_in_bo.vaddr,  feat_q, in_bytes);
+    memcpy((void *)(uintptr_t)d->conv_w_bo.vaddr,   wq,     w_bytes);
+    memset((void *)(uintptr_t)d->conv_out_bo.vaddr, 0x7F,   out_bytes);
+
+    int n = npu_direct_gen_conv_regs((uint64_t *)(uintptr_t)d->rc_bo.vaddr,
+                                     VLLM_NPU_REGS_MAX,
+                                     (uint32_t)d->conv_in_bo.haddr,
+                                     (uint32_t)d->conv_w_bo.haddr,
+                                     (uint32_t)d->conv_out_bo.haddr,
+                                     C_al, Hband, W, KH, KW, stride, pad, OC);
+    if (n < 0) return -1;
+
+    int sres = npu_conv_submit_once(d, d->rc_bo.haddr, (uint32_t)n);
+    if (sres != 0) { d->broken = 1; return -2; }
+
+    /* DPU output cube: [OC/4][OH*OW][4] int32 (planar-4 de-interleave). */
+    const int32_t *cube = (const int32_t *)(uintptr_t)d->conv_out_bo.vaddr;
+    for (int oc = 0; oc < OC; oc++) {
+        int32_t *o = out + (size_t)oc * oh * ow;
+        const int32_t *src = cube + (size_t)(oc / 4) * oh * ow * 4 + (oc % 4);
+        for (int p = 0; p < oh * ow; p++)
+            o[p] = src[(size_t)p * 4];
+    }
+    return 0;
+}
+
+/* One native-conv correctness case vs a CPU oracle (raw int32 accumulate).
+ * Reuses the conv_i32 path *and* the cached scratch BOs. Returns 1 = PASS. */
+static int npu_conv_test(vllm_npu_direct_t *d, int C, int H, int W,
+                         int KH, int KW, int stride, int pad, int OC) {
+    const int OH = (H + 2 * pad - KH) / stride + 1;
+    const int OW = (W + 2 * pad - KW) / stride + 1;
+    const int C_al = ((C + 15) / 16) * 16, OCp = ((OC + 15) / 16) * 16;
+    int8_t *feat = NULL, *wt = NULL, *fpack = NULL, *wpack = NULL;
+    int32_t *ref = NULL, *got = NULL;
+    long long mabs = 0; double mrel = 0.0; int pass = 0; int rc = 0;
+
+    feat  = (int8_t *)malloc((size_t)C * H * W);
+    wt    = (int8_t *)malloc((size_t)OC * KH * KW * C);
+    fpack = (int8_t *)calloc(1, (size_t)C_al * H * W);
+    wpack = (int8_t *)calloc(1, (size_t)KH * KW * C_al * OCp);
+    ref   = (int32_t *)calloc((size_t)OC * OH * OW, 4);
+    got   = (int32_t *)calloc((size_t)OC * OH * OW, 4);
+    if (!feat || !wt || !fpack || !wpack || !ref || !got) goto done;
+
+    for (int k = 0; k < C * H * W; k++)
+        feat[k] = (int8_t)(((k * 37 + 11) % 255) - 127);
+    for (int k = 0; k < OC * KH * KW * C; k++)
+        wt[k] = (int8_t)(((k * 29 + 7) % 255) - 127);
+
+    for (int oc = 0; oc < OC; oc++)
+        for (int oh = 0; oh < OH; oh++)
+            for (int ow = 0; ow < OW; ow++) {
+                int64_t acc = 0;
+                for (int ky = 0; ky < KH; ky++)
+                    for (int kx = 0; kx < KW; kx++) {
+                        int ih = oh * stride + ky - pad, iw = ow * stride + kx - pad;
+                        if (ih < 0 || ih >= H || iw < 0 || iw >= W) continue;
+                        for (int ic = 0; ic < C; ic++)
+                            acc += (int64_t)feat[(ic * H + ih) * W + iw] *
+                                   (int64_t)wt[((oc * KH + ky) * KW + kx) * C + ic];
+                    }
+                ref[(oc * OH + oh) * OW + ow] = (int32_t)acc;
+            }
+
+    npu_pack_feature_conv(fpack, feat, C, H, W);
+    npu_pack_weight_conv(wpack, wt, C, KH, KW, OC);
+
+    rc = vllm_npu_direct_conv_i32(d, got, fpack, wpack, C_al, H, W, KH, KW,
+                                  stride, pad, OH, OW, OC, 0, 0);
+    if (rc != 0) {
+        pass = 0; goto done;
+    }
+    for (int k = 0; k < OC * OH * OW; k++) {
+        long long diff = (long long)got[k] - (long long)ref[k];
+        if (diff < 0) diff = -diff;
+        if (diff > mabs) mabs = diff;
+        double den = (double)(ref[k] < 0 ? -ref[k] : ref[k]);
+        if (den < 1.0) den = 1.0;
+        double rel = (double)diff / den;
+        if (rel > mrel) mrel = rel;
+    }
+    pass = (mrel < 1e-3) ? 1 : 0;
+done:
+    free(feat); free(wt); free(fpack); free(wpack); free(ref); free(got);
+    if (getenv("VLLM_NPU_CONV_SWEEP") || getenv("VLLM_NPU_CONV_DUMP"))
+        fprintf(stderr, "  [sweep] C=%d H=%d W=%d %dx%d s=%d p=%d OC=%d %s rc=%d max|D|=%lld rel=%.2e\n",
+                C, H, W, KH, KW, stride, pad, OC, pass ? "PASS" : "FAIL", rc, mabs, mrel);
+    return pass;
+}
+
+/* Shape envelope probe (env VLLM_NPU_CONV_SWEEP): which geometries the
+ * Phase-1 register recipe generalises to. Returns count of FAILs. */
+static int vllm_npu_direct_conv_calib_sweep(int verbosity, int core_mask) {
+    static const int sh[] = {
+        /* C, H,  W, KH,KW, s, p, OC */
+        16,  8,  8, 3, 3, 1, 1, 16,
+        16, 16, 16, 3, 3, 1, 1, 16,
+        16, 32, 32, 3, 3, 1, 1, 16,
+        32, 16, 16, 3, 3, 1, 1, 32,
+        16, 16, 16, 3, 3, 2, 1, 16,
+        16, 32, 32, 3, 3, 2, 1, 16,
+        16, 20, 20, 1, 1, 1, 0, 16,
+        16, 40, 40, 3, 3, 1, 1, 16,
+        16,  8, 24, 3, 3, 1, 1, 16,
+        16, 24,  8, 3, 3, 1, 1, 16,
+        64, 20, 20, 3, 3, 1, 1, 64,
+    };
+    vllm_npu_direct_t *d = vllm_npu_direct_open(verbosity, core_mask);
+    int fails = 0;
+    if (!d || d->fd < 0) { printf("[NPU-CONV-SWEEP] SKIP no rknpu node\n"); if (d) vllm_npu_direct_close(d); return 0; }
+    if (d->backend != NPU_BACKEND_DRM) { printf("[NPU-CONV-SWEEP] SKIP backend not DRM\n"); vllm_npu_direct_close(d); return 0; }
+
+    /* Single-shape probe: VLLM_NPU_CONV_SHAPE="C,H,W,KH,KW,s,p,OC". */
+    {
+        const char *one = getenv("VLLM_NPU_CONV_SHAPE");
+        if (one && one[0]) {
+            int v[8] = {16, 16, 16, 3, 3, 1, 1, 16};
+            sscanf(one, "%d,%d,%d,%d,%d,%d,%d,%d",
+                   &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]);
+            printf("[NPU-CONV-SHAPE] C=%d H=%d W=%d %dx%d s=%d p=%d OC=%d\n",
+                   v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+            int ok = npu_conv_test(d, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+            vllm_npu_direct_close(d);
+            return ok ? 0 : 1;
+        }
+    }
+
+    printf("[NPU-CONV-SWEEP] shape envelope probe (%d shapes)\n", (int)(sizeof(sh)/sizeof(sh[0])/8));
+    for (size_t i = 0; i + 7 < sizeof(sh)/sizeof(sh[0]); i += 8) {
+        int C = sh[i], H = sh[i+1], W = sh[i+2], KH = sh[i+3], KW = sh[i+4];
+        int s = sh[i+5], p = sh[i+6], OC = sh[i+7];
+        if (d->broken) {
+            /* A wedged submit latches the handle; reopen a fresh one to keep
+             * probing the remaining shapes (title is per-process state). */
+            vllm_npu_direct_close(d);
+            usleep(300000);
+            d = vllm_npu_direct_open(verbosity, core_mask);
+            if (!d || d->fd < 0) { printf("[NPU-CONV-SWEEP] reopen failed - abort\n"); return fails; }
+        }
+        printf("  C=%d H=%d W=%d %dx%d s=%d p=%d OC=%d ... ", C, H, W, KH, KW, s, p, OC);
+        fflush(stdout);
+        int ok = npu_conv_test(d, C, H, W, KH, KW, s, p, OC);
+        printf("%s\n", ok ? "PASS" : "FAIL");
+        fflush(stdout);
+        if (!ok) fails++;
+    }
+    vllm_npu_direct_close(d);
+    printf("[NPU-CONV-SWEEP] done fails=%d\n", fails);
+    return fails;
+}
+
+int vllm_npu_direct_conv_calib(int verbosity, int core_mask) {
+    if (getenv("VLLM_NPU_CONV_SWEEP"))
+        return vllm_npu_direct_conv_calib_sweep(verbosity, core_mask);
+    /* Fixed Phase-1 shape. */
+    const int C = 16, H = 8, Wd = 8, KH = 3, KW = 3, stride = 1, pad = 1, OC = 16;
+    const int OH = (H + 2 * pad - KH) / stride + 1;
+    const int OW = (Wd + 2 * pad - KW) / stride + 1;
+    const int C_al = ((C + 15) / 16) * 16;
+    const int OCp  = ((OC + 15) / 16) * 16;
+    const size_t in_bytes  = (size_t)C_al * H * Wd;
+    const size_t w_bytes   = (size_t)KH * KW * C_al * OCp;
+    const size_t out_int   = (size_t)OCp * OH * OW;
+    const size_t out_bytes = out_int * 4 + 64;
+
+    vllm_npu_direct_t *d;
+    vllm_npu_bo_t bo_in, bo_w, bo_out;
+    int8_t *feat = NULL, *wt = NULL, *fpack = NULL, *wpack = NULL;
+    int32_t *ref = NULL, *got = NULL;
+    long long max_abs = 0;
+    double max_rel = 0.0;
+    int n, sres, rc, pass;
+
+    printf("[NPU-CONV-CALIB] target C=%d H=%d W=%d %dx%d s=%d p=%d OC=%d int8->int32 "
+           "(C_al=%d OCp=%d OH=%d OW=%d)\n",
+           C, H, Wd, KH, KW, stride, pad, OC, C_al, OCp, OH, OW);
+    fflush(stdout);
+
+    d = vllm_npu_direct_open(verbosity, core_mask);
+    if (!d || d->fd < 0) {
+        printf("[NPU-CONV-CALIB] SKIP no rknpu node\n");
+        if (d) vllm_npu_direct_close(d);
+        return 0;
+    }
+    if (d->backend != NPU_BACKEND_DRM) {
+        printf("[NPU-CONV-CALIB] SKIP backend not DRM (misc not wired)\n");
+        vllm_npu_direct_close(d);
+        return 0;
+    }
+
+    memset(&bo_in, 0, sizeof(bo_in));
+    memset(&bo_w, 0, sizeof(bo_w));
+    memset(&bo_out, 0, sizeof(bo_out));
+    rc = 1;
+
+    feat  = (int8_t *)malloc((size_t)C * H * Wd);
+    wt    = (int8_t *)malloc((size_t)OC * KH * KW * C);
+    fpack = (int8_t *)calloc(1, in_bytes);
+    wpack = (int8_t *)calloc(1, w_bytes);
+    ref   = (int32_t *)calloc(out_int ? out_int : 1, sizeof(int32_t));
+    got   = (int32_t *)calloc(out_int ? out_int : 1, sizeof(int32_t));
+    if (!feat || !wt || !fpack || !wpack || !ref || !got) {
+        printf("[NPU-CONV-CALIB] FAIL malloc\n");
+        goto done;
+    }
+
+    /* Deterministic pseudo-random int8 inputs. */
+    for (int k = 0; k < C * H * Wd; k++)
+        feat[k] = (int8_t)(((k * 37 + 11) % 255) - 127);
+    for (int k = 0; k < OC * KH * KW * C; k++)
+        wt[k] = (int8_t)(((k * 29 + 7) % 255) - 127);
+
+    /* CPU oracle: standard int32 accumulate, no quantisation scaling. */
+    for (int oc = 0; oc < OC; oc++)
+        for (int oh = 0; oh < OH; oh++)
+            for (int ow = 0; ow < OW; ow++) {
+                int64_t acc = 0;
+                for (int ky = 0; ky < KH; ky++)
+                    for (int kx = 0; kx < KW; kx++) {
+                        int ih = oh * stride + ky - pad;
+                        int iw = ow * stride + kx - pad;
+                        if (ih < 0 || ih >= H || iw < 0 || iw >= Wd) continue;
+                        for (int ic = 0; ic < C; ic++)
+                            acc += (int64_t)feat[(ic * H + ih) * Wd + iw] *
+                                   (int64_t)wt[((oc * KH + ky) * KW + kx) * C + ic];
+                    }
+                ref[(oc * OH + oh) * OW + ow] = (int32_t)acc;
+            }
+
+    npu_pack_feature_conv(fpack, feat, C, H, Wd);
+    npu_pack_weight_conv(wpack, wt, C, KH, KW, OC);
+
+    if (vllm_npu_direct_bo_alloc(d, &bo_in, in_bytes) != 0 ||
+        vllm_npu_direct_bo_alloc(d, &bo_w, w_bytes) != 0 ||
+        vllm_npu_direct_bo_alloc(d, &bo_out, out_bytes) != 0) {
+        printf("[NPU-CONV-CALIB] FAIL BO alloc\n");
+        goto done;
+    }
+    memcpy((void *)(uintptr_t)bo_in.vaddr, fpack, in_bytes);
+    memcpy((void *)(uintptr_t)bo_w.vaddr, wpack, w_bytes);
+    memset((void *)(uintptr_t)bo_out.vaddr, 0x7F, out_bytes);
+
+    if (vllm_npu_direct_ensure_cache(d) != 0) {
+        printf("[NPU-CONV-CALIB] FAIL regcmd/task BO cache\n");
+        goto done;
+    }
+    if (((bo_in.haddr | bo_w.haddr | bo_out.haddr | d->rc_bo.haddr) >> 32)) {
+        printf("[NPU-CONV-CALIB] FAIL IOVA exceeds 32 bits\n");
+        goto done;
+    }
+
+    n = npu_direct_gen_conv_regs((uint64_t *)(uintptr_t)d->rc_bo.vaddr,
+                                 VLLM_NPU_REGS_MAX,
+                                 (uint32_t)bo_in.haddr, (uint32_t)bo_w.haddr,
+                                 (uint32_t)bo_out.haddr,
+                                 C, H, Wd, KH, KW, stride, pad, OC);
+    if (n < 0) {
+        printf("[NPU-CONV-CALIB] FAIL regcmd generation (CBUF overflow?)\n");
+        goto done;
+    }
+    if (d->verbosity > 0)
+        printf("[NPU-CONV-CALIB] regcmd words=%d in=0x%x w=0x%x out=0x%x\n",
+               n, (unsigned)bo_in.haddr, (unsigned)bo_w.haddr, (unsigned)bo_out.haddr);
+
+    sres = npu_conv_submit_once(d, d->rc_bo.haddr, (uint32_t)n);
+    if (sres != 0) {
+        printf("[NPU-CONV-CALIB] FAIL submit rc=%d errno=%s (no retry)\n",
+               sres, strerror(errno));
+        d->broken = 1;
+        goto done;
+    }
+
+    /* DPU output cube: [OC/4][OH*OW][4] int32 (planar-4). */
+    {
+        const int32_t *cube = (const int32_t *)(uintptr_t)bo_out.vaddr;
+        for (int oc = 0; oc < OC; oc++)
+            for (int oh = 0; oh < OH; oh++)
+                for (int ow = 0; ow < OW; ow++) {
+                    int p = oh * OW + ow;
+                    got[(oc * OH + oh) * OW + ow] =
+                        cube[((oc / 4) * OH * OW + p) * 4 + (oc % 4)];
+                }
+    }
+    if (getenv("VLLM_NPU_CONV_DUMP")) {
+        const int32_t *cube = (const int32_t *)(uintptr_t)bo_out.vaddr;
+        int nw = (int)(out_bytes / 4);
+        printf("    raw cube (%d int32):\n", nw);
+        for (int k = 0; k < nw && k < 320; k++) {
+            printf(" %d", cube[k]);
+            if ((k % 16) == 15) printf("\n");
+        }
+        printf("\n");
+    }
+
+    for (int k = 0; k < OC * OH * OW; k++) {
+        long long diff = (long long)got[k] - (long long)ref[k];
+        double denom, rel;
+        if (diff < 0) diff = -diff;
+        if (diff > max_abs) max_abs = diff;
+        denom = (double)(ref[k] < 0 ? -ref[k] : ref[k]);
+        if (denom < 1.0) denom = 1.0;
+        rel = (double)diff / denom;
+        if (rel > max_rel) max_rel = rel;
+    }
+    pass = (max_rel < 1e-3);
+    printf("[NPU-CONV-CALIB] conv C=%d H=%d W=%d %dx%d s=%d p=%d OC=%d int8->int32 %s "
+           "max|Δ|=%lld rel=%.2e\n",
+           C, H, Wd, KH, KW, stride, pad, OC, pass ? "PASS" : "FAIL",
+           max_abs, max_rel);
+    if (!pass) {
+        /* diagnostics: locate sentinel (never-written) and mismatches */
+        long sent = 0, miss[16], bmin_oc = OC, bmax_oc = -1, bmin_oh = OH, bmax_oh = -1,
+             bmin_ow = OW, bmax_ow = -1;
+        for (int oc = 0; oc < OC; oc++) miss[oc] = 0;
+        for (int oc = 0; oc < OC; oc++)
+            for (int oh = 0; oh < OH; oh++)
+                for (int ow = 0; ow < OW; ow++) {
+                    int k = (oc * OH + oh) * OW + ow;
+                    int32_t v = got[k];
+                    if (v == (int32_t)0x7F7F7F7F) sent++;
+                    if (v != ref[k]) {
+                        miss[oc]++;
+                        if (oc < bmin_oc) bmin_oc = oc;
+                        if (oc > bmax_oc) bmax_oc = oc;
+                        if (oh < bmin_oh) bmin_oh = oh;
+                        if (oh > bmax_oh) bmax_oh = oh;
+                        if (ow < bmin_ow) bmin_ow = ow;
+                        if (ow > bmax_ow) bmax_ow = ow;
+                    }
+                }
+        printf("    sentinel(0x7F7F7F7F)=%ld bbox oc[%ld..%ld] oh[%ld..%ld] ow[%ld..%ld]\n",
+               sent, bmin_oc, bmax_oc, bmin_oh, bmax_oh, bmin_ow, bmax_ow);
+        printf("    miss per oc:");
+        for (int oc = 0; oc < OC; oc++) printf(" %ld", miss[oc]);
+        printf("\n");
+        for (int oh = 0; oh < 3 && oh < OH; oh++) {
+            printf("    oc0 oh%d got:", oh);
+            for (int ow = 0; ow < OW; ow++) printf(" %d", got[(0 * OH + oh) * OW + ow]);
+            printf("\n    oc0 oh%d ref:", oh);
+            for (int ow = 0; ow < OW; ow++) printf(" %d", ref[(0 * OH + oh) * OW + ow]);
+            printf("\n");
+        }
+        for (int oc = 0; oc < OC; oc++) {
+            if (!miss[oc]) continue;
+            printf("    first miss oc%d: got=%d ref=%d (oh/ow scan)\n", oc, got[oc*OH*OW], ref[oc*OH*OW]);
+            break;
+        }
+    }
+    fflush(stdout);
+    rc = pass ? 0 : 1;
+
+done:
+    vllm_npu_direct_bo_free(d, &bo_out);
+    vllm_npu_direct_bo_free(d, &bo_w);
+    vllm_npu_direct_bo_free(d, &bo_in);
+    free(feat); free(wt); free(fpack); free(wpack); free(ref); free(got);
+    vllm_npu_direct_close(d);
+    return rc;
 }

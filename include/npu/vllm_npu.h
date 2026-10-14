@@ -159,11 +159,84 @@ int vllm_npu_gemm_gw(vllm_npu_t *npu, float *out,
                      uint64_t wkey);
 
 /**
+ * Same as vllm_npu_gemm_gw but with an explicit N-per-pass hint (nt_hint).
+ * Called by workloads made of MANY SMALL GEMMs (conv-as-GEMM): there the
+ * wall time is the SUBMIT COUNT (~0.5 ms each), not the FLOPs, so the caller
+ * picks a smaller Nt together with a larger G to minimise ceil(N/Nt)*K/G.
+ * nt_hint 0 (or out of range / misaligned) = default/env behaviour, exactly
+ * like vllm_npu_gemm_gw.
+ */
+int vllm_npu_gemm_gw_ex(vllm_npu_t *npu, float *out,
+                        const int8_t *Aq, const float *a_scale,
+                        const int8_t *Wq, const float *b_scale,
+                        int M, int N, int K, int G, int prec,
+                        uint64_t wkey, int nt_hint);
+
+/**
+ * K-YOLO-001 M3 Phase-2: native (CNA CONV_MODE=0) regular convolution, one
+ * band per submit, DIRECT backend only. The caller pre-packs the NC1HWC2
+ * (C2=16) int8 feature band [C_al][Hband][W] and a signed-int8 weight cube
+ * for OC channels (already sliced for the OC band). Writes the raw int32
+ * accumulator into out[oc*OH_band*OW + oh*OW + ow]. Returns 0 on success,
+ * nonzero -> caller MUST fall back (no retry). On non-Linux/without the driver
+ * it always returns nonzero.
+ *   feat_q : [C_al][Hband][W] int8, C_al % 16 == 0
+ *   wq     : weight cube, see vllm_npu_direct_pack_weight_conv layout
+ *   pad    : hardware symmetric top/left pad (0 if the caller pre-padded)
+ */
+int vllm_npu_conv_i32(vllm_npu_t *npu, int32_t *out,
+                      const int8_t *feat_q, const int8_t *wq,
+                      int C_al, int Hband, int W,
+                      int KH, int KW, int stride, int pad,
+                      int OH_band, int OW, int OC, int OC_off, int wbank_hint);
+
+/**
  * Self-test: exercises the active backend (direct: /dev/rknpu open + BO
  * round-trip + a small group-wise matmul against a CPU reference; rknn:
  * exported gemm model). Returns 0 on success, nonzero if a check failed.
  */
 int vllm_npu_selftest(vllm_npu_t *npu);
+
+/* ================================================================
+ * K-YOLO-003：整网 RKNN 模型（官方 .rknn 检测路径，opt-in 第二路径）
+ *
+ * 与上面「算子级」RKNN 模型不同，这里加载的是 Rockchip **整网** .rknn（如
+ * rknn_model_zoo 的 yolov8.rknn）：喂 uint8 NHWC 图像、取回 N 个 fp32 输出，
+ * 家族的 DFL/解码/NMS 由 YOLO 层负责。复用同一 dlopen 函数表。
+ *
+ * 契约：任何失败（runtime 缺失 / 文件不可读 / rknn_init 失败 / 输入几何不支持）
+ * 一律返回 NULL，调用方**显式回退**到 VQF/CPU 路径——绝不静默降级
+ * （公理 silent_fallback_false_pass）。
+ * ================================================================ */
+typedef struct vllm_npu_rknn vllm_npu_rknn;   /* opaque */
+
+/** 加载整网 .rknn。core_mask=0 走 runtime 默认。成功返回句柄，失败 NULL。 */
+vllm_npu_rknn *vllm_npu_rknn_open(vllm_npu_t *npu, const char *path, int core_mask);
+void           vllm_npu_rknn_close(vllm_npu_rknn *m);
+
+/** 运行时版本串（如 "2.3.2 ... (drv 0.9.6)"）。返回 strlen 或 -1。 */
+int vllm_npu_rknn_sdk(const vllm_npu_rknn *m, char *buf, int len);
+
+/** 输入几何（前处理用）：填 NHWC 的 H/W/C。返回 0 成功。 */
+int vllm_npu_rknn_input_hwc(const vllm_npu_rknn *m, int *h, int *w, int *c);
+
+/** 输出个数（失败 -1）。 */
+int vllm_npu_rknn_n_outputs(const vllm_npu_rknn *m);
+
+/** 第 i 个输出的维度。dims 至少 max_dims 个元素。返回 0 成功。 */
+int vllm_npu_rknn_output_dims(const vllm_npu_rknn *m, int i,
+                              int *n_dims, int *dims, int max_dims);
+
+/** 打印输入/输出属性（诊断）。 */
+void vllm_npu_rknn_dump(const vllm_npu_rknn *m);
+
+/**
+ * 推理一次：in = uint8 NHWC（大小 = H*W*C，见 input_hwc）。
+ * out_data[i] 由本层 malloc（fp32，out_nelems[i] 个 float）——调用方负责 free。
+ * 返回 0 成功；负数表示失败（调用方须回退）。
+ */
+int vllm_npu_rknn_run(vllm_npu_rknn *m, const uint8_t *in,
+                      float **out_data, int *out_nelems);
 
 #ifdef __cplusplus
 }

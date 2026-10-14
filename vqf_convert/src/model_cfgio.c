@@ -615,9 +615,27 @@ int st_parse_config(const char *model_dir, STModelConfig *cfg) {
     return 0;
 }
 
+/* 名字归一化：部分 HF 导出（如 Qwen3-Embedding-0.6B）保存的是**裸名**
+ * （`embed_tokens.weight` / `layers.N.*` / `norm.weight`），而转换器内部一律按
+ * 带包裹层的前缀查询（`model.` / `model.language_model.`）。比较时把两侧的包裹
+ * 前缀统一剥掉，使两套命名等价；既有模型本就精确匹配（第一轮即命中），行为不变。 */
+static const char *strip_wrap(const char *n) {
+    if (strncmp(n, "model.", 6) == 0) {
+        const char *p = n + 6;
+        if (strncmp(p, "language_model.", 15) == 0) p += 15;
+        return p;
+    }
+    return n;
+}
+
 const STTensorInfo *find_tensor(const STModelConfig *cfg, const char *name) {
     for (int i = 0; i < cfg->n_tensors; i++) {
         if (strcmp(cfg->tensors[i].name, name) == 0) return &cfg->tensors[i];
+    }
+    /* 精确名未命中 → 按去包裹前缀归一化后再比一次（覆盖裸名导出） */
+    const char *qn = strip_wrap(name);
+    for (int i = 0; i < cfg->n_tensors; i++) {
+        if (strcmp(strip_wrap(cfg->tensors[i].name), qn) == 0) return &cfg->tensors[i];
     }
     return NULL;
 }

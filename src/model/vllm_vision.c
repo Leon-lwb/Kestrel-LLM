@@ -325,9 +325,19 @@ static void vvis_vit_attn_block(void *ctx_, int pb) {
                 float32x4_t acc[VVIS_ATTN_ACC];
                 for (int i = 0; i < v4n; i++)
                     acc[i] = vmulq_f32(vld1q_f32(q_h + i * 4), vld1q_f32(k_s + i * 4));
-                for (int w = v4n / 2; w >= 1; w >>= 1)
-                    for (int i = 0; i < w; i++)
-                        acc[i] = vaddq_f32(acc[i], acc[i + w]);
+                /* 归约 v4n 个 4 宽累加器：`v4n` 为 2 的幂时与旧的「逐次减半二分树」
+                 * 逐位一致（2B 的 hd=64 → v4n=16，行为不变）；否则把**奇数尾项**
+                 * 折回 acc[0]，避免漏项。旧实现 `for (w=v4n/2; w>=1; w>>=1)` 只覆盖
+                 * 2 的幂：Qwen3-VL-8B 的 vis head_dim=72 → v4n=18 会静默丢掉
+                 * acc[8]/acc[17]，即注意力点积漏掉 head 维 32-35 与 68-71
+                 * （实测：8B 视觉语义全错、2B 正常，见 K-BENCH-020 排查）。 */
+                for (int nacc = v4n; nacc > 1; ) {
+                    int hf = nacc >> 1;
+                    for (int i = 0; i < hf; i++)
+                        acc[i] = vaddq_f32(acc[i], acc[i + hf]);
+                    if (nacc & 1) acc[0] = vaddq_f32(acc[0], acc[nacc - 1]);
+                    nacc = hf;
+                }
                 float32x2_t lo = vget_low_f32(acc[0]);
                 float32x2_t hi = vget_high_f32(acc[0]);
                 scores[(size_t)q * n_patches + s] =

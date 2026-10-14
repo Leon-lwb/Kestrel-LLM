@@ -42,7 +42,7 @@
 | **逐层推理**（v1 新增） | 权重常驻与模型体积解耦：**8B 权重常驻 4.19 GB → 0.48 GB（8.7×）**，serve 峰值 **0.82 GB**；远程复测热态 **TTFT 1.73 s / tpot 330 ms**（5 次同请求中位数，见「性能」§4） |
 | **长文本与多轮** | 组合①（L3 驱逐 × 前缀复用）追问轮 prefill **−80% ~ −96%**；30B 再叠 MoE 组合⑤后 t2/t3 仅 **4.7 s / 3.2 s** |
 | **规则包（预置上下文）** | 现场规程 / 术语 / 参数这类**反复使用**的固定手册离线构建成可复用前缀：短手册（5,791 token）命中 **≈82×**（194.3 s → 2.4 s）；**>8K token 手册不落盘**，退回全量 prefill（见 wiki「规则包与预置上下文」） |
-| **稀疏注意力长度门控** | `--sparse-min-ctx`（decode，默认 1024）/ `--sparse-pf-min-ctx`（prefill，默认 3072）：旧门恒为 64（≈没门）导致短上下文净亏（ctx 1067 时 **+18.4%**），加门后 4K 起 decode 稀疏稳定快 **1.8×** |
+| **稀疏注意力长度门控** | `--sparse-min-ctx`（decode，默认 1024）/ `--sparse-pf-min-ctx`（prefill，默认 3072）。**decode 侧**加门后自 4K 起单调转正：**4K 1.58× / 8K 2.16× / 16K 2.92×**（2B，见 wiki「优化配置与边界」；2026-09-30 板端 8B 复测为 **1.54×**）。**prefill 侧**才是要命的那条：相对精确 prefill 在 ctx 1067 时仍 **+18.4%**，4.4K 才转正（−11.1%）、8.6K −29.0%、16K −45.1%。两条轴**默认都关** |
 | **纯自研格式与内核** | 只认自研 VQF v2 单文件；单产物 **≈0.8 MB**，零第三方运行时；手写 NEON 量化 GEMM/GEMV、自研线程池、自研国密 |
 | **可验证推理** | SM2 供应链签名护权重 + 逐请求 attestation 凭证（schema 3），浏览器内 / 离线零依赖验签 |
 
@@ -421,7 +421,7 @@ cmake -B build-rk3588 && cmake --build build-rk3588 -j8
 引擎的**一级目标平台是 aarch64**；x86-64 分支（`vllm_platform.h`）仅用于**功能自检与
 数值一致性对照**，**不作为性能基准**——x86 上跑的绝对吞吐/加速比不能外推到板端。
 两侧内核不同（AVX2/标量 vs NEON/dotprod），**跨架构不保证 TOKIDS 逐位一致**（实测边界见
-[wiki/架构总览.md](wiki/架构总览.md)「位级确定性」一节）。
+[docs/技术文档.md](docs/技术文档.md)「位级确定性」一节）。
 
 ```powershell
 # Windows / MinGW-w64（gcc 需在 PATH，或用 -Gcc 显式指定）
@@ -601,12 +601,18 @@ gcc -O2 -fopenmp -Wno-implicit-function-declaration '-Wl,--stack,33554432' \
 
 ## 模型与复现
 
-> **模型支持范围（诚实声明）**：本引擎针对并实测验证的是**两类 Qwen3 架构**：
+> **模型支持范围（诚实声明）**：本引擎针对并实测验证的是**以下架构**：
 >
 > - **Qwen3-VL 系列（2B / 8B）**——纯文本与图片/视频多模态；tokenizer、mrope、
 >   DeepStack 视觉塔等均为该架构特化实现。
 > - **Qwen3-MoE 系列（如 Qwen3-30B-A3B，文本）**——路由 + 逐专家 FFN 已接入
 >   （`--moe-batch` / `VLLM_ACTQ` 等加速，见管理页「MoE 模型服务」组合）。
+> - **Qwen3-Embedding-0.6B**——句子向量嵌入（last-token 池化 + L2 归一化），需 **byte-level BPE** 分词器。
+> - **Laya（ModernBERT-large + 决策头）**——非自回归决策模型（输出决策，不生成文本）。
+> - **YOLO（v5 / v8 / v11）**——目标检测；自有 **VQF v4** 检测格式，走 NPU 直驱或 ARM CPU int8 `vdotq_s32` 路径。
+>
+>   后三者为新一轮新增，其适配与优化全过程（含实测数据与复现口径）见
+>   [docs/tutorial/01-总览.md](docs/tutorial/01-总览.md)。
 >
 > **其他架构（Llama、旧版 Qwen / Qwen2 纯文本等）未经适配与验证**：转换可能报错或
 > 输出不可用，请勿据此推定为通用推理引擎。
@@ -711,13 +717,20 @@ gcc -O2 -fopenmp -Wno-implicit-function-declaration '-Wl,--stack,33554432' \
 | [docs/prefill注意力PV分块优化原理.md](docs/prefill注意力PV分块优化原理.md) | prefill 注意力 PV 分块：原理与探针结论 |
 | [docs/投机解码瓶颈分析与MTP落地方案.md](docs/投机解码瓶颈分析与MTP落地方案.md) | 投机解码瓶颈分析与 MTP 落地路线 |
 | [docs/逐层驻留专家级读取方案.md](docs/逐层驻留专家级读取方案.md) | 逐层驻留下的 MoE 专家级权重读取方案 |
+| [docs/落地台账.md](docs/落地台账.md) | **单一真源台账**：门（env）默认值 / 语义 / 取证位置，立项清单与门禁进度、默认化判定（`perf_axiom_single_source_ledger_v1`）；与正文冲突时以本表为准 |
+| [docs/tutorial/01-总览.md](docs/tutorial/01-总览.md) | **三类模型接入与优化教程**（向量嵌入 / Laya 决策 / YOLO 检测；「原理+实测数据+复现口径」，共 7 篇：适配与优化各半） |
+| [docs/K-BENCH-*.md](docs/K-BENCH-017-板端8B-vllm-vs-llamacpp对比.md) | **板端基准报告**：8B vs llama.cpp（K-BENCH-017）、MoE-30B-A3B（018）、2B Qwen3-VL vs llama.cpp（019）、多模态 2B/8B（020） |
+| [docs/K-EMB-001-*.md](docs/K-EMB-001-句子向量嵌入-Qwen3-Embedding-0.6B适配与byte-level-BPE分词器.md) | 句子向量嵌入 Qwen3-Embedding-0.6B 适配（含引擎分词器改造为 byte-level BPE） |
+| [docs/K-LAYA-001-*.md](docs/K-LAYA-001-非自回归决策模型-Laya-ModernBERT适配.md) | 非自回归决策模型 Laya（ModernBERT-large + 决策头）适配 |
+| [docs/立项-K-*.md](docs/立项-K-KV-002-G0-KV侧内存默认化.md) | **优化立项方案书**（K-ACTQ / K-DENSE / K-DN / K-EMB / K-GU / K-KV / K-L0 / K-LAYA / K-MIXQ / K-MOE / K-PF / K-SPEC / K-YOLO / K-COLLAB）：先冻结判据、逐级回填实测与判定 |
+| [docs/参考借鉴-Strata与FreeToken.md](docs/参考借鉴-Strata与FreeToken.md) | 外部引擎（Strata / FreeToken）参照与可借鉴手法（含交叉验证与「不可借」项） |
 | [docs/PRE_REG_*.txt](docs/PRE_REG_STREAM_SA.txt) | **预注册**：先写判据再看数据（稀疏 SA / MoE 长上下文 NIAH / Q4 GEMM / 专家粒度探针），原始产物见 `docs/bench/` |
 | [docs/bench/](docs/bench/20260915-rk3588-llama-ab/MANIFEST.txt) | **原始基准归档**：正文各测点的原始产物（各轮响应 json、引擎日志、`summary.txt`、`REPORT.txt`）与产生它们的板端脚本、md5 留证清单；每个测点一个目录，入口见目录内 `MANIFEST.txt` |
 
 > 不想逐篇翻文档？直接看 **[项目 Wiki](https://gitee.com/pei-xiaoguang/kestrel-llm/wikis/Home)**——
 > 按「上手 → 原理 → 数据与调优 → 安全」组织的导航页，并统一了**术语与数据口径**
 > （版本分区、冷/热页缓存、纯权重 RSS vs serve 峰值）。Wiki 为中文，由上述 `docs/` 提炼，
-> 细节以原文为准；同一套内容也随仓库分发在 [`wiki/`](wiki/Home.md)（克隆后离线可读）。
+> 细节以原文为准；仓内已不再随版本分发 `wiki/`，离线阅读以本节 `docs/` 为单一来源。
 
 ---
 

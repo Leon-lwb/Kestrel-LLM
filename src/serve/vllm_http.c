@@ -54,6 +54,281 @@ long vhttp_active_conns(void) {
 }
 
 /* ================================================================
+ * Minimal outbound HTTP/1.1 client（云边协同：边缘节点 → 云端上游）
+ *
+ * 只支持明文 http://（零第三方、无 TLS）。需要 https 时，请在边缘侧部署
+ * 一个反代/网关终止 TLS（本项目一贯的"零依赖"红线，不内嵌 TLS 栈）。
+ * ================================================================ */
+#ifdef _WIN32
+typedef SOCKET vclient_fd;
+#define VCLIENT_INVALID INVALID_SOCKET
+#define VCLIENT_BAD(f) ((f) == INVALID_SOCKET)
+#else
+typedef int vclient_fd;
+#define VCLIENT_INVALID (-1)
+#define VCLIENT_BAD(f) ((f) < 0)
+#endif
+
+static void vclient_close(vclient_fd fd) {
+#ifdef _WIN32
+    closesocket(fd);
+#else
+    close(fd);
+#endif
+}
+
+static int vclient_send(vclient_fd fd, const char *buf, size_t len) {
+#ifdef _WIN32
+    return send(fd, buf, (int)len, 0);
+#else
+    return (int)send(fd, buf, len, 0);
+#endif
+}
+
+static int vclient_recv(vclient_fd fd, char *buf, size_t len) {
+#ifdef _WIN32
+    return recv(fd, buf, (int)len, 0);
+#else
+    return (int)recv(fd, buf, len, 0);
+#endif
+}
+
+static void vclient_set_timeout_ms(vclient_fd fd, int ms) {
+#ifdef _WIN32
+    DWORD t = (DWORD)ms;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&t, sizeof(t));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&t, sizeof(t));
+#else
+    struct timeval tv;
+    tv.tv_sec = ms / 1000; tv.tv_usec = (ms % 1000) * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+}
+
+static void vclient_set_timeout(vclient_fd fd, int seconds) {
+    vclient_set_timeout_ms(fd, seconds * 1000);
+}
+
+/* "http://host[:port][/path]" → host / port / path。
+ * 返回 0 成功；-1 非法；-2 https（不支持）。 */
+static int http_url_split(const char *url, char *host, size_t hostcap,
+                          int *port, char *path, size_t pathcap) {
+    const char *p = url;
+    if (strncmp(p, "https://", 8) == 0) return -2;
+    if (strncmp(p, "http://", 7) == 0) p += 7;
+    else if (strstr(p, "://")) return -1;
+    const char *slash = strchr(p, '/');
+    const char *colon = strchr(p, ':');
+    size_t hlen;
+    if (colon && (!slash || colon < slash)) {
+        hlen = (size_t)(colon - p);
+        *port = atoi(colon + 1);
+    } else {
+        hlen = slash ? (size_t)(slash - p) : strlen(p);
+        *port = 80;
+    }
+    if (hlen == 0 || hlen >= hostcap || *port <= 0) return -1;
+    memcpy(host, p, hlen); host[hlen] = '\0';
+    const char *pp = slash ? slash : "/";
+    if (strlen(pp) >= pathcap) return -1;
+    memcpy(path, pp, strlen(pp) + 1);
+    return 0;
+}
+
+/* 从响应头区（长度 n）取某头部的值（大小写不敏感），写入 out（"" 表示缺失）。 */
+static void vclient_hdr_value(const char *hdrs, size_t n, const char *name,
+                              char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    size_t nl = strlen(name);
+    size_t i = 0;
+    while (i < n) {
+        size_t ls = i;
+        if (nl <= n - ls && strncasecmp(hdrs + ls, name, nl) == 0 &&
+            (ls + nl) < n && hdrs[ls + nl] == ':') {
+            size_t v = ls + nl + 1;
+            while (v < n && (hdrs[v] == ' ' || hdrs[v] == '\t')) v++;
+            size_t e = v;
+            while (e < n && hdrs[e] != '\r' && hdrs[e] != '\n') e++;
+            size_t vl = e - v;
+            if (vl >= cap) vl = cap - 1;
+            memcpy(out, hdrs + v, vl);
+            out[vl] = '\0';
+            return;
+        }
+        while (i < n && hdrs[i] != '\n') i++;
+        if (i < n) i++;
+    }
+}
+
+/* 就地解码 HTTP/1.1 chunked 传输体（buf 长度 len，可写、以 NUL 结尾）。
+ * 返回解码后长度；格式非法/截断则尽量返回已解出的部分。 */
+static size_t vclient_dechunk(char *buf, size_t len) {
+    size_t r = 0, w = 0;
+    while (r < len) {
+        size_t sz = 0; int digits = 0;
+        while (r < len) {
+            char c = buf[r];
+            int hv;
+            if (c >= '0' && c <= '9') hv = c - '0';
+            else if (c >= 'a' && c <= 'f') hv = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') hv = c - 'A' + 10;
+            else break;
+            sz = sz * 16 + (size_t)hv;
+            if (sz > (64u << 20)) return w;   /* sanity: absurd chunk */
+            digits++; r++;
+        }
+        while (r < len && buf[r] != '\n') r++;      /* skip CRLF / chunk-ext */
+        if (r < len) r++;
+        if (digits == 0 || sz == 0) break;          /* malformed or last chunk */
+        if (r + sz > len) sz = len - r;             /* truncated tail */
+        memmove(buf + w, buf + r, sz);
+        w += sz; r += sz;
+        if (r < len && buf[r] == '\r') r++;
+        if (r < len && buf[r] == '\n') r++;
+    }
+    buf[w] = '\0';
+    return w;
+}
+
+/* 通用出站请求：method = "GET"/"POST"；二进制安全（*out_len 为真实长度）。
+ * 返回 0 成功；-1 参数/内存；-2 URL 非法或 https；-3 DNS；-4 connect；
+ * -5/-6 发送；-7 内存；-8 超过 max_bytes；-9 响应非 HTTP。
+ * timeout_ms：socket 收发超时（同时决定 MJPEG 这类"永不结束"响应的读取窗口，
+ * 超时后带着已收到的数据正常返回）。max_bytes<=0 ⇒ 16MB。 */
+static int vhttp_xfer(const char *method, const char *url, const char *extra_headers,
+                      const char *body, size_t body_len, int timeout_ms, size_t max_bytes,
+                      unsigned char **out, size_t *out_len,
+                      int *out_status, char *out_ct, size_t ctcap) {
+    if (!method || !url || !out || !out_len || !out_status) return -1;
+    *out = NULL; *out_len = 0; *out_status = 0;
+    if (out_ct && ctcap) out_ct[0] = '\0';
+    if (max_bytes == 0) max_bytes = 16u << 20;
+    char host[256], path[1024];
+    int port = 80;
+    int rc = http_url_split(url, host, sizeof(host), &port, path, sizeof(path));
+    if (rc != 0) return rc;
+
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%d", port);
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) return -3;
+
+    vclient_fd fd = VCLIENT_INVALID;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (VCLIENT_BAD(fd)) continue;
+#ifdef _WIN32
+        if (connect(fd, ai->ai_addr, (int)ai->ai_addrlen) == 0) break;
+#else
+        if (connect(fd, ai->ai_addr, (socklen_t)ai->ai_addrlen) == 0) break;
+#endif
+        vclient_close(fd); fd = VCLIENT_INVALID;
+    }
+    freeaddrinfo(res);
+    if (VCLIENT_BAD(fd)) return -4;
+    vclient_set_timeout_ms(fd, timeout_ms > 0 ? timeout_ms : 60000);
+
+    char cl[64];
+    cl[0] = '\0';
+    if (body && body_len) snprintf(cl, sizeof(cl), "Content-Length: %zu\r\n", body_len);
+    char head[1024];
+    int hn = snprintf(head, sizeof(head),
+                      "%s %s HTTP/1.1\r\n"
+                      "Host: %s:%d\r\n"
+                      "%s"                       /* GET 无 body 时不发 Content-Type/Length */
+                      "%s"
+                      "Connection: close\r\n"
+                      "%s"
+                      "\r\n",
+                      method, path, host, port,
+                      (body && body_len) ? "Content-Type: application/json\r\n" : "",
+                      cl,
+                      extra_headers ? extra_headers : "");
+    if (hn <= 0 || hn >= (int)sizeof(head) || vclient_send(fd, head, (size_t)hn) != hn) {
+        vclient_close(fd); return -5;
+    }
+    if (body && body_len) {
+        size_t off = 0;
+        while (off < body_len) {
+            int w = vclient_send(fd, body + off, body_len - off);
+            if (w <= 0) { vclient_close(fd); return -6; }
+            off += (size_t)w;
+        }
+    }
+
+    size_t cap = 1u << 16, len = 0;
+    char *buf = (char *)malloc(cap + 1);
+    if (!buf) { vclient_close(fd); return -7; }
+    for (;;) {
+        if (len + 4096 > cap) {
+            size_t ncap = cap * 2;
+            if (ncap > max_bytes) ncap = max_bytes;
+            if (cap >= max_bytes) break;              /* 已达上限：停止读取（不是错误） */
+            char *nb = (char *)realloc(buf, ncap + 1);
+            if (!nb) { free(buf); vclient_close(fd); return -7; }
+            buf = nb; cap = ncap;
+        }
+        int r = vclient_recv(fd, buf + len, 4096);
+        if (r <= 0) break;                            /* EOF 或超时：带着已有数据返回 */
+        len += (size_t)r;
+    }
+    vclient_close(fd);
+    buf[len] = '\0';
+
+    if (len < 12 || strncmp(buf, "HTTP/", 5) != 0) { free(buf); return -9; }
+    int status = atoi(buf + 9);
+    char *hdr_end = strstr(buf, "\r\n\r\n");
+    if (!hdr_end) { free(buf); return -9; }
+    if (out_ct && ctcap)
+        vclient_hdr_value(buf, (size_t)(hdr_end - buf), "Content-Type", out_ct, ctcap);
+    char te[64];
+    vclient_hdr_value(buf, (size_t)(hdr_end - buf), "Transfer-Encoding", te, sizeof(te));
+    int chunked = (strstr(te, "chunked") || strstr(te, "Chunked")) ? 1 : 0;
+    char *bstart = hdr_end + 4;
+    size_t blen = len - (size_t)(bstart - buf);
+    unsigned char *o = (unsigned char *)malloc(blen + 1);
+    if (!o) { free(buf); return -7; }
+    memcpy(o, bstart, blen);
+    o[blen] = 0;
+    free(buf);
+    if (chunked) blen = (size_t)vclient_dechunk((char *)o, blen);
+    *out = o;
+    *out_len = blen;
+    *out_status = status;
+    return 0;
+}
+
+int vhttp_post_json(const char *url, const char *extra_headers,
+                    const char *body, size_t body_len,
+                    char **out_body, int *out_status,
+                    char *out_ct, size_t ctcap) {
+    if (!out_body) return -1;
+    unsigned char *o = NULL; size_t ol = 0;
+    int rc = vhttp_xfer("POST", url, extra_headers, body, body_len,
+                        60000, 16u << 20, &o, &ol, out_status, out_ct, ctcap);
+    if (rc != 0) { free(o); *out_body = NULL; return rc; }
+    char *s = (char *)realloc(o, ol + 1);     /* 保持既有"NUL 结尾字符串"契约 */
+    if (!s) { free(o); *out_body = NULL; *out_status = 0; return -7; }
+    s[ol] = '\0';
+    *out_body = s;
+    return 0;
+}
+
+int vhttp_get_binary(const char *url, int timeout_ms, size_t max_bytes,
+                     unsigned char **out_body, size_t *out_len,
+                     int *out_status, char *out_ct, size_t ctcap) {
+    if (!out_body || !out_len) return -1;
+    *out_body = NULL; *out_len = 0;
+    return vhttp_xfer("GET", url, NULL, NULL, 0, timeout_ms, max_bytes,
+                      out_body, out_len, out_status, out_ct, ctcap);
+}
+
+/* ================================================================
  * JSON
  * ================================================================ */
 
@@ -670,18 +945,21 @@ static int read_request(VHttpConn *c, VHttpRequest *req) {
 
 /* Send a complete non-streaming response. */
 static int send_response(VHttpConn *c, const VHttpResponse *resp) {
-    char head[512];
+    char head[768];
     const char *ct = resp->content_type ? resp->content_type : "text/plain";
     size_t blen = resp->body_len ? resp->body_len : (resp->body ? strlen(resp->body) : 0);
     /* HTML 应用页（chat/admin/convert）每次拉取最新版本，避免浏览器缓存旧页。 */
     const char *nocache = (ct && strcmp(ct, "text/html; charset=utf-8") == 0)
                           ? "Cache-Control: no-store\r\n" : "";
+    /* 云端回退来源标记（x-kestrel-source）等附加头；NULL = 无。 */
+    const char *extra = resp->extra_header ? resp->extra_header : "";
     int n = snprintf(head, sizeof(head),
                      "HTTP/1.1 %d %s\r\n"
                      "Content-Type: %s\r\n"
                      "Content-Length: %zu\r\n"
                      "Connection: close\r\n"
                      "Access-Control-Allow-Origin: *\r\n"
+                     "%s"
                      "%s"
                      "\r\n",
                      resp->status,
@@ -693,23 +971,29 @@ static int send_response(VHttpConn *c, const VHttpResponse *resp) {
                      resp->status == 429 ? "Too Many Requests" :
                      resp->status == 500 ? "Internal Server Error" :
                      resp->status == 503 ? "Service Unavailable" : "Error",
-                     ct, blen, nocache);
+                     ct, blen, nocache, extra);
     if (vnet_send(c, head, (size_t)n) < 0) return -1;
     if (blen && vnet_send(c, resp->body, blen) < 0) return -1;
     return 0;
 }
 
-int vhttp_stream_begin(VHttpConn *conn, int status, const char *content_type) {
-    char head[256];
+int vhttp_stream_begin_ex(VHttpConn *conn, int status, const char *content_type,
+                          const char *extra_header) {
+    char head[512];
+    const char *extra = extra_header ? extra_header : "";
     int n = snprintf(head, sizeof(head),
                      "HTTP/1.1 %d %s\r\n"
                      "Content-Type: %s\r\n"
                      "Connection: close\r\n"
                      "Access-Control-Allow-Origin: *\r\n"
+                     "%s"
                      "\r\n",
                      status, status == 200 ? "OK" : "Error",
-                     content_type ? content_type : "text/event-stream");
+                     content_type ? content_type : "text/event-stream", extra);
     return vnet_send(conn, head, (size_t)n) < 0 ? -1 : 0;
+}
+int vhttp_stream_begin(VHttpConn *conn, int status, const char *content_type) {
+    return vhttp_stream_begin_ex(conn, status, content_type, NULL);
 }
 int vhttp_stream_write(VHttpConn *conn, const char *data, size_t len) {
     return vnet_send(conn, data, len) < 0 ? -1 : 0;
@@ -999,7 +1283,8 @@ const char *vhttp_json_error(const char *message, char *buf, size_t cap) {
     VJson *err = vjson_new_object();
     vjson_obj_set(err, "message", vjson_new_string(message));
     vjson_obj_set(err, "type", vjson_new_string("invalid_request_error"));
-    vjson_obj_set(err, "code", vjson_new_number(0));
+    vjson_obj_set(err, "param", vjson_new_null());
+    vjson_obj_set(err, "code", vjson_new_null());
     vjson_obj_set(root, "error", err);
     vjson_serialize(root, buf, cap);
     vjson_free(root);

@@ -4,9 +4,15 @@
  * 面向 LLM 视觉推理的聚焦实现：
  *   - Main profile、4:2:0 8-bit、progressive（无场编码）
  *   - CAVLC + CABAC 熵解码
- *   - I / P / B 帧、多参考帧、8x8 变换
- *   - 只解码抽帧所需 GOP（从最近 IDR 开始）
- * 数值与 ffmpeg/libx264 兼容（无损解码，非近似）。
+ *   - 只解码 I 片（IDR），从最近 IDR 开始；P/B 片与多参考帧不实现
+ *   - 无 8x8 变换（transform_8x8_flag=1 时拒绝该片）
+ *
+ * ⚠ 能力边界（2026-10-13 收口定稿，诚实标注，不夸大）：
+ *   - 仅支持 I 片（IDR）：P/B 片、多参考帧、8x8 变换不在当前能力内。
+ *   - CABAC I_NxN「富残差 + 高频」（残差扫描 scan≥10）场景重建与
+ *     ffmpeg/libx264 位级不一致（已知问题，门槛 1）。受控测试 40/97 个流
+ *     与 ffmpeg 位级一致（Y 平面 maxabs=0），失败共性 = 富残差 + 高频。
+ *   - h264_decoder_decode() 返回 0 仅表示该帧已被尝试解码，不保证位级正确。
  *
  * 文件组织：
  *   [1] bitstream / NAL / emulation removal
@@ -18,10 +24,43 @@
  *   [7] 去块滤波
  *   [8] DPB 管理 + 顶层 decode
  */
-#include "vllm_media.h"
+#include "media/vllm_media.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+
+/* 图片/slice/行边界（邻接不可用）在 CABAC 上下文中的取值。
+ * 实测定标（判据 = 解码 bin 序列用 x264 约定编码器重编后与真实 payload 字节全等）：
+ *   邻接 cbp 需为 0x10F = luma cbp 位(0-3)=1 + luma DC 位(8)=1，chroma cbp 位(4-5)=0。
+ *   luma cbp / luma-DC CBF 上下文要求「不可用 → 1」；chroma cbp 上下文要求「不可用 → 0」。
+ *   邻接 nz 需为非零（1）：coded_block_flag 的 condTermFlag 对不可用块视为 1。
+ * 证据：真实 x264 流 11 条中 8 条（全部 I16x16 + t_grad + b_hgrad 两条 I_NxN）字节全等。 */
+#ifndef H264_BDY_CBP
+#define H264_BDY_CBP 0x10F
+#endif
+#ifndef H264_BDY_NZ
+#define H264_BDY_NZ  1
+#endif
+
+/* 运行时可覆盖（诊断用）：VLLM_BDY_NZ=<n>，默认取编译期 H264_BDY_NZ */
+static int h264_bdy_nz(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("VLLM_BDY_NZ");
+        v = e ? atoi(e) : H264_BDY_NZ;
+    }
+    return v;
+}
+
+/* 运行时可覆盖（诊断用）：VLLM_BDY_CBP=<十六进制/十进制>，默认取编译期 H264_BDY_CBP */
+static int h264_bdy_cbp(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("VLLM_BDY_CBP");
+        v = e ? (int)strtol(e, NULL, 0) : H264_BDY_CBP;
+    }
+    return v;
+}
 
 /* ================================================================
  * [1] Bitstream reader (RBSP) + emulation prevention removal
@@ -36,6 +75,19 @@ typedef struct {
 
 static inline int br_available(const BitReader *br) {
     return br->nbits - br->pos;
+}
+/* 规范 7.2 more_rbsp_data()：剩余比特若只有「一个 1 后接全 0」（rbsp_trailing_bits）
+ * 则返回 0。不可用 br_available()>0 代替，否则会把 trailing bits 误读为字段
+ * （典型后果：Main profile 的 PPS 被误判为含 transform_8x8_mode_flag=1）。 */
+static int br_more_rbsp_data(const BitReader *br) {
+    int ones = 0;
+    for (int i = br->pos; i < br->nbits; i++) {
+        if (br->d[i >> 3] & (0x80 >> (i & 7))) {
+            if (ones) return 1;
+            ones = 1;
+        }
+    }
+    return 0;
 }
 static inline int br_get_bit(BitReader *br) {
     if (br->pos >= br->nbits) return 0;
@@ -111,6 +163,7 @@ typedef struct {
     int pic_init_qp_minus26;
     int pic_init_qs_minus26;
     int chroma_qp_index_offset;
+    int second_chroma_qp_index_offset;
     int deblocking_filter_control_present;
     int constrained_intra_pred_flag;
     int redundant_pic_cnt_present;
@@ -182,6 +235,13 @@ static void parse_sps(const uint8_t *rbsp, int len, SPS *s) {
     s->width = mw * 16 - (s->crop_left + s->crop_right) * sub_wc;
     s->height = mh * 16 * (s->frame_mbs_only_flag ? 1 : 2) -
                 (s->crop_top + s->crop_bottom) * sub_hc;
+    if (getenv("VLLM_DUMP_SPS"))
+        fprintf(stderr, "[h264] SPS profile=%d chroma=%d mb=%dx%d mbs_only=%d crop=%d,%d,%d,%d disp=%dx%d "
+                        "log2_fn=%d poc_type=%d log2_poc=%d\n",
+                s->profile_idc, s->chroma_format_idc, s->mb_width, s->mb_height,
+                s->frame_mbs_only_flag, s->crop_left, s->crop_right, s->crop_top, s->crop_bottom,
+                s->width, s->height, s->log2_max_frame_num, s->pic_order_cnt_type,
+                s->log2_max_pic_order_cnt_lsb);
 }
 
 static void parse_pps(const uint8_t *rbsp, int len, PPS *p) {
@@ -220,24 +280,32 @@ static void parse_pps(const uint8_t *rbsp, int len, PPS *p) {
     p->deblocking_filter_control_present = br_get_bit(&br);
     p->constrained_intra_pred_flag = br_get_bit(&br);
     p->redundant_pic_cnt_present = br_get_bit(&br);
-    if (br_available(&br) > 0) {
-        /* 更多 rbsp 数据：变换 8x8 等 */
-        int more = 1;
-        while (more) {
-            more = br_get_bit(&br);
-            if (more) {
-                int b = br_get_bit(&br);
-                if (b) p->transform_8x8_mode_flag = 1;
-                else { br_get_ue(&br); /* mb_qp_delta */ }
-                if (b) {
-                    /* 第二个 scaling matrix */
-                    if (br_get_bit(&br)) {
-                        for (int k = 0; k < 64; k++) br_get_se(&br);
-                    }
+    if (br_more_rbsp_data(&br)) {
+        /* 规范 7.3.2.2 尾部：more_rbsp_data() 之后直接是
+         *   transform_8x8_mode_flag, pic_scaling_matrix_present_flag,
+         *   [scaling_list × (6 + 2*transform_8x8_mode_flag)], second_chroma_qp_index_offset
+         * 此处必须按规范逐字段读，否则 transform_8x8_mode_flag 会读错
+         * （进而漏读 I_NxN 的 transform_size_8x8_flag → CABAC 失步）。 */
+        p->transform_8x8_mode_flag = br_get_bit(&br);
+        p->pic_scaling_matrix_present = br_get_bit(&br);
+        if (p->pic_scaling_matrix_present) {
+            int n = 6 + 2 * p->transform_8x8_mode_flag;
+            for (int i = 0; i < n; i++) {
+                if (br_get_bit(&br)) {          /* scaling_list_present_flag */
+                    int sz = (i < 6) ? 16 : 64;
+                    for (int k = 0; k < sz; k++) br_get_se(&br);
                 }
             }
         }
+        p->second_chroma_qp_index_offset = br_get_se(&br);
     }
+    if (getenv("VLLM_DUMP_PPS"))
+        fprintf(stderr, "[h264] PPS entropy=%d init_qp_minus26=%d init_qs_minus26=%d chroma_qp_off=%d "
+                        "deblock_present=%d constrained=%d redundant=%d transform8x8=%d more_rbsp=%d\n",
+                p->entropy_coding_mode_flag, p->pic_init_qp_minus26, p->pic_init_qs_minus26,
+                p->chroma_qp_index_offset, p->deblocking_filter_control_present,
+                p->constrained_intra_pred_flag, p->redundant_pic_cnt_present,
+                p->transform_8x8_mode_flag, br_more_rbsp_data(&br));
 }
 
 /* ================================================================
@@ -271,6 +339,7 @@ typedef struct {
     uint8_t intra4x4[16];   /* 每 4x4 intra 模式（0-8） */
     uint8_t intra16x16_pred;
     uint8_t chroma_pred;
+    uint8_t dct8x8;         /* transform_size_8x8_flag（I_NxN 且 PPS 允许时） */
     uint8_t nz[24];         /* 非零系数数：16 luma + 4 chroma DC + 4 chroma AC */
 } MbState;
 
@@ -332,6 +401,7 @@ typedef struct H264Dec {
 
     /* 输出 */
     uint8_t *yuv_out;     /* 最近解码帧的 YUV（供 h264_decoder_decode 使用） */
+    size_t y_bytes, c_bytes; /* 平面步长（**按宏块对齐**，见 h264_decoder_init_nal） */
 } H264Dec;
 
 /* 一帧 YUV 缓冲大小（含 16 对齐边距用于插值） */
@@ -464,6 +534,19 @@ static int parse_slice_header(H264Dec *d, const uint8_t *rbsp, int len,
         }
     }
     if (cabac_bit_pos) *cabac_bit_pos = br.pos;
+    if (getenv("VLLM_DUMP_SH"))
+        fprintf(stderr, "[h264] SH first_mb=%d st=%d frame_num=%d idr_pic_id=%d poc_lsb=%d "
+                        "slice_qp_delta=%d disable_deblock=%d alpha=%d beta=%d pos=%d\n",
+                *first_mb, d->slice_type, d->frame_num, d->idr_pic_id, d->pic_order_cnt_lsb,
+                d->slice_qp_delta, d->disable_deblocking_filter_idc,
+                d->slice_alpha_c0_offset_div2, d->slice_beta_offset_div2, br.pos);
+    if (getenv("VLLM_DUMP_SH")) {
+        fprintf(stderr, "[h264] SH header bytes:");
+        for (int i = 0; i < 5 && i < len; i++) fprintf(stderr, " %02x", rbsp[i]);
+        fprintf(stderr, "\n[h264] SH bits(0..31):");
+        for (int bi = 0; bi < 32 && bi < len * 8; bi++) fprintf(stderr, "%d", (rbsp[bi >> 3] >> (7 - (bi & 7))) & 1);
+        fprintf(stderr, "\n");
+    }
     return 0;
 }
 
@@ -479,6 +562,89 @@ typedef struct {
     int bit_pos;       /* 当前字节内位位置 (0-7) */
 } Cabac;
 
+/* 诊断：VLLM_DUMP_BINS=<n> 打印前 n 个 bin 的解码内部量（不改变解码语义） */
+static const uint8_t *g_cabac_base = NULL;
+static int g_bin_budget = 0;
+static long g_bin_no = 0;
+
+/* ------------------------------------------------------------------
+ * 往返校验（诊断）：VLLM_RT_CHECK=1
+ * 把解码器实际读出的 (ctx,bin) 序列用 x264 约定的编码器重编，与真实 slice payload 逐字节比对。
+ * 强判据：重编 == payload 字节全等 ⇔ 解码用的上下文序列与编码器完全一致（算术层与语法层隔离）。
+ * 增量比对（只比较已落定字节，留 2 字节余量）可直接定位「第一个分歧 bin」。
+ * 默认关闭，开启时不影响解码语义。
+ * ------------------------------------------------------------------ */
+#define RT_MAX 262144
+typedef struct { uint16_t ctx; uint8_t bin; uint8_t kind; } RtOp; /* kind: 0=decision 1=bypass 2=terminate */
+static RtOp g_rt_ops[RT_MAX];
+static long g_rt_n = 0;
+static int g_rt_on = 0;
+static int g_rt_armed = 0;
+static uint8_t g_rt_init[1024];
+static int g_rt_qp = -1;
+
+static int rt_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("VLLM_RT_CHECK");
+        on = e ? atoi(e) : 0;
+    }
+    return on;
+}
+
+static inline void rt_rec(const uint8_t *ctx, int bit, int kind) {
+    if (g_rt_n < RT_MAX) {
+        RtOp *o = &g_rt_ops[g_rt_n];
+        o->kind = (uint8_t)kind;
+        o->bin = (uint8_t)bit;
+        o->ctx = (uint16_t)((g_cabac_base && ctx >= g_cabac_base) ? (uintptr_t)(ctx - g_cabac_base) : 0);
+    }
+    g_rt_n++;
+}
+
+/* ctx 索引 → 语法元素类别（便于读分歧点） */
+static const char *rt_ctx_name(int i) {
+    if (i < 0) return "?";
+    if (i == 3 || i == 4 || i == 5) return "mb_type";
+    if (i >= 6 && i <= 10) return "i16x16";
+    if (i == 60 || i == 61 || i == 62 || i == 63) return "qp_delta";
+    if (i == 64 || i == 67) return "chroma_pred";
+    if (i == 68 || i == 69) return "i4x4_mode";
+    if (i >= 70 && i <= 72) return "cbp_extra";
+    if (i >= 73 && i <= 76) return "cbp_luma";
+    if (i >= 77 && i <= 84) return "cbp_chroma";
+    if (i >= 85 && i <= 88) return "cbf_ldc";
+    if (i >= 89 && i <= 92) return "cbf_lac";
+    if (i >= 93 && i <= 96) return "cbf_l4x4";
+    if (i >= 97 && i <= 100) return "cbf_cdc";
+    if (i >= 101 && i <= 104) return "cbf_cac";
+    if (i >= 105 && i <= 119) return "sig_dc";
+    if (i >= 120 && i <= 133) return "sig_lac";
+    if (i >= 134 && i <= 148) return "sig_l4x4";
+    if (i >= 149 && i <= 151) return "sig_cdc";
+    if (i >= 152 && i <= 165) return "sig_cac";
+    if (i >= 166 && i <= 180) return "last_dc";
+    if (i >= 181 && i <= 194) return "last_lac";
+    if (i >= 195 && i <= 209) return "last_l4x4";
+    if (i >= 210 && i <= 212) return "last_cdc";
+    if (i >= 213 && i <= 226) return "last_cac";
+    if (i >= 227 && i <= 236) return "abs_dc";
+    if (i >= 237 && i <= 246) return "abs_lac";
+    if (i >= 247 && i <= 256) return "abs_l4x4";
+    if (i >= 257 && i <= 265) return "abs_cdc";
+    if (i >= 266 && i <= 274) return "abs_cac";
+    if (i == 399 || (i >= 399 && i <= 402)) return "t8_flag";
+    return "other";
+}
+static int bin_trace_limit(void) {
+    static int lim = -1;
+    if (lim < 0) {
+        const char *e = getenv("VLLM_DUMP_BINS");
+        lim = e ? atoi(e) : 0;
+    }
+    return lim;
+}
+
 static inline int cabac_bit(Cabac *c) {
     if (c->byte_pos >= c->size) return 0;  /* 数据耗尽补 0 */
     int b = (c->data[c->byte_pos] >> (7 - c->bit_pos)) & 1;
@@ -493,11 +659,25 @@ static void cabac_init(Cabac *c, const uint8_t *data, size_t size) {
     c->byte_pos = 0;
     c->bit_pos = 0;
     c->range = 0x1FE;
-    /* H.264 9.3.4.1.1：byte_alignment 后从字节边界读入 9 位到 codILow
-       （与 codIRange=510 同尺度，保证比较精度） */
+    /* H.264 9.3.4.1.1：byte_alignment 后直接读入 9 位到 codIOffset（codIRange=510）。
+     * 前导位约定：规范即为「字节对齐处读 9 位」，不得跳过任何前导位。
+     * 实测（32x16 平场多宏块 I 帧）skip=0 与 ffmpeg 位级全等（Ysum 64512/FNV 19d25034a1192b25），
+     * 而 skip=1 连最简单平场都错（Ysum 32748/65009）——早前「跳 1 位更接近」是多个重建缺陷叠加出的假象。
+     * 保留 env 覆盖仅用于回归对比。 */
+    {
+        static int skip = -1;
+        if (skip < 0) {
+            const char *e = getenv("VLLM_CABAC_SKIPBITS");
+            skip = e ? atoi(e) : 0;
+        }
+        for (int i = 0; i < skip; i++) (void)cabac_bit(c);
+    }
     c->low = 0;
     for (int i = 0; i < 9; i++)
         c->low = (c->low << 1) | (uint32_t)cabac_bit(c);
+    if (g_bin_budget)
+        fprintf(stderr, "[CABAC-INIT] range=%u low=%u (first9) size=%zu\n",
+                c->range, c->low, c->size);
 }
 
 /* range_tab[state][q]：LPS 范围（H.264 规范 Table 9-35） */
@@ -540,6 +720,8 @@ static inline int cabac_decode(Cabac *c, uint8_t *ctx) {
     int mps = *ctx & 1;
     uint32_t q = (c->range >> 6) & 3;
     uint32_t range_lps = range_tab[state][q];
+    uint32_t r0 = c->range, l0 = c->low;
+    int cb = *ctx;
     c->range -= range_lps;
     int bit;
     if (c->low < c->range) {
@@ -549,12 +731,25 @@ static inline int cabac_decode(Cabac *c, uint8_t *ctx) {
         c->low -= c->range;
         c->range = range_lps;
         bit = 1 - mps;
-        *ctx = (uint8_t)((trans_lps[state] << 1) | (1 - mps));
+        /* 规范 9.3.3.2.2：仅当 pStateIdx == 0 时翻转 valMPS */
+        int nmps = (state == 0) ? (1 - mps) : mps;
+        *ctx = (uint8_t)((trans_lps[state] << 1) | nmps);
     }
     /* 重归一化 */
+    int ren = 0;
     while (c->range < 256) {
         c->range <<= 1;
         c->low = (c->low << 1) | (uint32_t)cabac_bit(c);
+        ren++;
+    }
+    if (g_rt_on) rt_rec(ctx, bit, 0);
+    if (g_bin_budget) {
+        int idx = (g_cabac_base && ctx >= g_cabac_base) ? (int)(ctx - g_cabac_base) : -1;
+        fprintf(stderr, "[BIN %4ld] decision  ctx=%3d bin=%d cbyte=%3d pidx=%2d mps=%d q=%u lps=%u "
+                        "r0=%u rpre=%u ren=%d r=%u low=%u->%u\n",
+                g_bin_no++, idx, bit, cb, state, mps, q, range_lps, r0, r0 - range_lps, ren,
+                c->range, l0, c->low);
+        g_bin_budget--;
     }
     return bit;
 }
@@ -563,16 +758,20 @@ static inline int cabac_decode(Cabac *c, uint8_t *ctx) {
 static inline int cabac_decode_bypass(Cabac *c) {
     c->low <<= 1;
     c->low |= (uint32_t)cabac_bit(c);
-    if (c->low >= c->range) {
-        c->low -= c->range;
-        return 1;
+    int b = (c->low >= c->range);
+    if (b) c->low -= c->range;
+    if (g_rt_on) rt_rec(NULL, b, 1);
+    if (g_bin_budget) {
+        fprintf(stderr, "[BIN %4ld] bypass    bit=%d r=%u low=%u\n", g_bin_no++, b, c->range, c->low);
+        g_bin_budget--;
     }
-    return 0;
+    return b;
 }
 
 /* 终止编码（fixed probability，无上下文）：range 减 2 比较 */
 static inline int cabac_decode_terminate(Cabac *c) {
     int ret;
+    uint32_t r0 = c->range;
     c->range -= 2;
     if (c->low >= c->range) {
         ret = 1;
@@ -584,6 +783,12 @@ static inline int cabac_decode_terminate(Cabac *c) {
     while (c->range < 256) {
         c->range <<= 1;
         c->low = (c->low << 1) | (uint32_t)cabac_bit(c);
+    }
+    if (g_rt_on) rt_rec(NULL, ret, 2);
+    if (g_bin_budget) {
+        fprintf(stderr, "[BIN %4ld] terminate bit=%d r0=%u r=%u low=%u\n",
+                g_bin_no++, ret, r0, c->range, c->low);
+        g_bin_budget--;
     }
     return ret;
 }
@@ -616,6 +821,190 @@ static inline int cabac_decode_egk(Cabac *c, uint8_t *ctx, int k) {
         val = (val << k) + extra;
     }
     return val;
+}
+
+/* ---------------- 往返校验用：x264 约定 CABAC 编码器（仅诊断） ---------------- */
+typedef struct {
+    uint32_t range, low;
+    int queue, outstanding;
+    uint8_t *buf;
+    size_t ptr, cap;
+} CabacEnc;
+
+static void ce_putbyte(CabacEnc *e) {
+    if (e->queue < 0) return;
+    uint32_t out = e->low >> (e->queue + 10);
+    e->low &= (0x400u << e->queue) - 1u;
+    e->queue -= 8;
+    if ((out & 0xff) == 0xff) {
+        e->outstanding++;
+    } else {
+        uint32_t carry = out >> 8;
+        int n = e->outstanding;
+        if (e->ptr >= 1 && e->ptr < e->cap) e->buf[e->ptr - 1] = (uint8_t)(e->buf[e->ptr - 1] + carry);
+        while (n-- > 0) { if (e->ptr < e->cap) e->buf[e->ptr++] = (uint8_t)((carry - 1) & 0xff); }
+        if (e->ptr < e->cap) e->buf[e->ptr++] = (uint8_t)(out & 0xff);
+        e->outstanding = 0;
+    }
+}
+
+static void ce_renorm(CabacEnc *e) {
+    int shift = 0;
+    while ((e->range << shift) < 256) shift++;
+    e->range <<= shift;
+    e->low <<= shift;
+    e->queue += shift;
+    ce_putbyte(e);
+}
+
+static void ce_decision(CabacEnc *e, uint8_t *ctx, int bit) {
+    int state = *ctx >> 1, mps = *ctx & 1;
+    uint32_t q = (e->range >> 6) & 3;
+    uint32_t lps = range_tab[state][q];
+    e->range -= lps;
+    if (bit != mps) {
+        e->low += e->range;
+        e->range = lps;
+        *ctx = (uint8_t)((trans_lps[state] << 1) | ((state == 0) ? (1 - mps) : mps));
+    } else {
+        *ctx = (uint8_t)((trans_mps[state] << 1) | mps);
+    }
+    ce_renorm(e);
+}
+
+/* x264 cabac_encode_bypass_c：b 取「取反掩码」语义（bit=1 → ~0 & range = range，bit=0 → 0），
+ * 且必须先 low <<= 1。此处按 x264_cabac.c 逐字转写。 */
+static void ce_bypass(CabacEnc *e, int bit) {
+    e->low <<= 1;
+    e->low += (uint32_t)(-bit) & e->range;
+    e->queue += 1;
+    ce_putbyte(e);
+}
+
+/* x264 cabac_encode_terminal_c：编码 terminate=0（I_PCM 判定位 / 非末宏块的 end_of_slice_flag）。
+ * 这是真实存在于码流中的 bin（会消耗字节），此前编码器漏掉它导致短流重编偏少。 */
+static void ce_terminal0(CabacEnc *e) {
+    e->range -= 2;
+    ce_renorm(e);
+}
+
+/* flush：终止一个 CABAC 段（等价编码 terminate=1） */
+static void ce_flush(CabacEnc *e, int frame) {
+    e->low += e->range - 2;
+    e->low |= 1;
+    e->low <<= 9;
+    e->queue += 9;
+    ce_putbyte(e);
+    ce_putbyte(e);
+    {
+        int s = -e->queue;
+        if (s > 0 && s < 31) e->low <<= s;
+    }
+    e->low |= (uint32_t)(((0x35a4e4f5u >> (frame & 31)) & 1) << 10);
+    e->queue = 0;
+    ce_putbyte(e);
+    while (e->outstanding > 0) { if (e->ptr < e->cap) e->buf[e->ptr++] = 0xff; e->outstanding--; }
+}
+
+/* 重编 + 增量对拍：报告共同前缀与第一个分歧 bin（ctx 类别可判语法元素） */
+static void rt_check_run(const uint8_t *payload, size_t plen, int frame) {
+    if (!g_rt_on || g_rt_n <= 0) return;
+    size_t cap = plen + 8192;
+    uint8_t *buf = (uint8_t *)malloc(cap);
+    uint8_t *st = (uint8_t *)malloc(1024);
+    if (!buf || !st) { free(buf); free(st); return; }
+    memcpy(st, g_rt_init, 1024);
+    CabacEnc e;
+    e.range = 0x1FE; e.low = 0; e.queue = -9; e.outstanding = 0;
+    e.buf = buf; e.ptr = 1; e.cap = cap;
+    buf[0] = 0;
+    long bad = -1, applied = 0;
+    size_t checked = 0;
+    long flip = -1;
+    { const char *fe = getenv("VLLM_RT_FLIP"); if (fe) flip = strtol(fe, NULL, 0); }
+    for (long i = 0; i < g_rt_n && i < RT_MAX; i++) {
+        RtOp *o = &g_rt_ops[i];
+        int bv = (int)o->bin;
+        if (i == flip && o->kind != 2) bv ^= 1;   /* 诊断：故意翻转一个 bin（仅重编侧） */
+        if (o->kind == 0) ce_decision(&e, &st[o->ctx], bv);
+        else if (o->kind == 1) ce_bypass(&e, bv);
+        else if (o->bin) break;           /* terminate=1：由末尾 flush 表达 */
+        else ce_terminal0(&e);            /* terminate=0：真实 bin，必须编码 */
+        applied++;
+        size_t emit = e.ptr - 1;
+        size_t safe = emit > 2 ? emit - 2 : 0;
+        while (checked < safe && checked < plen) {
+            if (buf[1 + checked] != payload[checked]) { bad = i; break; }
+            checked++;
+        }
+        if (bad >= 0) break;
+    }
+    ce_flush(&e, frame);
+    size_t n = e.ptr - 1;
+    size_t common = 0;
+    while (common < n && common < plen && buf[1 + common] == payload[common]) common++;
+    fprintf(stderr, "[RT] payload=%zu enc=%zu common=%zu ops=%ld %s\n",
+            plen, n, common, g_rt_n, (n == plen && common == plen) ? "BYTE-FULL" : "DIFF");
+    /* 自检：用引擎解码器回读「重编结果」，逐 op 比对 bin（关闭记录以免污染） */
+    {
+        int save = g_rt_on; g_rt_on = 0;
+        Cabac vc;
+        cabac_init(&vc, buf + 1, n);
+        uint8_t vst[1024];
+        memcpy(vst, g_rt_init, sizeof(vst));
+        long mism = -1;
+        for (long i = 0; i < g_rt_n && i < RT_MAX; i++) {
+            RtOp *o = &g_rt_ops[i];
+            if (o->kind == 2 && o->bin) break;   /* terminate=1 由 flush 表达，与编码端一致 */
+            int b = (o->kind == 0) ? cabac_decode(&vc, &vst[o->ctx])
+                  : (o->kind == 1) ? cabac_decode_bypass(&vc)
+                                   : cabac_decode_terminate(&vc);
+            if (b != (int)o->bin) { mism = i; break; }
+        }
+        fprintf(stderr, "[RT] selfcheck(enc->dec): %s firstMismatch=%ld consumed=%zu/%zu\n",
+                mism < 0 ? "OK" : "FAIL", mism, vc.byte_pos, n);
+        g_rt_on = save;
+    }
+    if (bad >= 0) {
+        fprintf(stderr, "[RT] first divergent op #%ld (applied %ld), byte~%zu/%zu\n",
+                bad, applied, checked, plen);
+        long lo = bad - 8; if (lo < 0) lo = 0;
+        for (long i = lo; i <= bad && i < g_rt_n; i++) {
+            RtOp *o = &g_rt_ops[i];
+            fprintf(stderr, "[RT]   op[%6ld] kind=%d %-10s ctx=%3d bin=%d%s\n",
+                    i, o->kind, o->kind == 0 ? rt_ctx_name((int)o->ctx) : (o->kind == 1 ? "bypass" : "terminate"),
+                    (int)o->ctx, (int)o->bin, i == bad ? "   <== 分歧" : "");
+        }
+    } else if (common < plen) {
+        /* 无 settled 分歧：说明解码 bin 序列是真实前缀但提前结束（欠读）。打印末尾 op 供判读。 */
+        long lo = g_rt_n > 14 ? g_rt_n - 14 : 0;
+        fprintf(stderr, "[RT] no settled divergence; decode ends early -> tail ops:\n");
+        for (long i = lo; i < g_rt_n; i++) {
+            RtOp *o = &g_rt_ops[i];
+            fprintf(stderr, "[RT]   op[%6ld] kind=%d %-10s ctx=%3d bin=%d\n",
+                    i, o->kind, o->kind == 0 ? rt_ctx_name((int)o->ctx) : (o->kind == 1 ? "bypass" : "terminate"),
+                    (int)o->ctx, (int)o->bin);
+        }
+    }
+    if (getenv("VLLM_RT_HEX")) {
+        size_t from = checked > 8 ? checked - 8 : 0;
+        fprintf(stderr, "[RT] payload hex [%zu..%zu):", from, plen < from + 40 ? plen : from + 40);
+        for (size_t i = from; i < plen && i < from + 40; i++) fprintf(stderr, " %02x", payload[i]);
+        fprintf(stderr, "\n[RT] enc    hex [%zu..%zu):", from, n < from + 40 ? n : from + 40);
+        for (size_t i = from; i < n && i < from + 40; i++) fprintf(stderr, " %02x", buf[1 + i]);
+        fprintf(stderr, "\n[RT] payload tail:");
+        for (size_t i = (plen > 24 ? plen - 24 : 0); i < plen; i++) fprintf(stderr, " %02x", payload[i]);
+        fprintf(stderr, "\n");
+    }
+    if (getenv("VLLM_RT_HEXALL")) {
+        for (size_t i = 0; i < plen; i++) {
+            if (i % 32 == 0) fprintf(stderr, "\n[HEX %3zu]", i);
+            fprintf(stderr, " %02x", payload[i]);
+        }
+        fprintf(stderr, "\n");
+    }
+    free(buf);
+    free(st);
 }
 
 static const int8_t cabac_ctx_I[460][2] = {
@@ -1105,8 +1494,14 @@ static void cabac_ctx_init_decode(H264Dec *d, int slice_type) {
         int state = ((tab[i][0] * qp) >> 4) + tab[i][1];
         if (state < 1) state = 1;
         else if (state > 126) state = 126;
-        int s = (state < 127 - state) ? state : 127 - state;
-        d->cabac_ctx[i] = (uint8_t)((s << 1) | (state >> 6));
+        /* 规范 9.3.1.1：preCtxState → (pStateIdx, valMPS)
+         *   preCtxState <= 63 → pStateIdx = 63 - preCtxState, valMPS = 0
+         *   preCtxState >= 64 → pStateIdx = preCtxState - 64, valMPS = 1
+         * 存储字节 = (pStateIdx << 1) | valMPS（与 cabac_decode 的取值一致） */
+        int pidx, mps;
+        if (state <= 63) { pidx = 63 - state; mps = 0; }
+        else             { pidx = state - 64; mps = 1; }
+        d->cabac_ctx[i] = (uint8_t)((pidx << 1) | mps);
     }
     d->cabac_init_done = 1;
 }
@@ -1121,17 +1516,22 @@ static inline int h264_clip_u8(int a) {
     return a;
 }
 
-int h264_decoder_init(H264Decoder *d, const MPMovie *movie) {
+/* 内部：从裸 SPS/PPS NAL（含 1 字节 NAL header）初始化解码器。
+ * movie 可为 NULL（RTSP / 裸流路径：由 h264_decoder_decode_au 推访问单元）。 */
+static int h264_decoder_init_nal(H264Decoder *d,
+                                 const uint8_t *sps, int sps_len,
+                                 const uint8_t *pps, int pps_len,
+                                 const MPMovie *movie) {
     memset(d, 0, sizeof(*d));
     d->movie = movie;
-    if (!movie || !movie->sps || !movie->pps || movie->n_frames <= 0) return -1;
+    if (!sps || !pps || sps_len < 2 || pps_len < 2) return -1;
     H264Dec *dec = (H264Dec *)calloc(1, sizeof(H264Dec));
     if (!dec) return -1;
     uint8_t rbsp[512];
-    int rl = nal_to_rbsp(movie->sps + 1, movie->sps_len - 1, rbsp, sizeof(rbsp));
+    int rl = nal_to_rbsp(sps + 1, sps_len - 1, rbsp, sizeof(rbsp));
     if (rl <= 0) { free(dec); return -1; }
     parse_sps(rbsp, rl, &dec->sps);
-    rl = nal_to_rbsp(movie->pps + 1, movie->pps_len - 1, rbsp, sizeof(rbsp));
+    rl = nal_to_rbsp(pps + 1, pps_len - 1, rbsp, sizeof(rbsp));
     if (rl <= 0) { free(dec); return -1; }
     parse_pps(rbsp, rl, &dec->pps);
     dec->movie = movie;
@@ -1142,14 +1542,19 @@ int h264_decoder_init(H264Decoder *d, const MPMovie *movie) {
     int ls = YUV_STRIDE(dec->width);
     dec->ls_y = ls;
     dec->ls_c = ls >> 1;
-    /* 布局：[顶部pad 1行][Y 显示区 w*h][pad 4行][U][V][尾部pad 1行]。
-     * 顶部 pad 供 y=0 帧内预测读取；底部 pad 供最后一 MB(540→544)写入；
-     * 尾部 pad 供 chroma 272 行(>显示 270)写入。总 = yb + 6*ls + 2*cb。 */
-    size_t yb = (size_t)ls * dec->height;
-    size_t cb = (size_t)(ls >> 1) * (dec->height >> 1);
-    size_t frame_bytes = yb + 6 * (size_t)ls + cb * 2;
+    /* 平面按**宏块对齐**分配（Y: mb_h*16 行，色度: mb_h*8 行），不是显示尺寸。
+     * 解码器按整宏块重建：高度非 16 对齐时（如 720×358 ⇒ mb_h=23 ⇒ 368 行 > 358）
+     * 会写出显示区之外；色度的帧内预测邻接读取还会再多读 8 行。原实现按显示尺寸
+     * 分配 ⇒ ASan 实测越界（读越界 367B；写越界破坏堆，表现为 "double free or
+     * corruption (!prev)"，整进程 abort）。这是既有限制被 MP4 路径（此前从未接入
+     * 构建、属死代码）首次跑到而暴露。
+     * 布局：[顶部 pad 1 行][Y mb_h*16 行][pad 4 行][U][V][尾部 pad 2 行]。 */
+    dec->y_bytes = (size_t)ls * (size_t)dec->mb_h * 16;
+    dec->c_bytes = (size_t)(ls >> 1) * (size_t)dec->mb_h * 8;
+    size_t frame_bytes = (size_t)ls + dec->y_bytes + 4 * (size_t)ls
+                       + 2 * dec->c_bytes + 2 * (size_t)ls;
     dec->yuv_out = (uint8_t *)calloc(1, frame_bytes);
-    dec->mb = (MbState *)calloc((size_t)dec->mb_w * dec->mb_h, sizeof(MbState));
+    dec->mb = (MbState *)calloc((size_t)dec->mb_w * dec->mb_h + 16, sizeof(MbState));
     dec->cur_nz = (uint8_t *)calloc(24, 1);
     dec->left_nz = (uint8_t *)calloc(24, 1);
     dec->top_nz = (uint8_t *)calloc((size_t)(dec->mb_w + 1) * 24, 1);
@@ -1163,11 +1568,20 @@ int h264_decoder_init(H264Decoder *d, const MPMovie *movie) {
     }
     uint8_t *yuv = dec->yuv_out + ls;         /* Y 起点（跳过顶部 pad） */
     d->yuv = yuv;
-    d->y_u = yuv + yb + 4 * ls;               /* U 起点（Y + 4 行 pad） */
-    d->y_v = d->y_u + cb;                     /* V 起点 */
+    d->y_u = yuv + dec->y_bytes + 4 * ls;     /* U 起点（Y 之后 4 行 pad） */
+    d->y_v = d->y_u + dec->c_bytes;           /* V 起点 */
     d->yuv_cap = (int)frame_bytes;
     d->dec = dec;
     return 0;
+}
+
+int h264_decoder_init(H264Decoder *d, const MPMovie *movie) {
+    if (!movie || !movie->sps || !movie->pps || movie->n_frames <= 0) {
+        memset(d, 0, sizeof(*d));
+        return -1;
+    }
+    return h264_decoder_init_nal(d, movie->sps, movie->sps_len,
+                                 movie->pps, movie->pps_len, movie);
 }
 void h264_decoder_free(H264Decoder *d) {
     if (d->dec) {
@@ -1262,9 +1676,9 @@ int media_yuv_to_rgb(const uint8_t *yuv, int src_w, int src_h,
 #define MB_FIELD 0
 
 
-/* 帧内 4x4 预测（dst 为 4x4 块，top/left 为邻接重建像素） */
+/* 帧内 4x4 预测（dst 为 4x4 块，top/left 为邻接重建像素，tl 为左上角 p[-1][-1]） */
 static void h264_pred4x4(uint8_t *dst, int stride, int mode,
-                         const uint8_t *top, const uint8_t *left) {
+                         const uint8_t *top, const uint8_t *left, int tl) {
     int i;
     switch (mode) {
     case 0:
@@ -1285,35 +1699,75 @@ static void h264_pred4x4(uint8_t *dst, int stride, int mode,
         dst[2*stride+0]=(p2+p3*2+p4+2)>>2; dst[2*stride+1]=(p3+p4*2+p5+2)>>2; dst[2*stride+2]=(p4+p5*2+p6+2)>>2; dst[2*stride+3]=(p5+p6*2+p7+2)>>2;
         dst[3*stride+0]=(p3+p4*2+p5+2)>>2; dst[3*stride+1]=(p4+p5*2+p6+2)>>2; dst[3*stride+2]=(p5+p6*2+p7+2)>>2; dst[3*stride+3]=(p6+p7*2+p7+2)>>2;
         break; }
-    case 4: { uint8_t p0=left[3],p1=left[2],p2=left[1],p3=left[0],p4=top[0],p5=top[1],p6=top[2],p7=top[3];
-        dst[0*stride+0]=(p3+p4*2+p5+2)>>2; dst[0*stride+1]=(p2+p3*2+p4+2)>>2; dst[0*stride+2]=(p1+p2*2+p3+2)>>2; dst[0*stride+3]=(p0+p1*2+p2+2)>>2;
-        dst[1*stride+0]=(p2+p3*2+p4+2)>>2; dst[1*stride+1]=(p1+p2*2+p3+2)>>2; dst[1*stride+2]=(p0+p1*2+p2+2)>>2; dst[1*stride+3]=(p1+p0*2+p1+2)>>2;
-        dst[2*stride+0]=(p1+p2*2+p3+2)>>2; dst[2*stride+1]=(p0+p1*2+p2+2)>>2; dst[2*stride+2]=(p1+p0*2+p1+2)>>2; dst[2*stride+3]=(p2+p1*2+p0+2)>>2;
-        dst[3*stride+0]=(p0+p1*2+p2+2)>>2; dst[3*stride+1]=(p1+p0*2+p1+2)>>2; dst[3*stride+2]=(p2+p1*2+p0+2)>>2; dst[3*stride+3]=(p3+p2*2+p1+2)>>2;
+    case 4: { /* Intra_4x4_Diagonal_Down_Right（ffmpeg pred4x4_down_right）
+               * 参考线 = 过 TL 的反斜对角线（左列自下而上 → TL → 上排自左而右），
+               * 每个样点取该斜线上相邻三点的 [1,2,1]/4 加权。旧实现整块错位。 */
+        dst[3*stride+0]=(left[3] + 2*left[2] + left[1] + 2)>>2;
+        dst[2*stride+0]=dst[3*stride+1]=(left[2] + 2*left[1] + left[0] + 2)>>2;
+        dst[1*stride+0]=dst[2*stride+1]=dst[3*stride+2]=(left[1] + 2*left[0] + tl + 2)>>2;
+        dst[0*stride+0]=dst[1*stride+1]=dst[2*stride+2]=dst[3*stride+3]=(left[0] + 2*tl + top[0] + 2)>>2;
+        dst[0*stride+1]=dst[1*stride+2]=dst[2*stride+3]=(tl + 2*top[0] + top[1] + 2)>>2;
+        dst[0*stride+2]=dst[1*stride+3]=(top[0] + 2*top[1] + top[2] + 2)>>2;
+        dst[0*stride+3]=(top[1] + 2*top[2] + top[3] + 2)>>2;
         break; }
-    case 5: { uint8_t p0=left[3],p1=left[2],p2=left[1],p3=left[0],p4=top[0],p5=top[1],p6=top[2],p7=top[3];
-        dst[0*stride+0]=(p3+p4+1)>>1; dst[0*stride+1]=(p4+p5+1)>>1; dst[0*stride+2]=(p5+p6+1)>>1; dst[0*stride+3]=(p6+p7+1)>>1;
-        dst[1*stride+0]=(p2+p3*2+p4+2)>>2; dst[1*stride+1]=(p3+p4*2+p5+2)>>2; dst[1*stride+2]=(p4+p5*2+p6+2)>>2; dst[1*stride+3]=(p5+p6*2+p7+2)>>2;
-        dst[2*stride+0]=(p1+p2*2+p3+2)>>2; dst[2*stride+1]=(p2+p3*2+p4+2)>>2; dst[2*stride+2]=(p3+p4*2+p5+2)>>2; dst[2*stride+3]=(p4+p5*2+p6+2)>>2;
-        dst[3*stride+0]=(p0+p1*2+p2+2)>>2; dst[3*stride+1]=(p1+p2*2+p3+2)>>2; dst[3*stride+2]=(p2+p3*2+p4+2)>>2; dst[3*stride+3]=(p3+p4*2+p5+2)>>2;
+    case 5: { /* Intra_4x4_Vertical_Right（ffmpeg pred4x4_vertical_right）
+               * 旧实现把 q 序整体反转且行 2/3 用错参考（l 而非 lt 组合），与 ffmpeg 不符。 */
+        dst[0*stride+0]=dst[2*stride+1]=(tl + top[0] + 1)>>1;
+        dst[0*stride+1]=dst[2*stride+2]=(top[0] + top[1] + 1)>>1;
+        dst[0*stride+2]=dst[2*stride+3]=(top[1] + top[2] + 1)>>1;
+        dst[0*stride+3]=(top[2] + top[3] + 1)>>1;
+        dst[1*stride+0]=dst[3*stride+1]=(left[0] + 2*tl + top[0] + 2)>>2;
+        dst[1*stride+1]=dst[3*stride+2]=(tl + 2*top[0] + top[1] + 2)>>2;
+        dst[1*stride+2]=dst[3*stride+3]=(top[0] + 2*top[1] + top[2] + 2)>>2;
+        dst[1*stride+3]=(top[1] + 2*top[2] + top[3] + 2)>>2;
+        dst[2*stride+0]=(tl + 2*left[0] + left[1] + 2)>>2;
+        dst[3*stride+0]=(left[0] + 2*left[1] + left[2] + 2)>>2;
         break; }
-    case 6: { uint8_t p0=left[3],p1=left[2],p2=left[1],p3=left[0],p4=top[0],p5=top[1],p6=top[2],p7=top[3];
-        dst[0*stride+0]=(p2+p3+1)>>1; dst[0*stride+1]=(p1+p2*2+p3+2)>>2; dst[0*stride+2]=(p0+p1*2+p2+2)>>2; dst[0*stride+3]=(p1+p0*2+p1+2)>>2;
-        dst[1*stride+0]=(p3+p4+1)>>1; dst[1*stride+1]=(p2+p3*2+p4+2)>>2; dst[1*stride+2]=(p1+p2*2+p3+2)>>2; dst[1*stride+3]=(p0+p1*2+p2+2)>>2;
-        dst[2*stride+0]=(p4+p5+1)>>1; dst[2*stride+1]=(p3+p4*2+p5+2)>>2; dst[2*stride+2]=(p2+p3*2+p4+2)>>2; dst[2*stride+3]=(p1+p2*2+p3+2)>>2;
-        dst[3*stride+0]=(p5+p6+1)>>1; dst[3*stride+1]=(p4+p5*2+p6+2)>>2; dst[3*stride+2]=(p3+p4*2+p5+2)>>2; dst[3*stride+3]=(p2+p3*2+p4+2)>>2;
+    case 6: { /* Intra_4x4_Horizontal_Down（ffmpeg pred4x4_horizontal_down） */
+        dst[0*stride+0]=dst[1*stride+2]=(tl + left[0] + 1)>>1;
+        dst[0*stride+1]=dst[1*stride+3]=(left[0] + 2*tl + top[0] + 2)>>2;
+        dst[0*stride+2]=(tl + 2*top[0] + top[1] + 2)>>2;
+        dst[0*stride+3]=(top[0] + 2*top[1] + top[2] + 2)>>2;
+        dst[1*stride+0]=dst[2*stride+2]=(left[0] + left[1] + 1)>>1;
+        dst[1*stride+1]=dst[2*stride+3]=(tl + 2*left[0] + left[1] + 2)>>2;
+        dst[2*stride+0]=dst[3*stride+2]=(left[1] + left[2] + 1)>>1;
+        dst[2*stride+1]=dst[3*stride+3]=(left[0] + 2*left[1] + left[2] + 2)>>2;
+        dst[3*stride+0]=(left[2] + left[3] + 1)>>1;
+        dst[3*stride+1]=(left[1] + 2*left[2] + left[3] + 2)>>2;
         break; }
-    case 7: { uint8_t p4=top[4],p5=top[5],p6=top[6],p7=top[7];
-        dst[0*stride+0]=(top[0]+top[1]+1)>>1; dst[0*stride+1]=(top[1]+top[2]+1)>>1; dst[0*stride+2]=(top[2]+top[3]+1)>>1; dst[0*stride+3]=(top[3]+p4+1)>>1;
-        dst[1*stride+0]=(top[0]+top[1]*2+top[2]+2)>>2; dst[1*stride+1]=(top[1]+top[2]*2+top[3]+2)>>2; dst[1*stride+2]=(top[2]+top[3]*2+p4+2)>>2; dst[1*stride+3]=(top[3]+p4*2+p5+2)>>2;
-        dst[2*stride+0]=(top[1]+top[2]*2+top[3]+2)>>2; dst[2*stride+1]=(top[2]+top[3]*2+p4+2)>>2; dst[2*stride+2]=(top[3]+p4*2+p5+2)>>2; dst[2*stride+3]=(p4+p5*2+p6+2)>>2;
-        dst[3*stride+0]=(top[2]+top[3]*2+p4+2)>>2; dst[3*stride+1]=(top[3]+p4*2+p5+2)>>2; dst[3*stride+2]=(p4+p5*2+p6+2)>>2; dst[3*stride+3]=(p5+p6*2+p7+2)>>2;
+    case 7: { /* Intra_4x4_Vertical_Left（ffmpeg pred4x4_vertical_left；需右上样本 p[4..7][-1]）
+               * 旧实现误用「mode 3 的对角公式左移一格」——只有 row0 偶然吻合，行 1..3 全错；
+               * MB 选用 mode 7（常见于平滑斜坡）时整块偏差并沿预测链放大。 */
+        uint8_t t0=top[0],t1=top[1],t2=top[2],t3=top[3],t4=top[4],t5=top[5],t6=top[6];
+        dst[0*stride+0]=(t0+t1+1)>>1;
+        dst[0*stride+1]=dst[2*stride+0]=(t1+t2+1)>>1;
+        dst[0*stride+2]=dst[2*stride+1]=(t2+t3+1)>>1;
+        dst[0*stride+3]=dst[2*stride+2]=(t3+t4+1)>>1;
+        dst[2*stride+3]=(t4+t5+1)>>1;
+        dst[1*stride+0]=(t0+2*t1+t2+2)>>2;
+        dst[1*stride+1]=dst[3*stride+0]=(t1+2*t2+t3+2)>>2;
+        dst[1*stride+2]=dst[3*stride+1]=(t2+2*t3+t4+2)>>2;
+        dst[1*stride+3]=dst[3*stride+2]=(t3+2*t4+t5+2)>>2;
+        dst[3*stride+3]=(t4+2*t5+t6+2)>>2;
         break; }
-    case 8: { uint8_t p0=left[0],p1=left[1],p2=left[2],p3=left[3];
-        dst[0*stride+0]=(p0+p1+1)>>1; dst[0*stride+1]=(p0+p1*2+p2+2)>>2; dst[0*stride+2]=(p1+p2*2+p3+2)>>2; dst[0*stride+3]=(p2+p3*2+p3+2)>>2;
-        dst[1*stride+0]=(p1+p2+1)>>1; dst[1*stride+1]=(p1+p2*2+p3+2)>>2; dst[1*stride+2]=(p2+p3*2+p3+2)>>2; dst[1*stride+3]=(p3+p3*2+p3+2)>>2;
-        dst[2*stride+0]=(p2+p3+1)>>1; dst[2*stride+1]=(p2+p3*2+p3+2)>>2; dst[2*stride+2]=(p3+p3*2+p3+2)>>2; dst[2*stride+3]=(p3+p3*2+p3+2)>>2;
-        dst[3*stride+0]=(p3+p3+1)>>1; dst[3*stride+1]=(p3+p3*2+p3+2)>>2; dst[3*stride+2]=(p3+p3*2+p3+2)>>2; dst[3*stride+3]=(p3+p3*2+p3+2)>>2;
+    case 8: { /* Intra_4x4_Horizontal_Up（ffmpeg pred4x4_horizontal_up）
+               * 旧实现在 dst[0][2]/dst[0][3]/dst[1][2]/dst[1][3] 用了错位的左邻组合。 */
+        dst[0*stride+0]=(left[0] + left[1] + 1)>>1;
+        dst[0*stride+1]=(left[0] + 2*left[1] + left[2] + 2)>>2;
+        dst[0*stride+2]=(left[1] + left[2] + 1)>>1;
+        dst[0*stride+3]=(left[1] + 2*left[2] + left[3] + 2)>>2;
+        dst[1*stride+0]=(left[1] + left[2] + 1)>>1;
+        dst[1*stride+1]=(left[1] + 2*left[2] + left[3] + 2)>>2;
+        dst[1*stride+2]=(left[2] + left[3] + 1)>>1;
+        dst[1*stride+3]=(left[2] + 2*left[3] + left[3] + 2)>>2;
+        dst[2*stride+0]=(left[2] + left[3] + 1)>>1;
+        dst[2*stride+1]=(left[2] + 2*left[3] + left[3] + 2)>>2;
+        dst[2*stride+2]=left[3];
+        dst[2*stride+3]=left[3];
+        dst[3*stride+0]=left[3];
+        dst[3*stride+1]=left[3];
+        dst[3*stride+2]=left[3];
+        dst[3*stride+3]=left[3];
         break; }
     }
 }
@@ -1462,7 +1916,9 @@ static void h264_cabac_mb_qp_delta(H264Dec *d, Cabac *cab) {
         return;
     }
     int val = 1, ctx = 2;
-    while (cabac_decode(cab, &state[60 + ctx])) {
+    /* 一元码：后续 bin ctx=3（ffmpeg decode_cabac_mb_dqp 同构）；
+     * 加界防止数据耗尽时死循环 */
+    while (val <= 2 * max_qp && cabac_decode(cab, &state[60 + ctx])) {
         ctx = 3;
         val++;
     }
@@ -1499,12 +1955,15 @@ static int h264_cabac_intra_mb_type(H264Dec *d, Cabac *cab, int mb_x, int mb_y) 
         return 0;   /* I_NxN */
     if (cabac_decode_terminate(cab))
         return 25;  /* I_PCM */
+    /* mb_type(I) ctxIdxOffset=3，ctxIdxInc 0/1/2 用于首 bin（邻接 I16x16 数）；
+     * ffmpeg decode_cabac_intra_mb_type 在首 bin 后 state += 2，
+     * 故后续 bin 用 ctx 6..10（规范表 9-40） */
     int mb_type = 1;  /* I16x16 */
-    mb_type += 12 * cabac_decode(cab, &state[4]);       /* cbp_luma != 0 */
-    if (cabac_decode(cab, &state[5]))                   /* cbp_chroma != 0 */
-        mb_type += 4 + 4 * cabac_decode(cab, &state[6]);
-    mb_type += 2 * cabac_decode(cab, &state[7]);
-    mb_type += 1 * cabac_decode(cab, &state[8]);
+    mb_type += 12 * cabac_decode(cab, &state[6]);               /* cbp_luma != 0 */
+    if (cabac_decode(cab, &state[7]))                           /* cbp_chroma != 0 */
+        mb_type += 4 + 4 * cabac_decode(cab, &state[8]);
+    mb_type += 2 * cabac_decode(cab, &state[9]);
+    mb_type += 1 * cabac_decode(cab, &state[10]);
     return mb_type;
 }
 
@@ -1548,16 +2007,18 @@ static int h264_cabac_intra4x4_mode(H264Dec *d, Cabac *cab, int pred_mode) {
 /* chroma 帧内模式（ffmpeg decode_cabac_mb_chroma_pre_mode：ctx 64+邻接，67 用两次） */
 static int h264_cabac_chroma_pred(H264Dec *d, Cabac *cab, int left_mode, int top_mode) {
     uint8_t *state = d->cabac_ctx;
-    int ctx = (left_mode != 0) + (top_mode != 0);
+    int ctx = (left_mode != 0) + 2 * (top_mode != 0);
     if (!cabac_decode(cab, &state[64 + ctx])) return 0;
     if (!cabac_decode(cab, &state[64 + 3])) return 1;
     if (!cabac_decode(cab, &state[64 + 3])) return 2;
     return 3;
 }
 
-/* 16x16 帧内预测（模式 0-3） */
+/* 16x16 帧内预测（模式 0-3）
+ * 模式 3 = Intra_16x16_Plane（规范 8.3.3.4）：旧实现是「top[j] + (left[i]-left[15])/2」
+ * 的伪公式，在块内产生错误斜坡（多 MB 流上逐块累积成大偏差），已按规范重写。 */
 static void h264_pred16x16(uint8_t *dst, int stride, int mode,
-                           const uint8_t *top, const uint8_t *left) {
+                           const uint8_t *top, const uint8_t *left, int tl) {
     int i, j;
     switch (mode) {
     case 0:
@@ -1575,17 +2036,27 @@ static void h264_pred16x16(uint8_t *dst, int stride, int mode,
         for (i = 0; i < 16; i++)
             for (j = 0; j < 16; j++) dst[i * stride + j] = (uint8_t)s;
         break; }
-    case 3:
+    case 3: {
+        /* a = 16*(p[-1][15] + p[15][-1])；b/c 由 8 阶加权梯度 H/V 得（p[-1][-1] = tl） */
+        int H = 0, V = 0;
+        for (i = 0; i < 8; i++) {
+            H += (i + 1) * ((int)top[8 + i] - (int)(i == 7 ? tl : top[6 - i]));
+            V += (i + 1) * ((int)left[8 + i] - (int)(i == 7 ? tl : left[6 - i]));
+        }
+        int a = 16 * ((int)left[15] + (int)top[15]);
+        int b = (5 * H + 32) >> 6;
+        int c = (5 * V + 32) >> 6;
         for (i = 0; i < 16; i++)
             for (j = 0; j < 16; j++)
-                dst[i * stride + j] = (uint8_t)h264_clip_u8(top[j] + ((left[i] - left[15] + 1) >> 1));
-        break;
+                dst[i * stride + j] = (uint8_t)h264_clip_u8((a + b * (j - 7) + c * (i - 7) + 16) >> 5);
+        break; }
     }
 }
 
-/* 色度 8x8 帧内预测（模式 0-3） */
+/* 色度 8x8 帧内预测（模式 0-3）
+ * 模式 3 = Intra_Chroma_Plane（规范 8.3.4.4）：同亮度 Plane 但 4 阶梯度、块宽 8。 */
 static void h264_pred8x8c(uint8_t *dst, int stride, int mode,
-                          const uint8_t *top, const uint8_t *left) {
+                          const uint8_t *top, const uint8_t *left, int tl) {
     int i, j;
     switch (mode) {
     case 0:
@@ -1603,40 +2074,52 @@ static void h264_pred8x8c(uint8_t *dst, int stride, int mode,
         for (i = 0; i < 8; i++)
             for (j = 0; j < 8; j++) dst[i * stride + j] = (uint8_t)s;
         break; }
-    case 3:
+    case 3: {
+        int H = 0, V = 0;
+        for (i = 0; i < 4; i++) {
+            H += (i + 1) * ((int)top[4 + i] - (int)(i == 3 ? tl : top[2 - i]));
+            V += (i + 1) * ((int)left[4 + i] - (int)(i == 3 ? tl : left[2 - i]));
+        }
+        int a = 16 * ((int)left[7] + (int)top[7]);
+        int b = (5 * H + 32) >> 6;
+        int c = (5 * V + 32) >> 6;
         for (i = 0; i < 8; i++)
             for (j = 0; j < 8; j++)
-                dst[i * stride + j] = (uint8_t)h264_clip_u8(top[j] + ((left[i] - left[7] + 1) >> 1));
-        break;
+                dst[i * stride + j] = (uint8_t)h264_clip_u8((a + b * (j - 3) + c * (i - 3) + 16) >> 5);
+        break; }
     }
 }
 
 /* I 帧 mb 类型表（ffmpeg i_mb_type_info，索引 0-25 → {type, pred_mode, cbp}） */
 static const int i_mb_type_tab[26][3] = {
     {MB_TYPE_INTRA4x4,   -1,  -1},   /* 0 I_NxN */
-    {MB_TYPE_INTRA16x16,  2,   0},   /* 1 */
+    /* I16x16：pred16 = Intra16x16PredMode = (mb_type-1)%4（0=Vertical 1=Horizontal
+     * 2=DC 3=Plane，与 h264_pred16x16 一致）；cbp = cbpl | cbpc<<4。
+     * 旧表 pred16 列被整体反转（mbt=1→2、3→0），导致真 Vertical 被当 DC、真 DC 被当
+     * 当 Vertical —— 单 MB 平场（邻接同值）恰好不暴露，多 MB 后逐块累积成大偏差。 */
+    {MB_TYPE_INTRA16x16,  0,   0},   /* 1 */
     {MB_TYPE_INTRA16x16,  1,   0},   /* 2 */
-    {MB_TYPE_INTRA16x16,  0,   0},   /* 3 */
+    {MB_TYPE_INTRA16x16,  2,   0},   /* 3 */
     {MB_TYPE_INTRA16x16,  3,   0},   /* 4 */
-    {MB_TYPE_INTRA16x16,  2,  16},   /* 5 */
+    {MB_TYPE_INTRA16x16,  0,  16},   /* 5 */
     {MB_TYPE_INTRA16x16,  1,  16},   /* 6 */
-    {MB_TYPE_INTRA16x16,  0,  16},   /* 7 */
+    {MB_TYPE_INTRA16x16,  2,  16},   /* 7 */
     {MB_TYPE_INTRA16x16,  3,  16},   /* 8 */
-    {MB_TYPE_INTRA16x16,  2,  32},   /* 9 */
+    {MB_TYPE_INTRA16x16,  0,  32},   /* 9 */
     {MB_TYPE_INTRA16x16,  1,  32},   /* 10 */
-    {MB_TYPE_INTRA16x16,  0,  32},   /* 11 */
+    {MB_TYPE_INTRA16x16,  2,  32},   /* 11 */
     {MB_TYPE_INTRA16x16,  3,  32},   /* 12 */
-    {MB_TYPE_INTRA16x16,  2,  15},   /* 13 */
+    {MB_TYPE_INTRA16x16,  0,  15},   /* 13 */
     {MB_TYPE_INTRA16x16,  1,  15},   /* 14 */
-    {MB_TYPE_INTRA16x16,  0,  15},   /* 15 */
+    {MB_TYPE_INTRA16x16,  2,  15},   /* 15 */
     {MB_TYPE_INTRA16x16,  3,  15},   /* 16 */
-    {MB_TYPE_INTRA16x16,  2,  31},   /* 17 */
+    {MB_TYPE_INTRA16x16,  0,  31},   /* 17 */
     {MB_TYPE_INTRA16x16,  1,  31},   /* 18 */
-    {MB_TYPE_INTRA16x16,  0,  31},   /* 19 */
+    {MB_TYPE_INTRA16x16,  2,  31},   /* 19 */
     {MB_TYPE_INTRA16x16,  3,  31},   /* 20 */
-    {MB_TYPE_INTRA16x16,  2,  47},   /* 21 */
+    {MB_TYPE_INTRA16x16,  0,  47},   /* 21 */
     {MB_TYPE_INTRA16x16,  1,  47},   /* 22 */
-    {MB_TYPE_INTRA16x16,  0,  47},   /* 23 */
+    {MB_TYPE_INTRA16x16,  2,  47},   /* 23 */
     {MB_TYPE_INTRA16x16,  3,  47},   /* 24 */
     {MB_TYPE_INTRA_PCM,  -1,  -1},   /* 25 */
 };
@@ -1701,14 +2184,17 @@ static void h264_dequant_idct4(uint8_t *dst, int stride, int16_t *block,
 }
 
 /* I16x16 luma DC：4x4 Hadamard 反变换（无归一化）+ 反量化。
- * 位级语义（与 ffmpeg 7.1 实测一致）：
- *   qmul = dequant4_coeff[0][qp][0] * 16 = dequant4[rem][0] << (div+10)
- *   dc   = (z * qmul + 128) >> 8
- * 之后再经 idct4_dc_add 的 (x+32)>>6 得到像素增量。
- * 注意：不能用 dequant4[rem][0] << div（缺 16x scaling，实测差 16 倍）。 */
+ * 规范 8.5.10：d_00 = z * LevelScale4x4[qp%6][0][0] * 2^(qp/6)，
+ * 随后 4x4 IDCT 以 (d_00 + 32) >> 6 加到预测值上。
+ * 本实现的 Hadamard 对「仅 DC 非零」的输入得到 z（非 16z），故
+ * qmul = dequant4[rem][0] << (div + 6)，dc = (z * qmul + 128) >> 8。
+ * 依据：QP=20 平场扫描 15 个已由 end_of_slice_flag==1 验证正确的码流
+ * （z=-44→110, -25→118, -15→122, -5→126, -2→127, 0→128, 2→129, 5→130,
+ *  10→132, 15→134, 29→140, 54→150, 103→170, 177→200, 251→230）全部逐值吻合；
+ * 原 <<(div+8) 使幅度放大 4 倍（z=-5 得 120 而非 126）。 */
 static void h264_luma_dc_dequant(H264Dec *d, int16_t *dc, int qp) {
     int rem = qp % 6, div = qp / 6;
-    int qmul = dequant4[rem][0] << (div + 10);
+    int qmul = dequant4[rem][0] << (div + 6);
     int16_t t[16];
     for (int i = 0; i < 4; i++) {
         int z0 = dc[i*4+0] + dc[i*4+1];
@@ -1745,14 +2231,47 @@ static void h264_chroma_dc_dequant(H264Dec *d, int16_t *dc, int qp) {
 }
 
 /* 读帧内预测邻接：top[0..n-1] 上方、left[0..n-1] 左侧、top[n..2n-1] 右上。
- * 帧右边界外右上像素复制 top[n-1]；y=0 时读顶部 pad（128）。 */
+ * 帧右边界外右上像素复制 top[n-1]。
+ * 规范 8.3.1.2.1：邻接样本不可用时必须做替换 ——
+ *   上不可用且左可用 ⇒ 上样本取左侧样本；左不可用且上可用 ⇒ 左样本取上方样本；
+ *   两侧都不可用 ⇒ 全取 1 << (BitDepthY-1) = 128。
+ * 原实现一律读顶部/左侧 128 pad，等价于「两侧都不可用」，
+ * 导致顶行/左列宏块的非 DC 预测模式被固定成 128（如 32x16 平场第 2 宏块输出 128 而非 126）。 */
 static void h264_pred_neigh(const uint8_t *plane, int stride, int x, int y,
-                            uint8_t *top, uint8_t *left, int n, int width) {
-    for (int i = 0; i < n; i++) top[i] = plane[(y - 1) * stride + x + i];
-    for (int i = 0; i < n; i++) left[i] = plane[(y + i) * stride + x - 1];
+                            uint8_t *top, uint8_t *left, int n, int width,
+                            int top_avail, int left_avail, uint8_t *tl_out) {
+    uint8_t ot[32], ol[32];
+    for (int i = 0; i < n && i < 32; i++) {
+        ot[i] = plane[(y - 1) * stride + x + i];
+        ol[i] = plane[(y + i) * stride + x - 1];
+    }
+    for (int i = 0; i < n; i++) { top[i] = ot[i < 32 ? i : 0]; left[i] = ol[i < 32 ? i : 0]; }
     for (int i = 0; i < n; i++)
         top[n + i] = (x + n + i < width) ? plane[(y - 1) * stride + x + n + i]
                                          : top[n - 1];
+    if (!top_avail) {
+        for (int i = 0; i < n; i++) top[i] = left_avail ? ol[i < 32 ? i : 0] : 128;
+        for (int i = 0; i < n; i++) top[n + i] = top[n - 1];
+    }
+    if (!left_avail)
+        for (int i = 0; i < n; i++) left[i] = top_avail ? ot[i < 32 ? i : 0] : 128;
+    /* 左上角 p[-1][-1]（规范 8.3.1.2.1 的代入规则），仅 Intra_4x4 的 mode 4/6 使用 */
+    if (tl_out) {
+        if (top_avail && left_avail) *tl_out = plane[(y - 1) * stride + x - 1];
+        else if (left_avail)         *tl_out = ol[0];
+        else if (top_avail)          *tl_out = ot[0];
+        else                         *tl_out = 128;
+    }
+}
+
+/* 诊断：VLLM_DUMP_MB=<n> 打印前 n 个宏块的语法/残差（不改变解码语义） */
+static int h264_trace_limit(void) {
+    static int lim = -1;
+    if (lim < 0) {
+        const char *e = getenv("VLLM_DUMP_MB");
+        lim = e ? atoi(e) : 0;
+    }
+    return lim;
 }
 
 /* I 帧宏块解码（CABAC） */
@@ -1792,29 +2311,45 @@ static int h264_decode_mb_i(H264Dec *d, Cabac *cab, int mb_x, int mb_y) {
     d->mb[idx].mb_type = (int16_t)type;
     d->mb[idx].intra16x16_pred = (uint8_t)(pred16 >= 0 ? pred16 : 0);
 
-    /* chroma 帧内模式 */
-    int lcm = (mb_x > 0) ? d->mb[idx - 1].chroma_pred : 0;
-    int tcm = (mb_y > 0) ? d->mb[idx - mb_w].chroma_pred : 0;
-    int cm = h264_cabac_chroma_pred(d, cab, lcm, tcm);
-    d->mb[idx].chroma_pred = (uint8_t)cm;
-
+    /* I_NxN：16 个 4x4 预测模式先于 intra_chroma_pred_mode 解码（规范 7.3.5，
+     * 与 ffmpeg ff_h264_decode_mb_cabac 同序；顺序错会整帧 CABAC 失步） */
     if (IS_INTRA4x4(type)) {
+        /* transform_size_8x8_flag（仅当 PPS 允许 8x8 变换时存在，ctx 399+邻接）
+         * —— 本实现未实现 8x8 残差路径，但必须消费该 bin 以保持 CABAC 同步 */
+        if (d->pps.transform_8x8_mode_flag) {
+            int l8 = (mb_x > 0) ? d->mb[idx - 1].dct8x8 : 0;
+            int t8 = (mb_y > 0) ? d->mb[idx - mb_w].dct8x8 : 0;
+            int nts = (l8 ? 1 : 0) + (t8 ? 2 : 0);
+            d->mb[idx].dct8x8 = (uint8_t)cabac_decode(cab, &d->cabac_ctx[399 + nts]);
+        }
         /* 16 个 4x4 预测模式（标准块序，pred = min(左邻, 上邻)） */
         uint8_t modes[16];
         for (int i = 0; i < 16; i++) {
             int bx4 = h264_blk_x(i), by4 = h264_blk_y(i);
-            int la, up;
+            /* predIntra4x4PredMode（规范 8.3.1.1 / ffmpeg pred_intra_mode）：
+             * 任一邻接不可用 → Intra_4x4_DC(2)；两者都可用 → min(modeA, modeB)。
+             * 不可用必须与「模式值 2」区分（旧实现用 2 代替不可用并直接取 min，
+             * 当可用邻居模式为 3 时会算成 2，模式解读错位）。 */
+            int la = -1, up = -1;
             if (bx4 > 0) la = modes[h264_blk_n(bx4 - 1, by4)];
             else if (mb_x > 0) la = d->mb[idx - 1].intra4x4[h264_blk_n(3, by4)];
-            else la = 2;
             if (by4 > 0) up = modes[h264_blk_n(bx4, by4 - 1)];
             else if (mb_y > 0) up = d->mb[idx - mb_w].intra4x4[h264_blk_n(bx4, 3)];
-            else up = 2;
-            int pred = (la < up) ? la : up;
+            int pred = (la < 0 || up < 0) ? 2 : ((la < up) ? la : up);
             modes[i] = (uint8_t)h264_cabac_intra4x4_mode(d, cab, pred);
         }
         memcpy(d->mb[idx].intra4x4, modes, 16);
+        if (h264_trace_limit() > 0) {
+            fprintf(stderr, "        modes=");
+            for (int mi = 0; mi < 16; mi++) fprintf(stderr, "%d%s", modes[mi], mi == 15 ? "\n" : ",");
+        }
     }
+
+    /* chroma 帧内模式（在 intra4x4 模式之后） */
+    int lcm = (mb_x > 0) ? d->mb[idx - 1].chroma_pred : 0;
+    int tcm = (mb_y > 0) ? d->mb[idx - mb_w].chroma_pred : 0;
+    int cm = h264_cabac_chroma_pred(d, cab, lcm, tcm);
+    d->mb[idx].chroma_pred = (uint8_t)cm;
 
     /* cbp（I4x4 时解码；I16x16 由 mb_type 决定） */
     int cbpl = 0, cbpc = 0;
@@ -1823,6 +2358,18 @@ static int h264_decode_mb_i(H264Dec *d, Cabac *cab, int mb_x, int mb_y) {
         cbpc = h264_cabac_cbp_chroma(d, cab);
         cbp = cbpl | (cbpc << 4);
         d->mb[idx].cbp = (uint16_t)cbp;
+        /* 诊断：VLLM_FORCE_CBP=<cbpl>[,<cbpc>] 覆盖 cbp 值（仅用于假设检验，默认路径不变） */
+        {
+            const char *fc = getenv("VLLM_FORCE_CBP");
+            if (fc) {
+                int a = cbpl, b2 = cbpc;
+                if (strchr(fc, ',')) sscanf(fc, "%d,%d", &a, &b2);
+                else a = atoi(fc);
+                cbpl = a; cbpc = b2; cbp = cbpl | (cbpc << 4);
+                d->mb[idx].cbp = (uint16_t)cbp;
+                fprintf(stderr, "[h264] FORCE_CBP mb=%d cbpl=%d cbpc=%d cbp=%d\n", idx, cbpl, cbpc, cbp);
+            }
+        }
     } else {
         d->mb[idx].cbp = (uint8_t)cbp;
     }
@@ -1835,71 +2382,168 @@ static int h264_decode_mb_i(H264Dec *d, Cabac *cab, int mb_x, int mb_y) {
     int qpc = h264_chroma_qp(qp, d->pps.chroma_qp_index_offset);
     d->mb[idx].qp = (uint8_t)qp;
     memset(d->cur_nz, 0, 24);
+    int trace = (idx < h264_trace_limit());
+    if (trace)
+        fprintf(stderr, "[MB %4d] mbt=%2d type=%d pred16=%d chroma=%d cbp=%d dct8=%d qp=%d bpos=%zu.%d\n",
+                idx, mbt, type, pred16, cm, cbp, d->mb[idx].dct8x8, qp, cab->byte_pos, cab->bit_pos);
 
     /* 帧内预测 + 残差 */
     if (IS_INTRA16x16(type)) {
+        {   /* 诊断：VLLM_FORCE_PRED16=<mb_idx>:<mode> 覆盖 I16x16 预测模式（假设检验，不影响 CABAC） */
+            const char *fp = getenv("VLLM_FORCE_PRED16");
+            if (fp) { int mi = -1, mm = 0; if (sscanf(fp, "%d:%d", &mi, &mm) == 2 && mi == idx) pred16 = mm; }
+        }
         /* DC 块 + 16 AC 块 */
         memset(d->dc_block, 0, 32 * sizeof(int16_t));
         int16_t *dc = d->dc_block;
         int nzdc = h264_cabac_residual(d, cab, 0, 16, dc, 0, 1);
         if (nzdc) {
             h264_luma_dc_dequant(d, dc, qp);
+            /* ffmpeg decode_cabac_residual_internal：luma DC cbf=1 时置 cbp bit8，
+             * 供右侧/下方 MB 的 DC cbf 上下文（get_cabac_cbf_ctx 用 cbp>>8）。
+             * 原实现漏置 → 跨 MB 的 DC cbf 上下文错位（多 MB 流 CABAC 失步的根因之一）。 */
+            d->mb[idx].cbp |= 0x100;
         }
-        uint8_t top[32], left[32];
-        h264_pred_neigh(d->cur_y, d->ls_y, x0, y0, top, left, 16, d->width);
+        uint8_t top[32], left[32], tl16 = 128;
+        h264_pred_neigh(d->cur_y, d->ls_y, x0, y0, top, left, 16, d->width,
+                        mb_y > 0, mb_x > 0, &tl16);
         /* I16x16 预测（含残差逐块加） */
         uint8_t *dst = d->cur_y + y0 * d->ls_y + x0;
-        h264_pred16x16(dst, d->ls_y, pred16, top, left);
+        h264_pred16x16(dst, d->ls_y, pred16, top, left, tl16);
         for (int b = 0; b < 16; b++) {
             int bx4 = h264_blk_x(b), by4 = h264_blk_y(b);
             int bx = x0 + bx4 * 4, by = y0 + by4 * 4;
             memset(d->tmp_block, 0, 32 * sizeof(int16_t));
-            d->tmp_block[0] = dc[b];
-            if (cbp & (1 << (by4 >> 1))) {
-                int nz = h264_cabac_residual(d, cab, 1, 15, d->tmp_block + 1, b, 0);
+            /* dc[] 为 4x4 光栅序 ⇒ 块 (bx4,by4) 的 DC 在 dc[by4*4+bx4] */
+            d->tmp_block[0] = dc[by4 * 4 + bx4];
+            /* I16x16：cbp luma != 0 时 16 个 AC 块都有 cbf bin（ffmpeg 同构）；
+             * I4x4：按 8x8 象限位逐块判定 */
+            int ac_present = IS_INTRA16x16(type)
+                           ? ((cbp & 0x0F) != 0)
+                           : ((cbp & (1 << ((by4 >> 1) * 2 + (bx4 >> 1)))) != 0);
+            if (ac_present) {
+                /* AC 块：block 传整块起点（tmp_block[0] 为 DC，idct dc_pre=1 不重量化）；
+                 * 残差内部 j = zigzag[sp+1] ∈ [1,15] 已是光栅位置，故不可再 +1 偏移
+                 * （否则每个 AC 系数上移一行，I16x16/I4x4 亮区全错）。 */
+                int nz = h264_cabac_residual(d, cab, 1, 15, d->tmp_block, b, 0);
                 d->cur_nz[b] = (uint8_t)nz;
             }
             h264_dequant_idct4(dst + by4 * 4 * d->ls_y + bx4 * 4,
                                d->ls_y, d->tmp_block, qp, 1);
         }
     } else if (IS_INTRA4x4(type)) {
+        /* I_NxN 分两遍：
+         *   pass 1 —— 按「位流块序」（x264/ffmpeg scan8 象限序）解码 16 个 4x4 残差；
+         *             该序必须与编码器一致（cbf/nz 上下文依赖已解码块），否则 CABAC 失步。
+         *   pass 2 —— 按「光栅序」做预测+重建。4x4 预测参考已重建样本，而右上块
+         *             (bx4+1,by4-1) 在光栅序中先于当前块 ⇒ 可用；若按象限序重建，
+         *             右上块尚未重建（读到 memset 128），mode 3/7 的右上参考整片错。
+         * 旧实现把「残差解码」与「预测重建」都放在象限序单遍里 —— 单 MB 平场不暴露，
+         * 多 MB/斜纹理（如 mgq32 的 MB4 全 mode 7）逐块放大成可见偏差。 */
+        int16_t coef[16][16];   /* 扫描序残差（未反量化） */
+        for (int b = 0; b < 16; b++) {
+            int bx4 = h264_blk_x(b), by4 = h264_blk_y(b);
+            /* CodedBlockPatternLuma 位 i ↔ 8x8 象限 i（光栅序 0=左上 1=右上 2=左下 3=右下） */
+            int quad = (by4 >> 1) * 2 + (bx4 >> 1);
+            memset(coef[b], 0, sizeof(coef[b]));
+            {   /* 诊断：VLLM_SKIP_BLK=<b> 强制该块无残差（假设检验：cbf 读错？） */
+                const char *sb = getenv("VLLM_SKIP_BLK");
+                if (sb && atoi(sb) == b) {
+                    d->cur_nz[b] = 0;
+                    if (trace) fprintf(stderr, "        l4x4 blk=%2d quad=%d bp=%zu.%d nz=0(skip)\n",
+                                       b, quad, cab->byte_pos, cab->bit_pos);
+                    continue;
+                }
+            }
+            if (cbp & (1 << quad)) {
+                int nz = h264_cabac_residual(d, cab, 2, 16, coef[b], b, 0);
+                d->cur_nz[b] = (uint8_t)nz;
+            }
+            if (trace)
+                fprintf(stderr, "        l4x4 blk=%2d quad=%d bp=%zu.%d nz=%d\n",
+                        b, quad, cab->byte_pos, cab->bit_pos, d->cur_nz[b]);
+        }
+        /* pass 2：预测 + 重建（块序与 pass 1 相同：x264/ffmpeg scan8 象限序）。
+         * 右上样本 p[4..7][-1] 不可用时按规范以 p[3][-1] 复制（扩充参考样本），
+         * mode 3/7 保持不变 —— 实测 golden：mode 7 + 右上复制正好逐像素吻合，
+         * 而「mode 3/7 改判 DC」会整块错。（旧实现只按图片右缘判断，MB 内未重建的
+         * 右上块读到 memset 128，属错误参考。） */
         for (int b = 0; b < 16; b++) {
             int bx4 = h264_blk_x(b), by4 = h264_blk_y(b);
             int bx = x0 + bx4 * 4, by = y0 + by4 * 4;
             uint8_t *dst = d->cur_y + by * d->ls_y + bx;
-            uint8_t top[8], left[8];
-            h264_pred_neigh(d->cur_y, d->ls_y, bx, by, top, left, 4, d->width);
-            /* 模式可用性：右上不可用时 3/7 退化 */
+            uint8_t top[8], left[8], tl = 128;
+            h264_pred_neigh(d->cur_y, d->ls_y, bx, by, top, left, 4, d->width,
+                            (by4 > 0) || (mb_y > 0), (bx4 > 0) || (mb_x > 0), &tl);
             int mode = d->mb[idx].intra4x4[b];
-            if ((bx + 4 >= d->width) && (mode == 3 || mode == 7))
-                mode = 2;
-            h264_pred4x4(dst, d->ls_y, mode, top, left);
-            memset(d->tmp_block, 0, 32 * sizeof(int16_t));
-            if (cbp & (1 << (by4 >> 1))) {
-                int nz = h264_cabac_residual(d, cab, 2, 16, d->tmp_block, b, 0);
-                d->cur_nz[b] = (uint8_t)nz;
+            {   /* 诊断：VLLM_FORCE_MODE=<b>:<mode> 或 VLLM_FORCE_MODE_ALL=<mode>（不影响 CABAC） */
+                const char *fa = getenv("VLLM_FORCE_MODE_ALL");
+                const char *fb = getenv("VLLM_FORCE_MODE");
+                if (fa) mode = atoi(fa);
+                else if (fb) { int bb = 0, mm = 0; if (sscanf(fb, "%d:%d", &bb, &mm) == 2 && bb == b) mode = mm; }
             }
-            h264_dequant_idct4(dst, d->ls_y, d->tmp_block, qp, 0);
+            int tr_avail;
+            if (by4 == 0)   /* 右上样本位于上方 MB（bx4<3）或右上 MB（bx4==3） */
+                tr_avail = (mb_y > 0) && (bx4 < 3 || (mb_x + 1 < mb_w));
+            else            /* 位于本 MB 的右上块 (bx4+1,by4-1)：仅当它在块序中先于当前块 */
+                tr_avail = (bx4 < 3) && (h264_blk_n(bx4 + 1, by4 - 1) < b);
+            if (!tr_avail) top[4] = top[5] = top[6] = top[7] = top[3];
+            h264_pred4x4(dst, d->ls_y, mode, top, left, tl);
+            {   /* 诊断：VLLM_DUMP_PRED=<b> 打印该块预测值（供反推真值预测） */
+                const char *dp = getenv("VLLM_DUMP_PRED");
+                if (dp && atoi(dp) == b) {
+                    fprintf(stderr, "[PRED] blk=%d mode=%d tl=%d top=%d,%d,%d,%d,%d,%d,%d,%d left=%d,%d,%d,%d\n",
+                            b, mode, tl, top[0],top[1],top[2],top[3],top[4],top[5],top[6],top[7],
+                            left[0],left[1],left[2],left[3]);
+                    fprintf(stderr, "[PRED] blk=%d dst=", b);
+                    for (int pi = 0; pi < 4; pi++)
+                        for (int pj = 0; pj < 4; pj++)
+                            fprintf(stderr, "%d%s", dst[pi * d->ls_y + pj], (pi == 3 && pj == 3) ? "\n" : ",");
+                }
+            }
+            h264_dequant_idct4(dst, d->ls_y, coef[b], qp, 0);
+            {   /* 诊断：重建值（= 预测 + 残差），用于反推真值预测 */
+                const char *dp = getenv("VLLM_DUMP_PRED");
+                if (dp && atoi(dp) == b) {
+                    fprintf(stderr, "[PRED] blk=%d rec=", b);
+                    for (int pi = 0; pi < 4; pi++)
+                        for (int pj = 0; pj < 4; pj++)
+                            fprintf(stderr, "%d%s", dst[pi * d->ls_y + pj], (pi == 3 && pj == 3) ? "\n" : ",");
+                }
+            }
         }
     }
 
-    /* chroma：DC 2x2 + 4 AC 块 */
+    /* chroma：CABAC 读取顺序必须是「两分量 DC 先、两分量 AC 后」
+     * （ffmpeg h264_cabac.c yuv420 分支：先 for c 读两个 DC，再 for c{for i} 读两组 AC）。
+     * 原实现按 c 交替 DC/AC，cbpc!=0 时在此处整块失步 ⇒ 把「读取顺序」与「逐分量预测/重建」解耦。 */
+    int cbpc_local = (cbp >> 4) & 3;
+    int16_t cdc[2][4];
+    memset(cdc, 0, sizeof(cdc));
+    if (cbpc_local != 0) {
+        for (int c = 0; c < 2; c++) {
+            int16_t blk[4] = {0, 0, 0, 0};
+            /* 色度 DC 块号 = CHROMA_DC_BLOCK_INDEX + c（16/17），
+             * cbf 邻接用 cbp bit6/7（见 ffmpeg get_cabac_cbf_ctx） */
+            int nz = h264_cabac_residual(d, cab, 3, 4, blk, 16 + c, 1);
+            /* ffmpeg：色度 DC cbf=1 时置 cbp bit(6+c)（0x40<<c），
+             * 供右/下 MB 的色度 DC cbf 上下文。原实现漏置 → 跨 MB 失步。 */
+            if (nz) d->mb[idx].cbp |= (uint16_t)(0x40 << c);
+            for (int i = 0; i < 4; i++) cdc[c][i] = blk[i];
+        }
+    }
     for (int c = 0; c < 2; c++) {
         uint8_t *dst = (c == 0) ? d->cur_u : d->cur_v;
         int ls = d->ls_c;
-        uint8_t top[16], left[16];
-        h264_pred_neigh(dst, ls, x0 >> 1, y0 >> 1, top, left, 8, d->width >> 1);
-        int cmode = d->mb[idx].chroma_pred;
+        uint8_t top[16], left[16], tlc = 128;
+        h264_pred_neigh(dst, ls, x0 >> 1, y0 >> 1, top, left, 8, d->width >> 1,
+                        mb_y > 0, mb_x > 0, &tlc);
         uint8_t *cdst = dst + (y0 >> 1) * ls + (x0 >> 1);
-        h264_pred8x8c(cdst, ls, cmode, top, left);
+        h264_pred8x8c(cdst, ls, d->mb[idx].chroma_pred, top, left, tlc);
         int16_t dc[4] = {0,0,0,0};
-        int cbpc_local = (cbp >> 4) & 3;
-        if (cbpc_local & 1) {
-            int16_t blk[4];
-            int nz = h264_cabac_residual(d, cab, 3, 4, blk, 16 + c * 4, 1);
-            (void)nz;
-            /* 扫描序 → dc[0..3] */
-            dc[0] = blk[0]; dc[1] = blk[1]; dc[2] = blk[2]; dc[3] = blk[3];
+        /* CodedBlockPatternChroma: 0=无, 1=仅 DC, 2=DC+AC ⇒ DC 在 cbpc!=0 时存在 */
+        if (cbpc_local != 0) {
+            for (int i = 0; i < 4; i++) dc[i] = cdc[c][i];   /* 扫描序 → dc[0..3] */
             h264_chroma_dc_dequant(d, dc, qpc);
         }
         if (cbpc_local & 2) {
@@ -1908,11 +2552,27 @@ static int h264_decode_mb_i(H264Dec *d, Cabac *cab, int mb_x, int mb_y) {
                 uint8_t *bdst = dst + by * ls + bx;
                 memset(d->tmp_block, 0, 32 * sizeof(int16_t));
                 d->tmp_block[0] = dc[i];
-                int nz = h264_cabac_residual(d, cab, 4, 15, d->tmp_block + 1, 16 + c * 4 + i, 0);
+                int nz = h264_cabac_residual(d, cab, 4, 15, d->tmp_block, 16 + c * 4 + i, 0);
                 d->cur_nz[16 + c * 4 + i] = (uint8_t)nz;
                 h264_dequant_idct4(bdst, ls, d->tmp_block, qpc, 1);
             }
         }
+    }
+
+    if (trace) {
+        fprintf(stderr, "        dc=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d bpos_end=%zu.%d nz_luma=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+                d->dc_block[0], d->dc_block[1], d->dc_block[2], d->dc_block[3],
+                d->dc_block[4], d->dc_block[5], d->dc_block[6], d->dc_block[7],
+                d->dc_block[8], d->dc_block[9], d->dc_block[10], d->dc_block[11],
+                d->dc_block[12], d->dc_block[13], d->dc_block[14], d->dc_block[15],
+                cab->byte_pos, cab->bit_pos,
+                d->cur_nz[0], d->cur_nz[1], d->cur_nz[2], d->cur_nz[3],
+                d->cur_nz[4], d->cur_nz[5], d->cur_nz[6], d->cur_nz[7],
+                d->cur_nz[8], d->cur_nz[9], d->cur_nz[10], d->cur_nz[11],
+                d->cur_nz[12], d->cur_nz[13], d->cur_nz[14], d->cur_nz[15]);
+        const uint8_t *Y = d->cur_y + (y0) * d->ls_y + x0;
+        fprintf(stderr, "        y[0..7]=%d,%d,%d,%d,%d,%d,%d,%d\n",
+                Y[0], Y[1], Y[2], Y[3], Y[4], Y[5], Y[6], Y[7]);
     }
 
     /* 更新邻接 cbp/nz */
@@ -1928,10 +2588,243 @@ typedef struct {
     int first_mb;      /* first_mb_in_slice */
     int byte_start;    /* rbsp 中 CABAC 起始字节 */
     int cabac_len;
+    int rbsp_len;      /* 该 NAL 的 RBSP 总长（诊断用） */
     int slice_type;
     int idr_flag;
     int nal_ref_idc;
 } SliceInfo;
+
+/* ================= H.264 去块滤波（规范 8.7） =================
+ * 与 ffmpeg h264_loopfilter.c / h264dsp_template.c 的 C 参考实现同构。
+ * 覆盖范围：I 片路径 —— MB 边界边 bS=4、MB 内部 4x4 边 bS=3（亮度/色度同为 intra）。
+ * 显式未覆盖（后续迭代）：8x8 变换下按 flag 跳过 x/y=4,12 内部边；MBAFF/场编码；
+ * P/B 片的 bS 1/2 与「非 intra 侧」判定。表取自 ffmpeg（8-bit 段）。 */
+static const uint8_t h264_lf_alpha[52] = {
+     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+     4, 4, 5, 6, 7, 8, 9,10,12,13,15,17,20,22,25,28,
+    32,36,40,45,50,56,63,71,80,90,101,113,127,144,162,182,
+    203,226,255,255
+};
+static const uint8_t h264_lf_beta[52] = {
+     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+     2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 6, 6, 7, 7, 8, 8,
+     9, 9,10,10,11,11,12,12,13,13,14,14,15,15,16,16,
+    17,17,18,18
+};
+/* [indexA][bS]，列 0 未用；色度用同一值 +1（ffmpeg filter_mb_edgecv） */
+static const int8_t h264_lf_tc0[52][4] = {
+    {-1,0,0,0},{-1,0,0,0},{-1,0,0,0},{-1,0,0,0},{-1,0,0,0},{-1,0,0,0},
+    {-1,0,0,0},{-1,0,0,0},{-1,0,0,0},{-1,0,0,0},{-1,0,0,0},{-1,0,0,0},
+    {-1,0,0,0},{-1,0,0,0},{-1,0,0,0},{-1,0,0,0},{-1,0,0,0},{-1,0,0,1},
+    {-1,0,0,1},{-1,0,0,1},{-1,0,0,1},{-1,0,1,1},{-1,0,1,1},{-1,1,1,1},
+    {-1,1,1,1},{-1,1,1,1},{-1,1,1,1},{-1,1,1,2},{-1,1,1,2},{-1,1,1,2},
+    {-1,1,1,2},{-1,1,2,3},{-1,1,2,3},{-1,2,2,3},{-1,2,2,4},{-1,2,3,4},
+    {-1,2,3,4},{-1,3,3,5},{-1,3,4,6},{-1,3,4,6},{-1,4,5,7},{-1,4,5,8},
+    {-1,4,6,9},{-1,5,7,10},{-1,6,8,11},{-1,6,8,13},{-1,7,10,14},{-1,8,11,16},
+    {-1,9,12,18},{-1,10,13,20},{-1,11,15,23},{-1,13,17,25},
+};
+static inline int h264_lf_abs(int x) { return x < 0 ? -x : x; }
+static inline int h264_lf_clip(int x, int lo, int hi) { return x < lo ? lo : (x > hi ? hi : x); }
+static inline int h264_lf_clipu8(int x) { return x < 0 ? 0 : (x > 255 ? 255 : x); }
+static inline int h264_lf_clip3(int lo, int hi, int x) { return x < lo ? lo : (x > hi ? hi : x); }
+
+/* pix 指向边缘 q0 样本；xstep = 跨边缘方向步进，ystep = 沿边缘方向步进。
+ * 沿边缘一次覆盖 4 个 4x4 块（每块 4 样本），tc[] 为逐块阈值。 */
+static void h264_lf_luma_normal(uint8_t *pix0, int xstep, int ystep,
+                                int alpha, int beta, const int8_t *tc0) {
+    for (int i = 0; i < 4; i++) {
+        int tc_orig = tc0[i];
+        uint8_t *pix = pix0 + (size_t)i * 4 * ystep;
+        if (tc_orig < 0) continue;
+        for (int d = 0; d < 4; d++) {
+            int p0 = pix[-1 * xstep], p1 = pix[-2 * xstep], p2 = pix[-3 * xstep];
+            int q0 = pix[0], q1 = pix[1 * xstep], q2 = pix[2 * xstep];
+            if (h264_lf_abs(p0 - q0) < alpha && h264_lf_abs(p1 - p0) < beta && h264_lf_abs(q1 - q0) < beta) {
+                int tc = tc_orig;
+                if (h264_lf_abs(p2 - p0) < beta) {
+                    if (tc_orig)
+                        pix[-2 * xstep] = (uint8_t)h264_lf_clipu8(p1 + h264_lf_clip(
+                            ((p2 + ((p0 + q0 + 1) >> 1)) >> 1) - p1, -tc_orig, tc_orig));
+                    tc++;
+                }
+                if (h264_lf_abs(q2 - q0) < beta) {
+                    if (tc_orig)
+                        pix[1 * xstep] = (uint8_t)h264_lf_clipu8(q1 + h264_lf_clip(
+                            ((q2 + ((p0 + q0 + 1) >> 1)) >> 1) - q1, -tc_orig, tc_orig));
+                    tc++;
+                }
+                int delta = h264_lf_clip((((q0 - p0) * 4) + (p1 - q1) + 4) >> 3, -tc, tc);
+                pix[-1 * xstep] = (uint8_t)h264_lf_clipu8(p0 + delta);
+                pix[0]          = (uint8_t)h264_lf_clipu8(q0 - delta);
+            }
+            pix += ystep;
+        }
+    }
+}
+/* bS == 4 亮度强滤波：沿边缘 16 样本（4 块 × 4） */
+static void h264_lf_luma_intra(uint8_t *pix0, int xstep, int ystep, int alpha, int beta) {
+    for (int d = 0; d < 16; d++) {
+        uint8_t *pix = pix0 + (size_t)d * ystep;
+        int p2 = pix[-3 * xstep], p1 = pix[-2 * xstep], p0 = pix[-1 * xstep];
+        int q0 = pix[0], q1 = pix[1 * xstep], q2 = pix[2 * xstep];
+        if (h264_lf_abs(p0 - q0) < alpha && h264_lf_abs(p1 - p0) < beta && h264_lf_abs(q1 - q0) < beta) {
+            if (h264_lf_abs(p0 - q0) < ((alpha >> 2) + 2)) {
+                if (h264_lf_abs(p2 - p0) < beta) {
+                    int p3 = pix[-4 * xstep];
+                    pix[-1 * xstep] = (uint8_t)((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
+                    pix[-2 * xstep] = (uint8_t)((p2 + p1 + p0 + q0 + 2) >> 2);
+                    pix[-3 * xstep] = (uint8_t)((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3);
+                } else {
+                    pix[-1 * xstep] = (uint8_t)((2 * p1 + p0 + q1 + 2) >> 2);
+                }
+                if (h264_lf_abs(q2 - q0) < beta) {
+                    int q3 = pix[3 * xstep];
+                    pix[0]          = (uint8_t)((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3);
+                    pix[1 * xstep]  = (uint8_t)((p0 + q0 + q1 + q2 + 2) >> 2);
+                    pix[2 * xstep]  = (uint8_t)((2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3);
+                } else {
+                    pix[0] = (uint8_t)((2 * q1 + q0 + p1 + 2) >> 2);
+                }
+            } else {
+                pix[-1 * xstep] = (uint8_t)((2 * p1 + p0 + q1 + 2) >> 2);
+                pix[0]          = (uint8_t)((2 * q1 + q0 + p1 + 2) >> 2);
+            }
+        }
+    }
+}
+/* bS 1..3 色度常规滤波：4 块 × 2 样本（4:2:0 的 8 像素边），tc 已含 +1 */
+static void h264_lf_chroma_normal(uint8_t *pix0, int xstep, int ystep,
+                                  int alpha, int beta, const int8_t *tc0) {
+    for (int i = 0; i < 4; i++) {
+        int tc = tc0[i];
+        uint8_t *pix = pix0 + (size_t)i * 2 * ystep;
+        if (tc <= 0) continue;
+        for (int d = 0; d < 2; d++) {
+            int p0 = pix[-1 * xstep], p1 = pix[-2 * xstep];
+            int q0 = pix[0], q1 = pix[1 * xstep];
+            if (h264_lf_abs(p0 - q0) < alpha && h264_lf_abs(p1 - p0) < beta && h264_lf_abs(q1 - q0) < beta) {
+                int delta = h264_lf_clip((((q0 - p0) * 4) + (p1 - q1) + 4) >> 3, -tc, tc);
+                pix[-1 * xstep] = (uint8_t)h264_lf_clipu8(p0 + delta);
+                pix[0]          = (uint8_t)h264_lf_clipu8(q0 - delta);
+            }
+            pix += ystep;
+        }
+    }
+}
+static void h264_lf_chroma_intra(uint8_t *pix0, int xstep, int ystep, int alpha, int beta) {
+    for (int d = 0; d < 8; d++) {
+        uint8_t *pix = pix0 + (size_t)d * ystep;
+        int p0 = pix[-1 * xstep], p1 = pix[-2 * xstep];
+        int q0 = pix[0], q1 = pix[1 * xstep];
+        if (h264_lf_abs(p0 - q0) < alpha && h264_lf_abs(p1 - p0) < beta && h264_lf_abs(q1 - q0) < beta) {
+            pix[-1 * xstep] = (uint8_t)((2 * p1 + p0 + q1 + 2) >> 2);
+            pix[0]          = (uint8_t)((2 * q1 + q0 + p1 + 2) >> 2);
+        }
+    }
+}
+static void h264_lf_luma_edge(uint8_t *pix, int xstep, int ystep, int qp_av, int bS, int offA, int offB) {
+    int indexA = h264_lf_clip3(0, 51, qp_av + offA);
+    int indexB = h264_lf_clip3(0, 51, qp_av + offB);
+    int alpha = h264_lf_alpha[indexA], beta = h264_lf_beta[indexB];
+    if (alpha == 0 || beta == 0) return;
+    if (bS == 4) {
+        h264_lf_luma_intra(pix, xstep, ystep, alpha, beta);
+    } else {
+        int8_t tc[4];
+        int tv = h264_lf_tc0[indexA][bS];
+        tc[0] = tc[1] = tc[2] = tc[3] = (int8_t)tv;
+        h264_lf_luma_normal(pix, xstep, ystep, alpha, beta, tc);
+    }
+}
+static void h264_lf_chroma_edge(uint8_t *pix, int xstep, int ystep, int qpc_av, int bS, int offA, int offB) {
+    int indexA = h264_lf_clip3(0, 51, qpc_av + offA);
+    int indexB = h264_lf_clip3(0, 51, qpc_av + offB);
+    int alpha = h264_lf_alpha[indexA], beta = h264_lf_beta[indexB];
+    if (alpha == 0 || beta == 0) return;
+    if (bS == 4) {
+        h264_lf_chroma_intra(pix, xstep, ystep, alpha, beta);
+    } else {
+        int8_t tc[4];
+        int tv = (int)h264_lf_tc0[indexA][bS] + 1;
+        if (tv <= 0) return;
+        tc[0] = tc[1] = tc[2] = tc[3] = (int8_t)tv;
+        h264_lf_chroma_normal(pix, xstep, ystep, alpha, beta, tc);
+    }
+}
+/* 整帧去块滤波（重建完成后调用；MB 光栅序，先垂直边后水平边，规范 8.7） */
+static void h264_deblock_picture(H264Dec *d) {
+    if (!d->mb || !d->cur_y) return;
+    /* 诊断：VLLM_NO_DEBLOCK=1 跳过整帧去块（与 ffmpeg -skip_loop_filter all 对拍重建层） */
+    if (getenv("VLLM_NO_DEBLOCK")) return;
+    int idc = d->pps.deblocking_filter_control_present ? d->disable_deblocking_filter_idc : 0;
+    if (idc == 1) return;                              /* 显式禁用 */
+    int do_internal = (idc != 2);                      /* idc==2 只滤 MB 边界 */
+    int offA = d->pps.deblocking_filter_control_present ? d->slice_alpha_c0_offset_div2 * 2 : 0;
+    int offB = d->pps.deblocking_filter_control_present ? d->slice_beta_offset_div2 * 2 : 0;
+    int cw = d->mb_w * 16, ch = d->mb_h * 16;
+    int cwc = d->mb_w * 8, chc = d->mb_h * 8;
+    uint8_t *Y = d->cur_y; int sy = d->ls_y;
+    uint8_t *U = d->cur_u, *V = d->cur_v; int sc = d->ls_c;
+
+    for (int my = 0; my < d->mb_h; my++) {
+        for (int mx = 0; mx < d->mb_w; mx++) {
+            int idx = my * d->mb_w + mx;
+            int x0 = mx * 16, y0 = my * 16;
+            int qp = d->mb[idx].qp;
+            int dct8 = d->mb[idx].dct8x8;
+            int qp_l = (mx > 0) ? d->mb[idx - 1].qp : qp;
+            int qp_t = (my > 0) ? d->mb[idx - d->mb_w].qp : qp;
+
+            /* 亮度垂直边 x = 0(MB 边界),4,8,12 */
+            for (int e = 0; e < 4; e++) {
+                int mb_edge = (e == 0);
+                if (mb_edge) { if (mx == 0) continue; }
+                else { if (!do_internal) continue; if (dct8 && (e == 1 || e == 3)) continue; }
+                int xe = x0 + e * 4;
+                if (xe + 3 >= cw) continue;
+                int qp_av = mb_edge ? ((qp + qp_l + 1) >> 1) : qp;
+                h264_lf_luma_edge(&Y[(size_t)y0 * sy + xe], 1, sy, qp_av, mb_edge ? 4 : 3, offA, offB);
+            }
+            /* 亮度水平边 y = 0(MB 边界),4,8,12 */
+            for (int e = 0; e < 4; e++) {
+                int mb_edge = (e == 0);
+                if (mb_edge) { if (my == 0) continue; }
+                else { if (!do_internal) continue; if (dct8 && (e == 1 || e == 3)) continue; }
+                int ye = y0 + e * 4;
+                if (ye + 3 >= ch) continue;
+                int qp_av = mb_edge ? ((qp + qp_t + 1) >> 1) : qp;
+                h264_lf_luma_edge(&Y[(size_t)ye * sy + x0], sy, 1, qp_av, mb_edge ? 4 : 3, offA, offB);
+            }
+
+            /* 色度（4:2:0：每 MB 8x8；边 x/y = 0(MB 边界),4） */
+            int cx0 = mx * 8, cy0 = my * 8;
+            int qpc = h264_chroma_qp(qp, d->pps.chroma_qp_index_offset);
+            int qpc_l = (mx > 0) ? h264_chroma_qp(qp_l, d->pps.chroma_qp_index_offset) : qpc;
+            int qpc_t = (my > 0) ? h264_chroma_qp(qp_t, d->pps.chroma_qp_index_offset) : qpc;
+            for (int c = 0; c < 2; c++) {
+                uint8_t *P = (c == 0) ? U : V;
+                for (int e = 0; e < 2; e++) {
+                    int mb_edge = (e == 0);
+                    if (mb_edge) { if (mx == 0) continue; }
+                    else if (!do_internal) continue;
+                    int xce = cx0 + e * 4;
+                    if (xce + 2 >= cwc) continue;
+                    int qav = mb_edge ? ((qpc + qpc_l + 1) >> 1) : qpc;
+                    h264_lf_chroma_edge(&P[(size_t)cy0 * sc + xce], 1, sc, qav, mb_edge ? 4 : 3, offA, offB);
+                }
+                for (int e = 0; e < 2; e++) {
+                    int mb_edge = (e == 0);
+                    if (mb_edge) { if (my == 0) continue; }
+                    else if (!do_internal) continue;
+                    int yce = cy0 + e * 4;
+                    if (yce + 2 >= chc) continue;
+                    int qav = mb_edge ? ((qpc + qpc_t + 1) >> 1) : qpc;
+                    h264_lf_chroma_edge(&P[(size_t)yce * sc + cx0], sc, 1, qav, mb_edge ? 4 : 3, offA, offB);
+                }
+            }
+        }
+    }
+}
 
 /* 解码一帧（支持多 slice，I 帧路径；P/B 后续迭代） */
 static int h264_decode_frame(H264Dec *dec, const uint8_t *data, size_t size) {
@@ -1940,6 +2833,10 @@ static int h264_decode_frame(H264Dec *dec, const uint8_t *data, size_t size) {
     SliceInfo slices[64];
     int n_slices = 0;
     int mb_total = dec->mb_w * dec->mb_h;
+    {   /* 诊断：VLLM_FORCE_MB=<n> 覆盖本帧宏块数（验证「slice 内是否还有更多 MB」） */
+        const char *fm = getenv("VLLM_FORCE_MB");
+        if (fm) mb_total = atoi(fm);
+    }
 
     /* pass 1：解析帧内全部 slice NAL 的 header，定位各 slice 的 CABAC 起点 */
     size_t off = 0;
@@ -1951,6 +2848,8 @@ static int h264_decode_frame(H264Dec *dec, const uint8_t *data, size_t size) {
         const uint8_t *nal = data + off + 4;
         int nal_type = nal[0] & 0x1f;
         dec->nal_ref_idc = (nal[0] >> 5) & 3;
+        if (h264_trace_limit() > 0)
+            fprintf(stderr, "[h264] nal off=%zu nlen=%u type=%d\n", off, nlen, nal_type);
         off += 4 + nlen;
         if (nal_type == 7 || nal_type == 8) continue;   /* SPS/PPS */
         if (nal_type != 1 && nal_type != 5) continue;   /* 非 slice */
@@ -1969,6 +2868,7 @@ static int h264_decode_frame(H264Dec *dec, const uint8_t *data, size_t size) {
             slices[n_slices].first_mb = first_mb;
             slices[n_slices].byte_start = byte_start;
             slices[n_slices].cabac_len = rl - byte_start;
+            slices[n_slices].rbsp_len = rl;
             slices[n_slices].slice_type = dec->slice_type;
             slices[n_slices].idr_flag = dec->idr_flag;
             slices[n_slices].nal_ref_idc = dec->nal_ref_idc;
@@ -1977,41 +2877,89 @@ static int h264_decode_frame(H264Dec *dec, const uint8_t *data, size_t size) {
     }
     if (n_slices == 0) goto done;
 
-    /* 清空帧（I 帧）：DC 灰值 128 垫边，避免帧边界读取越界 */
+    /* 清空帧（I 帧）：DC 灰值 128 垫边，避免帧边界读取越界。
+     * 平面尺寸按宏块对齐（dec->y_bytes/c_bytes），与 h264_decoder_init_nal 一致；
+     * 同时清掉尾部 pad，保证色度帧内预测的邻接读取落在缓冲区内。 */
     int ls = dec->ls_y;
-    size_t yb = (size_t)ls * dec->height;
-    size_t cb = (size_t)(ls >> 1) * (dec->height >> 1);
-    memset(dec->yuv_out, 128, yb + 6 * (size_t)ls + cb * 2);
+    size_t yb = dec->y_bytes ? dec->y_bytes : (size_t)ls * dec->height;
+    size_t cb = dec->c_bytes ? dec->c_bytes : (size_t)(ls >> 1) * (dec->height >> 1);
+    memset(dec->yuv_out, 128, (size_t)ls + yb + 4 * (size_t)ls + 2 * cb + 2 * (size_t)ls);
     dec->cur_y = dec->yuv_out + ls;
     dec->cur_u = dec->cur_y + yb + 4 * ls;
     dec->cur_v = dec->cur_u + cb;
-    dec->left_cbp = 0; dec->top_cbp = 0;
-    memset(dec->top_nz, 0, (size_t)(dec->mb_w + 1) * 24);
+    /* 图片边界（邻接不可用）在 CABAC 上下文里的取值：邻接 cbp 取 h264_bdy_cbp()
+     * （默认 0x10F：luma cbp 位+luma DC 位=1、chroma 位=0），邻接 nz 取 H264_BDY_NZ（非零）。
+     * 定标依据见文件上方 H264_BDY_CBP 注释；可用 VLLM_BDY_CBP 运行时覆盖做 A/B。 */
+    dec->left_cbp = h264_bdy_cbp(); dec->top_cbp = h264_bdy_cbp();
+    memset(dec->top_nz, h264_bdy_nz(), (size_t)(dec->mb_w + 1) * 24);
     memset(dec->mb, 0, (size_t)mb_total * sizeof(MbState));
 
     /* pass 2：逐 slice 解码（slice 边界重初始化 CABAC 与 QP） */
+    int warned8x8 = 0;
     for (int s = 0; s < n_slices; s++) {
         int start = slices[s].first_mb;
         int end = (s + 1 < n_slices) ? slices[s + 1].first_mb : mb_total;
+        if (h264_trace_limit() > 0)
+            fprintf(stderr, "[h264] slice %d/%d first_mb=%d mb_range=[%d,%d) byte_start=%d cabac_len=%d rbsp_len=%d st=%d\n",
+                    s, n_slices, start, start, end, slices[s].byte_start, slices[s].cabac_len,
+                    slices[s].rbsp_len, slices[s].slice_type);
         dec->qscale = 26 + dec->pps.pic_init_qp_minus26 + dec->slice_qp_delta;
         dec->last_qscale_diff = 0;
         dec->qp_y = dec->qscale;
+        if (h264_trace_limit() > 0)
+            fprintf(stderr, "[h264] slice_qp: init=%d slice_qp_delta=%d -> qscale=%d (chroma_qp_off=%d,%d)\n",
+                    dec->pps.pic_init_qp_minus26, dec->slice_qp_delta, dec->qscale,
+                    dec->pps.chroma_qp_index_offset, dec->pps.second_chroma_qp_index_offset);
 
         Cabac cab;
+        g_cabac_base = dec->cabac_ctx;
+        g_bin_no = 0;
+        g_bin_budget = bin_trace_limit();
         cabac_init(&cab, rbsp + slices[s].byte_start, (size_t)slices[s].cabac_len);
         cabac_ctx_init_decode(dec, slices[s].slice_type);
+        if (getenv("VLLM_DUMP_CTX")) {   /* 诊断：dump 初始化后的 CABAC 上下文（供独立解码器对照） */
+            fprintf(stderr, "[CTX] qscale=%d n=460:", dec->qscale);
+            for (int ci = 0; ci < 460; ci++) fprintf(stderr, "%02x", dec->cabac_ctx[ci]);
+            fprintf(stderr, "\n");
+        }
+
+        /* 往返校验（诊断）：记录本 slice 的 (ctx,bin) 序列与初始上下文 */
+        g_rt_on = rt_on();
+        g_rt_n = 0;
+        if (g_rt_on) memcpy(g_rt_init, dec->cabac_ctx, 1024);
 
         for (int i = start; i < end; i++) {
             int mb_x = i % dec->mb_w, mb_y = i / dec->mb_w;
-            /* 行首或 slice 首 MB：left 邻接重置 */
-            if (mb_x == 0 || i == start) { dec->left_cbp = 0; memset(dec->left_nz, 0, 24); }
-            dec->top_cbp = (mb_y > 0) ? dec->mb[(mb_y - 1) * dec->mb_w + mb_x].cbp : 0;
+            /* 行首或 slice 首 MB：left 邻接重置为「不可用」（取值同图片边界约定） */
+            if (mb_x == 0 || i == start) { dec->left_cbp = h264_bdy_cbp(); memset(dec->left_nz, h264_bdy_nz(), 24); }
+            dec->top_cbp = (mb_y > 0) ? dec->mb[(mb_y - 1) * dec->mb_w + mb_x].cbp : h264_bdy_cbp();
             if (h264_decode_mb_i(dec, &cab, mb_x, mb_y) != 0) {
                 fprintf(stderr, "[h264] MB %d/%d (slice %d) decode failed\n", i, mb_total, s);
                 goto done;
             }
+            /* 显式回退不可静默：编码器使用了 8x8 变换，而本引擎尚未实现
+             * 8x8 残差(cat5)/逆变换 ⇒ 该帧重建结果不可信。 */
+            if (dec->mb[i].dct8x8 && !warned8x8) {
+                warned8x8 = 1;
+                fprintf(stderr, "[h264] WARN: encoder uses transform_size_8x8 (MB %d) but "
+                                "8x8 residual/IDCT is not implemented; frame output NOT reliable\n", i);
+            }
+            /* end_of_slice_flag：CABAC 下每个 MB 之后必读（规范 7.3.4 / 9.3.3.2） */
+            int eos = cabac_decode_terminate(&cab);
+            if (h264_trace_limit() > 0) {
+                if (eos && i != end - 1)
+                    fprintf(stderr, "[h264] slice %d end_of_slice_flag@MB %d (expected %d)\n",
+                            s, i, end - 1);
+                if (!eos && i == end - 1)
+                    fprintf(stderr, "[h264] slice %d missing end_of_slice_flag@MB %d\n", s, i);
+            }
         }
+        /* 往返校验（诊断）：重编本 slice 的 bin 序列并与真实 payload 对拍 */
+        if (g_rt_on)
+            rt_check_run(rbsp + slices[s].byte_start, (size_t)slices[s].cabac_len, 0);
     }
+    /* 全部 MB 重建完成后做整帧去块滤波（规范 8.7：预测用未滤波样本，滤波在整帧重建之后） */
+    h264_deblock_picture(dec);
     ret = 0;
 done:
     free(rbsp);
@@ -2028,4 +2976,43 @@ int h264_decoder_decode(H264Decoder *d, int frame_idx) {
     const uint8_t *nal_data = m->data + m->sample_off[i];
     size_t nal_size = m->sample_size[i];
     return h264_decode_frame(dec, nal_data, nal_size);
+}
+
+/* ---------- 裸流 / RTSP 推入式接口（K-E2E-005） ----------
+ * 与 MP4 路径共用同一解码内核：解码器仍只支持 I 片（P/B 未实现），
+ * 因此 RTSP/裸流侧只应推入 IDR 访问单元，非 IDR 由调用方自行跳过并计入统计。 */
+int h264_decoder_init_spspps(H264Decoder *d,
+                             const uint8_t *sps, int sps_len,
+                             const uint8_t *pps, int pps_len) {
+    if (!d) return -1;
+    return h264_decoder_init_nal(d, sps, sps_len, pps, pps_len, NULL);
+}
+
+int h264_decoder_decode_au(H264Decoder *d, const uint8_t *avcc, size_t len) {
+    if (!d || !d->dec || !avcc || len < 5) return -1;
+    return h264_decode_frame(d->dec, avcc, len);
+}
+
+int h264_decoder_width(const H264Decoder *d)  { return (d && d->dec) ? d->dec->width : 0; }
+int h264_decoder_height(const H264Decoder *d) { return (d && d->dec) ? d->dec->height : 0; }
+
+/* 把解码输出重排为**紧凑 YUV420P**（Y 连续 w*h，U 随后 (w/2)*(h/2)，V 再后）。
+ * 解码器内部按 32 字节对齐行距存放（YUV_STRIDE）且 U/V 之间有 4 行 pad，
+ * 而 media_yuv_to_rgb 按紧凑布局读取 ⇒ 必须先重排，否则色度取错。
+ * out 由调用方分配，大小 = w*h*3/2。返回 0 成功。 */
+int h264_decoder_yuv_compact(const H264Decoder *d, uint8_t *out) {
+    if (!d || !d->dec || !out) return -1;
+    const H264Dec *dec = d->dec;
+    int w = dec->width, h = dec->height;
+    if (w <= 0 || h <= 0 || !d->yuv || !d->y_u || !d->y_v) return -1;
+    for (int y = 0; y < h; y++)
+        memcpy(out + (size_t)y * w, d->yuv + (size_t)y * dec->ls_y, (size_t)w);
+    uint8_t *U = out + (size_t)w * h;
+    uint8_t *V = U + (size_t)(w / 2) * (h / 2);
+    int lsc = dec->ls_c;
+    for (int y = 0; y < h / 2; y++) {
+        memcpy(U + (size_t)y * (w / 2), d->y_u + (size_t)y * lsc, (size_t)(w / 2));
+        memcpy(V + (size_t)y * (w / 2), d->y_v + (size_t)y * lsc, (size_t)(w / 2));
+    }
+    return 0;
 }

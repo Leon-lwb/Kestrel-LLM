@@ -111,4 +111,36 @@ _Static_assert(sizeof(VQFSig)   == 200, "VQFSig layout drift");
 _Static_assert(sizeof(VQFHeader) == 448, "VQFHeader layout drift (expect 448 after MoE fields)");
 _Static_assert(sizeof(VQFTensor) == 64,  "VQFTensor layout drift");
 
+/* ----------------------------------------------------------------
+ * VQF v4：检测模型（YOLO）扩展 —— 规格见 docs/立项-K-YOLO-001 §附录 A
+ *
+ * 复用同一容器（magic/头布局/目录/64B 对齐数据区/FNV·HMAC·SM2 全继承），
+ * 仅 version=4 且 arch 槽复用为 VQFArchDet。LLM 加载器（vqf.c）遇到 v4
+ * 显式拒绝；检测加载器（vllm_yolo.c）遇到 v2/v3 亦然。
+ * ---------------------------------------------------------------- */
+#define VQF_VERSION_DET   4
+#define VQF_FLAG_DET      (1u << 10)   /* 检测模型族（YOLO） */
+#define VQF_DET_TASK_DETECT 0
+#define VQF_DET_TASK_SEG    1
+#define VQF_DET_TASK_POSE   2
+#define VQF_DET_FAM_V5      0
+#define VQF_DET_FAM_V8      1
+#define VQF_DET_FAM_V11     2
+
+typedef struct {
+    uint32_t task, family;
+    uint32_t input_w, input_h;
+    uint32_t n_classes;
+    uint32_t strides[3];
+    uint32_t head, reg_max, n_ops, n_anchors;
+    float    conf_thres, iou_thres;
+    uint32_t graph_bytes;
+    uint32_t rsvd[8];
+} VQFArchDet;              /* 92B ≤ 180B ⇒ 目录偏移仍为 448 */
+
+#define VQF_QT_BLOB 0x06   /* 原始字节张量（graph / names / anchors） */
+
+_Static_assert(sizeof(VQFArchDet) <= sizeof(VQFArch),
+               "VQFArchDet must fit the arch slot (keep dir offset at 448)");
+
 #endif /* VQF_FORMAT_H */

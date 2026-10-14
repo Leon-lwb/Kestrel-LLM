@@ -10,6 +10,7 @@
 #define VLLM_TOKENIZER_QWEN_H
 
 #include <stdint.h>
+#include <stddef.h>   /* size_t（BPE 表的长度字段） */
 
 #ifdef __cplusplus
 extern "C" {
@@ -37,6 +38,29 @@ typedef struct {
     /* 1 = 强制走旧线性扫描（env VLLM_TOK_LINEAR=1）。仅用于位级回归对照：
      * 索引路径与线性路径对同一输入必须产出完全相同的 id 序列。 */
     int    tok_linear;
+
+    /* ---- byte-level BPE（merges.bin；缺失时回退上面的贪心最长前缀）----
+     * 旧编码器是"逐位置取最长词表前缀"，与 HF/tokenizers 的 BPE 合并序不一致
+     * （如 "Explain" → 贪心 "Expla"+"in"，HF 为 "Ex"+"plain"）。这里载入
+     * tokenizer.json 的 merges（repr 域）+ added_tokens，按 GPT2/Qwen 的
+     * 预分词正则近似切词后做**按 rank 的最小合并**，与 HF 分词位级对齐。
+     *   bpe_str   : merges 左右键 + added 内容的连续存储
+     *   bm_*      : [n_merges] 每条的存储偏移/左右长度 + 开放寻址哈希 → 下标
+     *   at_*      : [n_added] 特殊/附加 token（含 <|im_*|>/<think> 等）
+     * rank 即 merges 列表顺序（下标），查找返回下标。 */
+    int       bpe_ready;
+    char     *bpe_str;
+    size_t    bpe_str_len;
+    uint32_t *bm_off;
+    uint16_t *bm_llen;
+    uint16_t *bm_rlen;
+    int      *bm_tab;          /* 槽内存 merge 下标 + 1（0 = 空） */
+    int       bm_mask;
+    int       n_merges;
+    uint32_t *at_id;
+    uint32_t *at_off;
+    uint16_t *at_len;
+    int       n_added;
 
     /* Special token IDs */
     int    bos_id;
@@ -73,6 +97,12 @@ void qwen_tokenizer_free(QwenTokenizer *tok);
  */
 int qwen_tokenizer_encode(QwenTokenizer *tok, const char *text,
                            int *token_ids, int max_tokens);
+
+/* K-LAYA-001: encode with the GPT-2 / ByteLevel pre-tokenizer regex
+ * (tokenizers ByteLevel use_regex=true), for ModernBERT-family vocabs.
+ * Reuses the same loaded vocab.bin + merges.bin (engine byte domain). */
+int qwen_tokenizer_encode_gpt2(QwenTokenizer *tok, const char *text,
+                               int *token_ids, int max_tokens);
 
 /**
  * Decode a single token ID to its string.

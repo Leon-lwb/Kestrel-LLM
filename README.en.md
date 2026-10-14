@@ -48,8 +48,8 @@ OpenAI-compatible HTTP API is available immediately.
 |---|---|
 | **Per-layer residency** (new in v1) | Resident memory decoupled from model size: **8B resident weights 4.19 GB → 0.48 GB (8.7×)**, serve peak **0.82 GB**; warm, remotely re-measured **TTFT 1.73 s / tpot 330 ms** (median of 5 identical requests, see "Performance" §4) |
 | **Long text and multi-turn** | Combo ① (L3 eviction × prefix reuse) cuts follow-up-turn prefill by **−80% ~ −96%**; with MoE combo ⑤ the 30B reaches **4.7 s / 3.2 s** for t2/t3 |
-| **Rulebook (pre-set context)** | A fixed, repeatedly used handbook (field SOPs, terminology, process parameters) is built offline into a reusable prefix: short handbooks (5,791 tokens) hit **≈82×** (194.3 s → 2.4 s); handbooks **over 8K tokens are not snapshotted** and fall back to full prefill (see [wiki/规则包与预置上下文.md](wiki/规则包与预置上下文.md)) |
-| **Sparse-attention context gating** | `--sparse-min-ctx` (decode, default 1024) / `--sparse-pf-min-ctx` (prefill, default 3072): the old gate was a constant 64 (i.e. no gate at all), which made sparse a net loss at short context (**+18.4%** at ctx 1067); with the gates in place, decode-sparse is a steady **1.8×** faster from 4K upwards |
+| **Rulebook (pre-set context)** | A fixed, repeatedly used handbook (field SOPs, terminology, process parameters) is built offline into a reusable prefix: short handbooks (5,791 tokens) hit **≈82×** (194.3 s → 2.4 s); handbooks **over 8K tokens are not snapshotted** and fall back to full prefill (see wiki `规则包与预置上下文`) |
+| **Sparse-attention context gating** | `--sparse-min-ctx` (decode, default 1024) / `--sparse-pf-min-ctx` (prefill, default 3072). **Decode side**: with the gates in place it turns positive from 4K up — **1.58× at 4K / 2.16× at 8K / 2.92× at 16K** (2B, see wiki `优化配置与边界`; a 2026-09-30 board re-test on 8B measured **1.54×**). **Prefill side** is the dangerous one: against exact prefill it still *costs* **+18.4% at ctx 1067**, crossing over only at 4.4K (−11.1%), then −29.0% at 8.6K and −45.1% at 16K. Both axes default **off** |
 | **In-house format and kernels** | Only the in-house VQF v2 single file; single ~0.8 MB binary, zero third-party runtime; hand-written NEON quantized GEMM/GEMV, own thread pool, own SM2/SM3/SM4 |
 | **Verifiable inference** | SM2 supply-chain signature protects weights + per-request attestation proof (schema 3), verified in-browser or offline with zero dependencies |
 
@@ -436,7 +436,7 @@ for **functional self-tests and numerical-consistency comparison** and is **neve
 baseline** — absolute throughput or speedups measured on x86 must not be extrapolated to the
 board. The two sides use different kernels (AVX2/scalar vs NEON/dotprod), so **cross-architecture
 bit-exact TOKIDS equality is not guaranteed** (measured bound: see the "bit-level determinism"
-section of [wiki/架构总览.md](wiki/架构总览.md)).
+section of [docs/技术文档.md](docs/技术文档.md)).
 
 ```powershell
 # Windows / MinGW-w64 (gcc must be on PATH, or pass -Gcc explicitly)
@@ -625,7 +625,7 @@ attestation**:
 
 ## Models and Reproduction
 
-> **Model support (honest disclosure)**: this engine is built and validated for **two Qwen3
+> **Model support (honest disclosure)**: this engine is built and validated for **the following
 > architecture families**:
 >
 > - **Qwen3-VL series (2B / 8B)** — text plus image/video multimodal; the tokenizer, mrope and
@@ -633,6 +633,12 @@ attestation**:
 > - **Qwen3-MoE series (e.g. Qwen3-30B-A3B, text)** — routing and per-expert FFN are
 >   integrated (accelerations such as `--moe-batch` / `VLLM_ACTQ`; see the "MoE model serving"
 >   combo in the admin console).
+> - **Qwen3-Embedding-0.6B** — sentence-embedding vectors (last-token pooling + L2 normalize); requires a **byte-level BPE** tokenizer.
+> - **Laya (ModernBERT-large + decision head)** — non-autoregressive decision model (emits a decision, generates no text).
+> - **YOLO (v5 / v8 / v11)** — object detection; in-house **VQF v4** detection format, served via the direct NPU path or an ARM CPU int8 `vdotq_s32` path.
+>
+>   The latter three are new in this round; the full adaptation and optimization process (with
+>   measured data and reproduction basis) is in [docs/tutorial/01-总览.md](docs/tutorial/01-总览.md).
 >
 > **Other architectures (Llama, older Qwen / Qwen2 text models, etc.) are neither adapted nor
 > validated**: conversion may fail or produce unusable output — do not treat this as a
@@ -749,6 +755,13 @@ third-party project runtime is ever shipped with the engine.
 | [docs/prefill注意力PV分块优化原理.md](docs/prefill注意力PV分块优化原理.md) | Prefill attention PV tiling: principles and probe conclusions |
 | [docs/投机解码瓶颈分析与MTP落地方案.md](docs/投机解码瓶颈分析与MTP落地方案.md) | Speculative-decoding bottleneck analysis and the MTP landing plan |
 | [docs/逐层驻留专家级读取方案.md](docs/逐层驻留专家级读取方案.md) | Expert-grained MoE weight reads under per-layer residency |
+| [docs/落地台账.md](docs/落地台账.md) | **Single-source ledger**: env-gate defaults / semantics / provenance, project list with gate progress and defaulting verdicts (`perf_axiom_single_source_ledger_v1`); takes precedence over the main text on conflict |
+| [docs/tutorial/01-总览.md](docs/tutorial/01-总览.md) | **Three-model onboarding + optimization tutorial** (embedding / Laya decision / YOLO detection; "principles + measured data + reproduction basis", 7 parts: adaptation and optimization) |
+| [docs/K-BENCH-*.md](docs/K-BENCH-017-板端8B-vllm-vs-llamacpp对比.md) | **Board-side benchmark reports**: 8B vs llama.cpp (K-BENCH-017), MoE-30B-A3B (018), 2B Qwen3-VL vs llama.cpp (019), multimodal 2B/8B (020) |
+| [docs/K-EMB-001-*.md](docs/K-EMB-001-句子向量嵌入-Qwen3-Embedding-0.6B适配与byte-level-BPE分词器.md) | Sentence-embedding Qwen3-Embedding-0.6B adaptation (including the byte-level BPE tokenizer rework) |
+| [docs/K-LAYA-001-*.md](docs/K-LAYA-001-非自回归决策模型-Laya-ModernBERT适配.md) | Non-autoregressive decision model Laya (ModernBERT-large + decision head) adaptation |
+| [docs/立项-K-*.md](docs/立项-K-KV-002-G0-KV侧内存默认化.md) | **Optimization project charters** (K-ACTQ / K-DENSE / K-DN / K-EMB / K-GU / K-KV / K-L0 / K-LAYA / K-MIXQ / K-MOE / K-PF / K-SPEC / K-YOLO / K-COLLAB): freeze the criteria first, then backfill measurements and verdicts |
+| [docs/参考借鉴-Strata与FreeToken.md](docs/参考借鉴-Strata与FreeToken.md) | External-engine (Strata / FreeToken) references and borrowable techniques (with cross-checks and non-borrowable items) |
 | [docs/PRE_REG_*.txt](docs/PRE_REG_STREAM_SA.txt) | **Pre-registrations**: criteria written before looking at the data (sparse SA / MoE long-context NIAH / Q4 GEMM / expert-grain probes); raw artifacts under `docs/bench/` |
 
 ---

@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>YOLO 检测配置 · vLLM-Kestrel</title>
+<style>
+:root{--bg:#0f1419;--panel:#1a212b;--panel2:#202a36;--bd:#2c3a4a;--tx:#d7e0ea;--tx2:#8ea0b4;--acc:#4da3ff;--ok:#3ecf8e;--bad:#ff6b6b;--warn:#ffb020}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 "SF Mono",Consolas,"Microsoft YaHei",monospace}
+header{display:flex;align-items:center;gap:14px;padding:12px 20px;background:var(--panel);border-bottom:1px solid var(--bd)}
+header h1{font-size:16px;margin:0;font-weight:600}
+.navlink{color:var(--tx2);font-size:12px;text-decoration:none;border:1px solid var(--bd);border-radius:6px;padding:3px 10px}
+.navlink:hover{color:var(--acc);border-color:var(--acc)}
+main{display:grid;grid-template-columns:1fr 1fr;gap:14px;padding:14px 20px;max-width:1400px;margin:0 auto}
+@media(max-width:980px){main{grid-template-columns:1fr}}
+.card{background:var(--panel);border:1px solid var(--bd);border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:6px}
+.card.wide{grid-column:1/-1}
+.card h2{font-size:13px;margin:0 0 4px;color:var(--tx2);font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+label.fld{display:block;margin:6px 0}
+label.fld .t{display:flex;justify-content:space-between;font-size:12px;color:var(--tx2);margin-bottom:3px}
+input[type=text],input[type=number],input[type=file],select{width:100%;background:var(--panel2);border:1px solid var(--bd);color:var(--tx);border-radius:6px;padding:6px 8px;font-size:13px;font-family:inherit}
+button{background:var(--panel2);color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:7px 14px;font-size:13px;cursor:pointer;font-family:inherit}
+button:hover{border-color:var(--acc);color:var(--acc)}
+button.primary{background:var(--acc);border-color:var(--acc);color:#08131f}
+button.primary:hover{filter:brightness(1.1);color:#08131f}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px}
+.grid4{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}
+.msg{padding:8px 10px;border-radius:6px;margin-top:8px;font-size:12px;display:none}
+.msg.show{display:block}
+.msg.ok{background:#14301f;color:var(--ok);border:1px solid #1f4a30}
+.msg.err{background:#33191c;color:var(--bad);border:1px solid #5c2c30}
+canvas{max-width:100%;border:1px solid var(--bd);border-radius:8px;background:#0a0e13}
+table{width:100%;border-collapse:collapse;font-size:12px;margin-top:6px}
+th,td{border-bottom:1px solid var(--bd);padding:5px 6px;text-align:left}
+th{color:var(--tx2);font-weight:600;font-size:11px}
+.small{font-size:11px;color:var(--tx2)}
+</style>
+</head>
+<body>
+<header>
+  <h1>YOLO 检测配置</h1>
+  <span style="flex:1"></span>
+  <a class="navlink" href="/admin/">← 返回管理页 /admin/</a>
+</header>
+<main>
+  <div class="card wide">
+    <h2>配置（保存后重启引擎生效）</h2>
+    <label class="fld"><span class="t"><span>检测模型路径（--yolo-model；VQF v4 或官方 .rknn）</span></span>
+      <input type="text" id="f_yolo_model" placeholder="/mnt/VQF/yolo/yolov8n.vqf"></label>
+    <div class="grid4">
+      <label class="fld"><span class="t"><span>后端（--yolo-backend）</span></span>
+        <select id="f_yolo_backend"><option value="vqf">vqf（自有 VQF v4）</option><option value="rknn">rknn（官方 librknnrt）</option></select></label>
+      <label class="fld"><span class="t"><span>librknnrt.so（--rknn-lib）</span></span>
+        <input type="text" id="f_rknn_lib" placeholder="/usr/lib/librknnrt.so"></label>
+      <label class="fld"><span class="t"><span>置信度阈值（--yolo-conf）</span></span>
+        <input type="number" id="f_yolo_conf" step="0.01" min="0" max="1" placeholder="0.25"></label>
+      <label class="fld"><span class="t"><span>NMS IoU（--yolo-iou）</span></span>
+        <input type="number" id="f_yolo_iou" step="0.01" min="0" max="1" placeholder="0.45"></label>
+      <label class="fld"><span class="t"><span>NPU 核心掩码（--yolo-core-mask）</span></span>
+        <input type="number" id="f_yolo_core_mask" min="0" placeholder="0"></label>
+    </div>
+    <label class="fld"><span class="t"><span>默认视频源（--yolo-video-src；本地 .mp4 文件 / 图像序列目录 / http:// MJPEG·快照 / rtsp:// 摄像头）</span></span>
+      <input type="text" id="f_yolo_video_src" placeholder="rtsp://192.168.1.64:554/Streaming/Channels/101"></label>
+    <div class="grid4">
+      <label class="fld"><span class="t"><span>单次抽帧数（--yolo-video-frames，默认 8）</span></span>
+        <input type="number" id="f_yolo_video_frames" min="1" max="300" placeholder="8"></label>
+      <label class="fld"><span class="t"><span>常驻拉流间隔 ms（--yolo-video-interval-ms，默认 500）</span></span>
+        <input type="number" id="f_yolo_video_interval_ms" min="0" placeholder="500"></label>
+    </div>
+    <div class="small">⚠ 引擎自带 H.264 软解<b>只支持 I 片</b>（无 P/B、无 8x8 变换；CABAC 富残差+高频场景位级不可信）：MP4/RTSP 源只能抽到<b>关键帧（IDR）</b>，
+      实际抽帧率 ≈ 关键帧率；跳过的非 IDR 在 <code>summary.skipped_non_idr</code> 回报，<b>IDR 但引擎解不出</b>的帧在 <code>summary.decoded_failed</code> 单列回报。
+      MJPEG 流与图像序列目录不受此限。</div>
+    <div class="row">
+      <button class="primary" onclick="saveCfg()">保存配置（重启生效）</button>
+      <span class="small" id="cfgPath"></span>
+    </div>
+    <div class="msg" id="cfgMsg"></div>
+  </div>
+
+  <div class="card wide">
+    <h2>传图试检测（POST /admin/api/yolo/test，临时加载不入驻）</h2>
+    <div class="row" style="margin-top:0">
+      <input type="file" id="imgFile" accept="image/*" style="max-width:320px">
+      <button class="primary" onclick="runTest()">开始检测</button>
+      <span class="small">未填的项沿用当前配置；试检测走纯 CPU / 临时 RKNN，不改服务状态。</span>
+    </div>
+    <div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:8px">
+      <canvas id="cv" width="1" height="1"></canvas>
+      <div style="flex:1;min-width:260px">
+        <div class="small" id="meta">（尚未检测）</div>
+        <div id="detList"></div>
+      </div>
+    </div>
+    <div class="msg" id="testMsg"></div>
+  </div>
+
+  <div class="card wide">
+    <h2>视频源试检测（POST /v1/detect_video · 常驻 POST /v1/stream/start|stop · GET /v1/stream/status）</h2>
+    <label class="fld"><span class="t"><span>视频源（留空 = 用配置的默认视频源）</span></span>
+      <input type="text" id="vSrc" placeholder="/mnt/VQF/video/demo.mp4 | /mnt/VQF/frames | http://ip/video | rtsp://ip:554/…"></label>
+    <div class="grid4">
+      <label class="fld"><span class="t"><span>抽帧数（max_frames）</span></span>
+        <input type="number" id="vFrames" min="1" max="300" value="8"></label>
+      <label class="fld"><span class="t"><span>帧间隔 ms（interval_ms）</span></span>
+        <input type="number" id="vInterval" min="0" value="0"></label>
+      <label class="fld"><span class="t"><span>总超时 ms（timeout_ms）</span></span>
+        <input type="number" id="vTimeout" min="1000" value="20000"></label>
+      <label class="fld"><span class="t"><span>常驻拉流间隔 ms</span></span>
+        <input type="number" id="vStreamInterval" min="0" value="500"></label>
+    </div>
+    <div class="row">
+      <button class="primary" onclick="runVidTest()">单次抽帧检测</button>
+      <button onclick="streamStart()">启动常驻拉流</button>
+      <button onclick="streamStop()">停止拉流</button>
+      <button onclick="streamStatus()">查状态</button>
+      <span class="small">RTSP/MJPEG 的「单次抽帧」会在 timeout 内累积到 max_frames 帧为止。</span>
+    </div>
+    <div class="small" id="vMeta">（尚未检测）</div>
+    <div id="vSummary"></div>
+    <div id="vFrames"></div>
+    <div class="msg" id="vMsg"></div>
+  </div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+function showMsg(el, text, ok){ el.textContent = text; el.className = "msg show " + (ok ? "ok" : "err"); }
+let imgDataUrl = null;
+
+async function loadCfg(){
+  try{
+    const r = await fetch("/admin/api/config"); const j = await r.json();
+    const c = j.config || {};
+    $("f_yolo_model").value = c.yolo_model || "";
+    if (c.yolo_backend) $("f_yolo_backend").value = (c.yolo_backend === "rknn") ? "rknn" : "vqf";
+    $("f_rknn_lib").value = c.rknn_lib || "";
+    $("f_yolo_conf").value = (c.yolo_conf != null && c.yolo_conf > 0) ? c.yolo_conf : "";
+    $("f_yolo_iou").value = (c.yolo_iou != null && c.yolo_iou > 0) ? c.yolo_iou : "";
+    $("f_yolo_core_mask").value = c.yolo_core_mask ? c.yolo_core_mask : "";
+    $("f_yolo_video_src").value = c.yolo_video_src || "";
+    $("f_yolo_video_frames").value = (c.yolo_video_frames > 0) ? c.yolo_video_frames : "";
+    $("f_yolo_video_interval_ms").value = (c.yolo_video_interval_ms > 0) ? c.yolo_video_interval_ms : "";
+    $("vSrc").placeholder = c.yolo_video_src
+      ? ("留空 = " + c.yolo_video_src)
+      : "/mnt/VQF/video/demo.mp4 | /mnt/VQF/frames | http://ip/video | rtsp://ip:554/…";
+    $("cfgPath").textContent = j.config_path ? ("配置文件: " + j.config_path) : "";
+  }catch(e){ showMsg($("cfgMsg"), "读取配置失败: " + e, false); }
+}
+async function saveCfg(){
+  const body = {
+    yolo_model: $("f_yolo_model").value.trim(),
+    yolo_backend: $("f_yolo_backend").value,
+    rknn_lib: $("f_rknn_lib").value.trim(),
+    yolo_conf: parseFloat($("f_yolo_conf").value) || 0,
+    yolo_iou: parseFloat($("f_yolo_iou").value) || 0,
+    yolo_core_mask: parseInt($("f_yolo_core_mask").value, 10) || 0,
+    yolo_video_src: $("f_yolo_video_src").value.trim(),
+    yolo_video_frames: parseInt($("f_yolo_video_frames").value, 10) || 0,
+    yolo_video_interval_ms: parseInt($("f_yolo_video_interval_ms").value, 10) || 0
+  };
+  try{
+    const r = await fetch("/admin/api/config/patch", {method:"POST",
+      headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+    const j = await r.json();
+    showMsg($("cfgMsg"), j.error ? ("失败: " + j.error) : ("已保存到 " + j.path + "（重启引擎生效）"), !j.error);
+    loadCfg();
+  }catch(e){ showMsg($("cfgMsg"), "请求失败: " + e, false); }
+}
+
+$("imgFile").addEventListener("change", function(){
+  const f = this.files && this.files[0];
+  if (!f) return;
+  const rd = new FileReader();
+  rd.onload = function(){
+    imgDataUrl = rd.result;
+    const img = new Image();
+    img.onload = function(){
+      const cv = $("cv");
+      cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+      cv.getContext("2d").drawImage(img, 0, 0);
+      $("meta").textContent = "图片 " + img.naturalWidth + "×" + img.naturalHeight + "，待检测";
+      $("detList").innerHTML = "";
+    };
+    img.src = imgDataUrl;
+  };
+  rd.readAsDataURL(f);
+});
+
+async function runTest(){
+  if (!imgDataUrl){ showMsg($("testMsg"), "请先选择图片", false); return; }
+  const b64 = imgDataUrl.replace(/^data:[^,]*,/, "");
+  const body = { image_b64: b64 };
+  const ym = $("f_yolo_model").value.trim(); if (ym) body.model = ym;
+  body.backend = $("f_yolo_backend").value;
+  const rl = $("f_rknn_lib").value.trim(); if (rl) body.rknn_lib = rl;
+  const ycf = parseFloat($("f_yolo_conf").value); if (ycf > 0) body.conf = ycf;
+  const yiou = parseFloat($("f_yolo_iou").value); if (yiou > 0) body.iou = yiou;
+  showMsg($("testMsg"), "检测中…", true);
+  $("detList").innerHTML = "";
+  try{
+    const r = await fetch("/admin/api/yolo/test", {method:"POST",
+      headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+    const j = await r.json();
+    if (j.error){ showMsg($("testMsg"), "失败: " + j.error, false); return; }
+    showMsg($("testMsg"), "后端 " + j.backend + " · " + j.ms.toFixed(1) + " ms · " + j.n + " 个目标", true);
+    $("meta").textContent = "模型 " + j.model + " · 输入 " + j.width + "×" + j.height + " · " + j.ms.toFixed(1) + " ms";
+    drawBoxes(j.detections || []);
+    renderList(j.detections || []);
+  }catch(e){ showMsg($("testMsg"), "请求失败: " + e, false); }
+}
+
+function drawBoxes(dets){
+  const cv = $("cv"), ctx = cv.getContext("2d");
+  ctx.lineWidth = Math.max(2, cv.width / 400);
+  ctx.font = Math.max(12, cv.width / 60) + "px monospace";
+  for (const d of dets){
+    const b = d.box || [0,0,0,0];
+    ctx.strokeStyle = "#3ecf8e"; ctx.fillStyle = "#3ecf8e";
+    ctx.strokeRect(b[0], b[1], b[2]-b[0], b[3]-b[1]);
+    const label = d.name + " " + (d.score != null ? d.score.toFixed(2) : "");
+    const tw = ctx.measureText(label).width + 6;
+    ctx.fillRect(b[0], b[1] - 18, tw, 18);
+    ctx.fillStyle = "#08131f";
+    ctx.fillText(label, b[0] + 3, b[1] - 5);
+  }
+}
+function renderList(dets){
+  if (!dets.length){ $("detList").innerHTML = "<div class='small'>（无目标）</div>"; return; }
+  let h = "<table><tr><th>类别</th><th>置信度</th><th>框</th></tr>";
+  for (const d of dets){
+    const b = d.box || [];
+    h += "<tr><td>" + d.name + " (#" + d.cls + ")</td><td>" + (d.score != null ? d.score.toFixed(3) : "-") +
+         "</td><td>[" + b.map(v => Math.round(v)).join(", ") + "]</td></tr>";
+  }
+  $("detList").innerHTML = h + "</table>";
+}
+
+loadCfg();
+
+/* ---------- 视频源试检测 ---------- */
+function vSrcValue(){
+  const v = $("vSrc").value.trim();
+  return v;
+}
+async function runVidTest(){
+  const body = {
+    max_frames: parseInt($("vFrames").value, 10) || 8,
+    interval_ms: parseInt($("vInterval").value, 10) || 0,
+    timeout_ms: parseInt($("vTimeout").value, 10) || 20000
+  };
+  const s = vSrcValue(); if (s) body.source = s;
+  showMsg($("vMsg"), "抽帧检测中…（RTSP/MJPEG 需等到 timeout 或帧数达标）", true);
+  $("vSummary").innerHTML = ""; $("vFrames").innerHTML = "";
+  try{
+    const r = await fetch("/v1/detect_video", {method:"POST",
+      headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+    const j = await r.json();
+    if (j.error){ showMsg($("vMsg"), "失败: " + (j.error.message || j.error), false); return; }
+    const sm = j.summary || {};
+    $("vMeta").textContent = "源 " + j.source + " · 类型 " + j.kind + " · 模式 " + j.mode
+      + (j.live ? " · 直播" : "") + " · " + j.width + "×" + j.height;
+    showMsg($("vMsg"), "完成：抽帧 " + sm.frames + "，有目标 " + sm.detected_frames
+      + "，跳过非 IDR " + sm.skipped_non_idr + "，解码失败 " + (sm.decoded_failed != null ? sm.decoded_failed : 0)
+      + "，停止原因 " + sm.stop
+      + "，耗时 " + (sm.ms != null ? sm.ms.toFixed(0) : "-") + " ms", true);
+    renderVSummary(sm);
+    renderVFrames(j.frames || []);
+  }catch(e){ showMsg($("vMsg"), "请求失败: " + e, false); }
+}
+function renderVSummary(sm){
+  const cs = sm.classes || [];
+  if (!cs.length){ $("vSummary").innerHTML = "<div class='small'>（无目标）</div>"; return; }
+  let h = "<table><tr><th>类别</th><th>最高置信度</th><th>出现帧数</th></tr>";
+  for (const c of cs)
+    h += "<tr><td>" + c.name + " (#" + c.cls + ")</td><td>" + (c.max_score != null ? c.max_score.toFixed(3) : "-")
+       + "</td><td>" + c.frames + "</td></tr>";
+  $("vSummary").innerHTML = h + "</table>";
+}
+function renderVFrames(frs){
+  if (!frs.length){ $("vFrames").innerHTML = ""; return; }
+  let h = "<table><tr><th>帧</th><th>目标</th></tr>";
+  for (const f of frs){
+    const ds = f.detections || [];
+    const txt = ds.length ? ds.map(d => d.name + " " + d.score.toFixed(2)).join("; ") : "（无）";
+    h += "<tr><td>#" + f.i + "</td><td>" + txt + "</td></tr>";
+  }
+  $("vFrames").innerHTML = h + "</table>";
+}
+async function streamStart(){
+  const body = { interval_ms: parseInt($("vStreamInterval").value, 10) || 500 };
+  const s = vSrcValue(); if (s) body.source = s;
+  try{
+    const r = await fetch("/v1/stream/start", {method:"POST",
+      headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+    const j = await r.json();
+    showMsg($("vMsg"), j.error ? ("启动失败: " + (j.error.message || j.error))
+      : ("已启动常驻拉流：" + j.source + "（间隔 " + j.interval_ms + " ms）"), !j.error);
+    if (!j.error) streamStatus();
+  }catch(e){ showMsg($("vMsg"), "请求失败: " + e, false); }
+}
+async function streamStop(){
+  try{
+    const r = await fetch("/v1/stream/stop", {method:"POST"});
+    const j = await r.json();
+    showMsg($("vMsg"), j.error ? ("停止失败: " + (j.error.message || j.error))
+      : ("已停止，累计 " + j.frames + " 帧"), !j.error);
+  }catch(e){ showMsg($("vMsg"), "请求失败: " + e, false); }
+}
+async function streamStatus(){
+  try{
+    const r = await fetch("/v1/stream/status"); const j = await r.json();
+    $("vMeta").textContent = "常驻拉流 " + (j.running ? "运行中" : "已停止")
+      + " · 源 " + (j.source || "-") + " · 类型 " + (j.kind || "-") + " · 模式 " + (j.mode || "-")
+      + " · 帧 " + j.frames + "（有目标 " + j.detected_frames + "）· 跳过非 IDR " + j.skipped_non_idr
+      + " · 解码失败 " + (j.decoded_failed != null ? j.decoded_failed : 0)
+      + " · 运行 " + (j.uptime_s != null ? j.uptime_s.toFixed(0) : "0") + " s"
+      + (j.error ? (" · 结束原因 " + j.error) : "");
+    renderVSummary({classes: aggFromLast(j.last || [])});
+    $("vFrames").innerHTML = "";
+    showMsg($("vMsg"), j.running ? "常驻拉流运行中（最近一帧 #" + j.last_index + "，" + j.last_count + " 个目标）"
+      : ("常驻拉流未运行" + (j.error ? ("：" + j.error) : "")), true);
+  }catch(e){ showMsg($("vMsg"), "请求失败: " + e, false); }
+}
+function aggFromLast(dets){
+  const m = {};
+  for (const d of dets){
+    if (!m[d.name]) m[d.name] = {cls:d.cls, name:d.name, max_score:d.score, frames:1};
+    else { m[d.name].max_score = Math.max(m[d.name].max_score, d.score); m[d.name].frames++; }
+  }
+  return Object.values(m);
+}
+</script>
+</body>
+</html>

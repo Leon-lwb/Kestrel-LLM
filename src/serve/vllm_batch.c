@@ -443,8 +443,8 @@ int vllm_batch_run(VBatchSched *b, VBatchReq *req) {
         char line[4300];
         int ln = snprintf(line, sizeof(line), "data: %s\n\n", dbuf);
         if (ln > 0) vhttp_stream_write(req->conn, line, (size_t)ln);
-        /* per-request metrics event */
-        if (met) {
+        /* per-request metrics event (opt-in; 默认流严格标准 OpenAI) */
+        if (req->emit_meta && met) {
             char mline[512];
             double tok_s = met->total_ms > 0.0
                            ? (double)met->n_tokens * 1000.0 / met->total_ms : 0.0;
@@ -457,7 +457,7 @@ int vllm_batch_run(VBatchSched *b, VBatchReq *req) {
             vhttp_stream_write(req->conn, mline, (size_t)strlen(mline));
         }
         /* 方案 2：batch 流式出证（与串行 decode_loop 相同的 schema=3）。 */
-        if (vatt_active() && req->out_text && req->out_text[0]) {
+        if (req->emit_meta && vatt_active() && req->out_text && req->out_text[0]) {
             VAttestReq ar;
             memset(&ar, 0, sizeof(ar));
             ar.body_sha = req->body_sha;

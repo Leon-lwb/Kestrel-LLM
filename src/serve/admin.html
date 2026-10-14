@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title data-en="vLLM-Kestrel Engine Admin">vLLM-Kestrel 引擎管理</title>
+<title data-en="vLLM-Kestrel Edge-Cloud Coordination Platform · Admin">vLLM-Kestrel 边缘云协调平台 · 管理</title>
 <style>
 :root{
   --bg:#0f1419; --panel:#1a212b; --panel2:#202a36; --bd:#2c3a4a;
@@ -11,7 +11,7 @@
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 "SF Mono",Consolas,"Microsoft YaHei",monospace}
-header{display:flex;align-items:center;gap:14px;padding:12px 20px;background:var(--panel);border-bottom:1px solid var(--bd)}
+header{display:flex;align-items:center;gap:10px;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--bd);flex-wrap:wrap}
 header h1{font-size:16px;margin:0;font-weight:600}
 .badge{display:inline-block;padding:2px 10px;border-radius:10px;font-size:12px;border:1px solid var(--bd);background:var(--panel2)}
 .badge.ok{color:var(--ok);border-color:var(--ok)}
@@ -31,28 +31,36 @@ header h1{font-size:16px;margin:0;font-weight:600}
 table.combos{width:100%;border-collapse:collapse;font-size:12px;margin-top:4px}
 table.combos th,table.combos td{border-bottom:1px solid var(--bd);padding:6px 8px;text-align:left;vertical-align:top}
 table.combos th{color:var(--tx2);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.4px}
-table.combos tr:last-child td{border-bottom:no e}
+table.combos tr:last-child td{border-bottom:none}
 table.combos tr:hover td{background:var(--panel2)}
 table.combos td.ev{color:var(--ok);white-space:nowrap}
 table.combos td.act{white-space:nowrap;text-align:right}
 table.combos button{padding:3px 10px;font-size:12px}
 table.combos .name{font-weight:600}
 table.combos .why{color:var(--tx2)}
-main{display:grid;grid-template-columns:1fr 1fr;gap:14px;padding:14px 20px;max-width:1400px;margin:0 auto}
-@media(max-width:980px){main{grid-template-columns:1fr}}
-.card{background:var(--panel);border:1px solid var(--bd);border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:4px}
-.card h2{font-size:13px;margin:0 0 6px;color:var(--tx2);font-weight:600;text-transform:uppercase;letter-spacing:.5px;display:flex;align-items:center;gap:8px}
+main{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;padding:12px 16px;max-width:1500px;margin:0 auto;align-items:start}
+@media(max-width:860px){main{grid-template-columns:1fr}}
+/* 卡片：统一 padding / 间距；min-width:0 防止内容（宽表/长 token）撑出横向溢出 */
+.card{background:var(--panel);border:1px solid var(--bd);border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:2px;min-width:0}
+.card h2{font-size:12.5px;margin:0 0 8px;padding-bottom:8px;border-bottom:1px solid var(--bd);color:var(--tx2);font-weight:600;text-transform:uppercase;letter-spacing:.5px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .card h2 .sub{font-weight:400;text-transform:none;letter-spacing:0;font-size:11px;color:var(--tx2)}
-/* 卡片内逻辑分区 */
-.sec{font-size:11px;color:var(--acc);text-transform:uppercase;letter-spacing:.6px;margin:10px 0 2px;padding-top:8px;border-top:1px dashed var(--bd)}
+/* 卡片内逻辑分区（标题与卡片头同样式，形成一致的层级） */
+.sec{font-size:11px;color:var(--acc);text-transform:uppercase;letter-spacing:.6px;margin:10px 0 4px;padding-top:8px;border-top:1px dashed var(--bd);display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .sec:first-of-type{border-top:none;margin-top:0;padding-top:0}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px}
+/* 卡片内字段栅格：把成组的短字段并排对齐，纵向更紧凑 */
+.fldgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:4px 12px}
+.fldgrid label.fld{margin:4px 0}
+/* 明确两列：用于 4 项一组，排成整齐的 2×2（避免 auto-fit 出现 3+1 的空档） */
+.fldgrid.c2{grid-template-columns:repeat(2,minmax(0,1fr))}
+/* 宽内容（实测台账表）独立横向滚动，不撑破卡片 */
+.tablewrap{overflow-x:auto}
 .kv{background:var(--panel2);border:1px solid var(--bd);border-radius:8px;padding:8px 10px}
 .kv .k{font-size:11px;color:var(--tx2)}
 .kv .v{font-size:15px;margin-top:2px;word-break:break-all}
 .kv .v.small{font-size:13px}
-label.fld{display:block;margin:8px 0}
-label.fld .t{display:flex;justify-content:space-between;font-size:12px;color:var(--tx2);margin-bottom:3px}
+label.fld{display:block;margin:6px 0}
+label.fld .t{display:flex;justify-content:space-between;align-items:baseline;gap:8px;font-size:12px;color:var(--tx2);margin-bottom:3px}
 input[type=text],input[type=number],select{width:100%;background:var(--panel2);border:1px solid var(--bd);color:var(--tx);border-radius:6px;padding:6px 8px;font-size:13px;font-family:inherit}
 /* Model-dir field: highlighted so it is impossible to miss */
 label.fld.hl .t{color:var(--acc);font-weight:600}
@@ -64,10 +72,10 @@ button.primary{background:var(--acc);border-color:var(--acc);color:#08131f}
 button.primary:hover{filter:brightness(1.1);color:#08131f}
 button.danger{background:#3a1f24;border-color:#6b3535;color:#ff9b9b}
 button.danger:hover{border-color:var(--bad);color:var(--bad)}
-.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
-.chkrow{display:flex;gap:8px;align-items:center;margin:6px 0;font-size:13px}
-.chkrow input{flex:0 0 auto}
-.msg{padding:8px 10px;border-radius:6px;margin-top:10px;font-size:12px;display:none}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px}
+.chkrow{display:flex;gap:8px;align-items:flex-start;margin:5px 0;font-size:13px;line-height:1.5}
+.chkrow input{flex:0 0 auto;margin-top:2px}
+.msg{padding:8px 10px;border-radius:6px;margin-top:8px;font-size:12px;display:none}
 .msg.show{display:block}
 .msg.ok{background:#14301f;color:var(--ok);border:1px solid #1f4a30}
 .msg.err{background:#33191c;color:var(--bad);border:1px solid #5c2c30}
@@ -91,11 +99,19 @@ footer{padding:10px 20px;color:#5a6a7c;font-size:12px}
 a{color:var(--acc)}
 .navlink{color:var(--tx2);font-size:12px;text-decoration:none;border:1px solid var(--bd);border-radius:6px;padding:3px 10px}
 .navlink:hover{color:var(--acc);border-color:var(--acc)}
+/* K-ADMIN-001：组件配置入口（按钮卡片，单独成页 /admin/{kb,laya,yolo}） */
+.compogrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px;margin-top:4px}
+.compo{display:block;text-decoration:none;color:var(--tx);background:var(--panel2);border:1px solid var(--bd);border-radius:10px;padding:14px;transition:border-color .15s}
+.compo:hover{border-color:var(--acc);box-shadow:0 0 0 1px rgba(77,163,255,.35)}
+.compo .tt{font-size:14px;font-weight:600;color:var(--acc)}
+.compo .dd{font-size:12px;color:var(--tx2);margin-top:6px;line-height:1.5}
+.compo .go{margin-top:10px;display:inline-block;font-size:12px;color:var(--tx2);border:1px solid var(--bd);border-radius:6px;padding:3px 10px}
+.compo:hover .go{color:var(--acc);border-color:var(--acc)}
 </style>
 </head>
 <body>
 <header>
-  <h1 data-en="vLLM-Kestrel Engine Admin">vLLM-Kestrel 引擎管理</h1>
+  <h1 data-en="vLLM-Kestrel Edge-Cloud Coordination Platform · Admin">vLLM-Kestrel 边缘云协调平台 · 管理</h1>
   <span id="engBadge" class="badge">引擎: 未知</span>
   <span id="mgrBadge" class="badge">supervisor: 未知</span>
   <span id="cfgBadge" class="badge">配置: -</span>
@@ -123,20 +139,51 @@ a{color:var(--acc)}
     <div class="msg" id="opmsg2"></div>
   </div>
 
+  <!-- 组件配置入口（K-ADMIN-001：按钮卡片，各自独立成页；云端为可选） -->
+  <div class="card" style="grid-column:1/-1">
+    <h2 data-en="Component Configuration">组件配置</h2>
+    <div class="compogrid">
+      <a class="compo" href="/admin/kb">
+        <div class="tt" data-en="Vector Model / Knowledge Base">向量模型知识库</div>
+        <div class="dd" data-en="Embedding model path, KB root dir; manage .vkb docs and run retrieval tests.">向量模型目录、知识库根目录；管理 .vkb 文档并可在线检索试查。</div>
+        <span class="go" data-en="Open KB config →">打开知识库配置 →</span>
+      </a>
+      <a class="compo" href="/admin/laya">
+        <div class="tt" data-en="Laya Decision">Laya 决策</div>
+        <div class="dd" data-en="Laya decision pack path; construct a request to try a decision online.">Laya 决策权重包目录；构造请求在线试决策。</div>
+        <span class="go" data-en="Open Laya config →">打开 Laya 配置 →</span>
+      </a>
+      <a class="compo" href="/admin/yolo">
+        <div class="tt" data-en="YOLO Detection">YOLO 检测</div>
+        <div class="dd" data-en="Detection model / backend (VQF v4 or official RKNN); upload an image to test.">检测模型与后端（VQF v4 或官方 RKNN）；传图试检测。</div>
+        <span class="go" data-en="Open YOLO config →">打开 YOLO 配置 →</span>
+      </a>
+      <a class="compo" href="/admin/cloud">
+        <div class="tt" data-en="Cloud Model (optional)">云端模型（可选）</div>
+        <div class="dd" data-en="Cloud uplink endpoint / model / fallback mode; test connectivity. Off by default (never).">云端回退地址、模型与回退模式；可测试连通。默认关闭（never）。</div>
+        <span class="go" data-en="Open cloud config →">打开云端配置 →</span>
+      </a>
+    </div>
+  </div>
+
   <!-- 模型加载 -->
   <div class="card">
     <h2 data-en="Model Loading">模型加载</h2>
     <div class="sec" data-en="Model Path &amp; Format">模型路径与格式</div>
     <label class="fld hl"><span class="t"><span data-en="Model folder path ">模型文件夹路径 </span><b style="color:var(--warn);font-weight:600" data-en="(required)">（必填）</b></span>
       <input type="text" id="f_model_dir" placeholder="D:\Modl\Qwen3-VL-2B-Instruct"></label>
+    <label class="fld"><span class="t" data-en="Model ID (--model-id; the id advertised by /v1/models and required in OpenAI requests)">模型 ID (--model-id；/v1/models 对外标识，OpenAI 请求的 model 字段)</span>
+      <input type="text" id="f_model_id" placeholder="qwen3-vl-2b"></label>
     <div style="font-size:11px;color:var(--tx2)" data-en-html="The engine is a pure VQF runtime: it auto-locates <b>model.vqf</b> inside the model folder (tries model.vqf / weights.vqf / vllm.vqf in order), mmap-mounts it directly; no format selection needed.">引擎为纯 VQF 运行时：在模型文件夹内自动定位 <b>model.vqf</b>（依次尝试 model.vqf / weights.vqf / vllm.vqf），mmap 直挂加载，无需选择格式。</div>
     <div style="font-size:11px;color:var(--tx2)" data-en-html="The quantization mode is baked into the VQF file at <b>conversion time</b> (decided by vqf_convert --wmode); the load side cannot change it — re-convert to change the quantization.">量化模式在<b>转换期</b>已固化进 VQF 文件（由 vqf_convert --wmode 决定），加载侧不可更改——要换量化请重新转换。</div>
     <div style="margin-top:4px;padding:0 10px;border-left:3px solid var(--bd)">
       <div class="sec" data-en="Load / Unload Policy">加载 / 卸载策略</div>
       <div class="chkrow"><input type="checkbox" id="f_auto_load"><label for="f_auto_load" data-en="Load on use (--load-on-use): auto-load the model when a request arrives while it is unloaded">用时加载 (--load-on-use)：模型未加载时收到请求自动加载</label></div>
-      <label class="fld"><span class="t" data-en="Idle auto-unload seconds (--auto-unload, 0=off)">空闲自动卸载秒数 (--auto-unload，0=关闭)</span><input type="number" id="f_auto_unload_s" min="0" value="0"></label>
+      <div class="fldgrid">
+        <label class="fld"><span class="t" data-en="Idle auto-unload seconds (--auto-unload, 0=off)">空闲自动卸载秒数 (--auto-unload，0=关闭)</span><input type="number" id="f_auto_unload_s" min="0" value="0"></label>
+        <label class="fld"><span class="t" data-en="Minimum free memory MB (--min-free-mb, reject new requests below this)">最小空闲内存 MB (--min-free-mb，低于则拒绝新请求)</span><input type="number" id="f_min_free_mb" min="0" value="512"></label>
+      </div>
       <div style="font-size:11px;color:var(--tx2)" data-en="When auto-unload is on, load-on-use is implied: load → use → auto-unload after N idle seconds (frees weights + KV memory) → the next request reloads.">自动卸载开启后隐含启用用时加载：加载 → 使用 → 空闲 N 秒自动卸载（释放权重+KV 内存）→ 下个请求自动重载。</div>
-      <label class="fld"><span class="t" data-en="Minimum free memory MB (--min-free-mb, reject new requests below this)">最小空闲内存 MB (--min-free-mb，低于则拒绝新请求)</span><input type="number" id="f_min_free_mb" min="0" value="512"></label>
       <div class="chkrow"><input type="checkbox" id="f_vqf_prewarm"><label for="f_vqf_prewarm" data-en="VQF prewarm after load (VLLM_VQF_PREWARM): background-pull mmap weight pages into RAM to cut first-inference latency">VQF 加载后预热 (VLLM_VQF_PREWARM)：后台把 mmap 权重页拉进 RAM，降低首次推理延迟</label></div>
       <div class="chkrow" style="flex-wrap:wrap">
         <input type="checkbox" id="f_vqf_stream"><label for="f_vqf_stream" data-en="VQF layered residency (VLLM_VQF_STREAM): AirLLM-style per-layer eviction/prefetch, RSS drops sharply">VQF 分层驻留 (VLLM_VQF_STREAM)：AirLLM 型逐层驱逐/预读，RSS 大幅下降</label>
@@ -172,30 +219,38 @@ a{color:var(--acc)}
     <div class="chkrow"><input type="checkbox" id="f_sparse_attn"><label for="f_sparse_attn"><span data-en="Sparse attention (--sparse-attn)">稀疏注意力 (--sparse-attn)</span><span class="ptag" data-en="Long context">长上下文</span><span class="ptag x86no" data-en="x86 total prefill only −6.7%">x86 总 prefill 仅 −6.7%</span></label></div>
     <label class="fld"><span class="t" data-en="Decode sparse-k (effective only when &lt; the context block count; block size 32)">解码 sparse-k（须 &lt; 上下文块数才生效，块大小 32）</span><input type="number" id="f_sparse_k" min="1" value="32"></label>
     <div class="chkrow"><input type="checkbox" id="f_sparse_prefill"><label for="f_sparse_prefill"><span data-en="Sparse prefill too (env VLLM_SPARSE_PREFILL=1) — OFF by default: the prefill kernel's output IS what gets written into the KV, so its approximation damages the context representation. If you turn it on, use the two prefill knobs below.">prefill 也走稀疏 (env VLLM_SPARSE_PREFILL=1) —— 默认关：prefill 的输出就是写进 KV 的内容，它的近似会损坏上下文表示；开它请配合下面两个 prefill 旋钮</span><span class="ptag x86no" data-en="needle loss if left at 0 granularity">粒度为 0 时已知丢针</span></label></div>
-    <label class="fld"><span class="t" data-en="Prefill sparse-k (--sparse-pf-k; 0 = follow the decode sparse-k)">prefill sparse-k（--sparse-pf-k；0 = 沿用解码档）</span><input type="number" id="f_sparse_pf_k" min="0" value="32"></label>
-    <label class="fld"><span class="t" data-en="Prefill block-selection granularity (--sparse-pf-group G): tokens sharing one selection. 0 = one representative query per whole batch (old behaviour, loses the needle); 4~8 recommended">prefill 选块粒度（--sparse-pf-group G，每 G 个 token 共享一次选块）：0 = 整批一个代表 query（旧行为，会丢针）；推荐 4~8</span><input type="number" id="f_sparse_pf_group" min="0" value="4"></label>
+    <div class="fldgrid">
+      <label class="fld"><span class="t" data-en="Prefill sparse-k (--sparse-pf-k; 0 = follow the decode sparse-k)">prefill sparse-k（--sparse-pf-k；0 = 沿用解码档）</span><input type="number" id="f_sparse_pf_k" min="0" value="32"></label>
+      <label class="fld"><span class="t" data-en="Prefill block-selection granularity (--sparse-pf-group G): tokens sharing one selection. 0 = one representative query per whole batch (old behaviour, loses the needle); 4~8 recommended">prefill 选块粒度（--sparse-pf-group G，每 G 个 token 共享一次选块）：0 = 整批一个代表 query（旧行为，会丢针）；推荐 4~8</span><input type="number" id="f_sparse_pf_group" min="0" value="4"></label>
+    </div>
     <div class="chkrow"><input type="checkbox" id="f_disk_kv"><label for="f_disk_kv"><span data-en="Disk KV persistence (--disk-kv, reuse conversation prefix KV across processes after restart)">磁盘 KV 持久化 (--disk-kv，重启后跨进程复用对话前缀 KV)</span><span class="ptag ram" data-en="KV on disk">KV 落盘</span><span class="ptag x86" data-en="x86 review −97%">x86 复核 −97%</span></label></div>
     <label class="fld"><span class="t" data-en="KV checkpoint directory">KV checkpoint 目录</span><input type="text" id="f_disk_kv_dir" placeholder="kv_disk（引擎工作目录）" data-en-ph="kv_disk (engine working directory)"></label>
     <div class="sec" data-en="Industrial Edge: Preset Contexts &amp; Sessions">工业边缘：预置上下文与会话</div>
-    <label class="fld"><span class="t" data-en="Rulebook dir (--rulebook-dir; empty = off)">规则包目录 (--rulebook-dir，留空=关闭)</span><input type="text" id="f_rulebook_dir" placeholder="rulebooks" data-en-ph="rulebooks"></label>
-    <label class="fld"><span class="t" data-en="Session dir (--session-dir; empty = off)">会话目录 (--session-dir，留空=关闭)</span><input type="text" id="f_session_dir" placeholder="sessions" data-en-ph="sessions"></label>
-    <label class="fld"><span class="t" data-en="Session file limit (--session-limit, LRU; 0 = default 1024)">会话文件上限 (--session-limit，LRU；0=默认 1024)</span><input type="number" id="f_session_limit" min="0" value="0"></label>
-    <label class="fld"><span class="t" data-en="Audit log (--audit-log; empty = &lt;session dir&gt;/admin_audit.jsonl, both empty = off)">审计日志 (--audit-log；留空=会话目录/admin_audit.jsonl，两者都空则关闭)</span><input type="text" id="f_audit_log" placeholder="sessions/admin_audit.jsonl" data-en-ph="sessions/admin_audit.jsonl"></label>
+    <div class="fldgrid c2">
+      <label class="fld"><span class="t" data-en="Rulebook dir (--rulebook-dir; empty = off)">规则包目录 (--rulebook-dir，留空=关闭)</span><input type="text" id="f_rulebook_dir" placeholder="rulebooks" data-en-ph="rulebooks"></label>
+      <label class="fld"><span class="t" data-en="Session dir (--session-dir; empty = off)">会话目录 (--session-dir，留空=关闭)</span><input type="text" id="f_session_dir" placeholder="sessions" data-en-ph="sessions"></label>
+      <label class="fld"><span class="t" data-en="Session file limit (--session-limit, LRU; 0 = default 1024)">会话文件上限 (--session-limit，LRU；0=默认 1024)</span><input type="number" id="f_session_limit" min="0" value="0"></label>
+      <label class="fld"><span class="t" data-en="Audit log (--audit-log; empty = &lt;session dir&gt;/admin_audit.jsonl, both empty = off)">审计日志 (--audit-log；留空=会话目录/admin_audit.jsonl，两者都空则关闭)</span><input type="text" id="f_audit_log" placeholder="sessions/admin_audit.jsonl" data-en-ph="sessions/admin_audit.jsonl"></label>
+    </div>
     <div style="font-size:11px;color:var(--tx2)" data-en-html="Rulebooks are built OFFLINE with <b>--rulebook-build &lt;file&gt; --rulebook-id &lt;id&gt; ...</b> (see README). Session / rulebook / audit review lives on a SEPARATE page: <b>/review</b> (not on this page). Changes here require an engine restart — the supervisor rebuilds the command line from this config.">规则包用 <b>--rulebook-build &lt;文件&gt; --rulebook-id &lt;id&gt; ...</b> 离线预置。会话 / 规则包 / 审计的审查在<b>独立页 /review</b>（不在本页）。此处改动需重启引擎——supervisor 会据此重建命令行。</div>
     <div class="sec" data-en="Sampling &amp; Speculative Decoding">采样与推测解码</div>
     <div class="chkrow"><input type="checkbox" id="f_spec"><label for="f_spec"><span data-en="Speculative decoding (--spec, n-gram draft + batch verify, greedy mode only)">推测解码 (--spec，n-gram 草稿 + 批量验证，仅贪婪模式)</span><span class="ptag" data-en="Client must send top_p=1.0">须客户端传 top_p=1.0</span><span class="ptag x86no" data-en="x86 2.4× slower">x86 反慢 2.4×</span></label></div>
-    <label class="fld"><span class="t" data-en="Draft length (--spec-k)">草稿长度 (--spec-k)</span><input type="number" id="f_spec_k" min="1" max="16" value="4"></label>
-    <label class="fld"><span class="t" data-en="min-p sampling (--min-p, 0=off)">min-p 采样 (--min-p，0=关闭)</span><input type="number" id="f_min_p" min="0" max="1" step="0.01" value="0"></label>
+    <div class="fldgrid">
+      <label class="fld"><span class="t" data-en="Draft length (--spec-k)">草稿长度 (--spec-k)</span><input type="number" id="f_spec_k" min="1" max="16" value="4"></label>
+      <label class="fld"><span class="t" data-en="min-p sampling (--min-p, 0=off)">min-p 采样 (--min-p，0=关闭)</span><input type="number" id="f_min_p" min="0" max="1" step="0.01" value="0"></label>
+    </div>
   </div>
 
   <!-- 服务 -->
   <div class="card">
     <h2 data-en="HTTP Server">HTTP 服务</h2>
-    <label class="fld"><span class="t" data-en="Port (--port)">端口 (--port)</span><input type="number" id="f_port" min="1" max="65535" value="8080"></label>
-    <label class="fld"><span class="t" data-en="Worker threads (--threads)">Worker 线程 (--threads)</span><input type="number" id="f_threads" min="1" max="32" value="8"></label>
-    <label class="fld"><span class="t" data-en="Max queued (--max-queued)">最大排队 (--max-queued)</span><input type="number" id="f_max_queued" min="0" value="16"></label>
-    <label class="fld"><span class="t" data-en="Continuous batching (--batch-max, 0/1 = off, max 32)">连续批处理 (--batch-max，0/1=关，上限 32)</span><input type="number" id="f_batch_max" min="0" max="32" value="0"></label>
-    <label class="fld"><span class="t">OMP_NUM_THREADS</span><input type="text" id="f_omp" value="4"></label>
+    <div class="fldgrid">
+      <label class="fld"><span class="t" data-en="Port (--port)">端口 (--port)</span><input type="number" id="f_port" min="1" max="65535" value="8080"></label>
+      <label class="fld"><span class="t" data-en="Worker threads (--threads)">Worker 线程 (--threads)</span><input type="number" id="f_threads" min="1" max="32" value="8"></label>
+      <label class="fld"><span class="t" data-en="Max queued (--max-queued)">最大排队 (--max-queued)</span><input type="number" id="f_max_queued" min="0" value="16"></label>
+      <label class="fld"><span class="t" data-en="Continuous batching (--batch-max, 0/1 = off, max 32)">连续批处理 (--batch-max，0/1=关，上限 32)</span><input type="number" id="f_batch_max" min="0" max="32" value="0"></label>
+      <label class="fld"><span class="t">OMP_NUM_THREADS</span><input type="text" id="f_omp" value="4"></label>
+    </div>
   </div>
 
   <!-- 内核优化 (NEON GEMM/GEMV) -->
@@ -209,8 +264,10 @@ a{color:var(--acc)}
     <div class="sec" data-en="Threads &amp; Sampling">线程与采样</div>
     <div class="chkrow"><input type="checkbox" id="f_pb_heap"><label for="f_pb_heap"><span data-en="Bounded-heap sampling ">有界堆采样 </span><b>(VLLM_PB_HEAP)</b><span data-en=" — on by default, P2 sampling optimization (sampling time 13.6ms→4.8ms)"> — 默认开，P2 采样优化（采样耗时 13.6ms→4.8ms）</span></label></div>
     <div class="chkrow"><input type="checkbox" id="f_tp_bind"><label for="f_tp_bind"><span data-en="Thread affinity binding ">线程亲和绑定 </span><b>(VLLM_TP_BIND)</b><span data-en=" — off by default (measured faster when disabled)"> — 默认关（实测关闭更快）</span></label></div>
-    <label class="fld"><span class="t" data-en="Thread-pool spin budget (VLLM_TP_SPIN, empty = default)">线程池自旋预算 (VLLM_TP_SPIN，空 = 默认)</span><input type="text" id="f_tp_spin" placeholder="默认" data-en-ph="default"></label>
-    <label class="fld"><span class="t" data-en="Q4 decode row slicing (VLLM_ROW_SLICE, empty = auto full-matrix slicing)">Q4 decode 行分片 (VLLM_ROW_SLICE，空 = 自动全矩阵分片)</span><input type="text" id="f_row_slice" placeholder="auto"></label>
+    <div class="fldgrid">
+      <label class="fld"><span class="t" data-en="Thread-pool spin budget (VLLM_TP_SPIN, empty = default)">线程池自旋预算 (VLLM_TP_SPIN，空 = 默认)</span><input type="text" id="f_tp_spin" placeholder="默认" data-en-ph="default"></label>
+      <label class="fld"><span class="t" data-en="Q4 decode row slicing (VLLM_ROW_SLICE, empty = auto full-matrix slicing)">Q4 decode 行分片 (VLLM_ROW_SLICE，空 = 自动全矩阵分片)</span><input type="text" id="f_row_slice" placeholder="auto"></label>
+    </div>
   </div>
 
   <!-- MoE 优化 (Qwen3-30B-A3B 稀疏专家) -->
@@ -254,8 +311,10 @@ a{color:var(--acc)}
         <option value="1" data-en="1  - Recommended (+QKV prefill offload)">1  - 推荐 (+QKV prefill 卸载)</option>
         <option value="2" data-en="2  - Lowest CPU load (decode offload, for small models, TPOT×12.5 on 8B)">2  - 最低 CPU 负载 (decode 卸载, 小模型适用, 8B 上 TPOT×12.5)</option>
       </select></label>
-    <label class="fld"><span class="t">VLLM_NPU_INFER (0/1)</span><input type="number" id="f_npu_infer" min="0" max="1" value="1"></label>
-    <label class="fld"><span class="t">VLLM_NPU_TIMING (0/1)</span><input type="number" id="f_npu_timing" min="0" max="1" value="0"></label>
+    <div class="fldgrid">
+      <label class="fld"><span class="t">VLLM_NPU_INFER (0/1)</span><input type="number" id="f_npu_infer" min="0" max="1" value="1"></label>
+      <label class="fld"><span class="t">VLLM_NPU_TIMING (0/1)</span><input type="number" id="f_npu_timing" min="0" max="1" value="0"></label>
+    </div>
     <div class="row">
       <button id="btn_selftest" data-en="NPU self-test (--npu-calib)">NPU 自测 (--npu-calib)</button>
     </div>
@@ -280,11 +339,15 @@ a{color:var(--acc)}
     <div class="chkrow" id="p3warn" style="display:none;color:var(--warn);font-size:12px;line-height:1.6" data-en-html="⚠ --l3-evict is on but the P3 gate is off: <code>--prefix-kv</code> is silently dropped and multi-turn follow-ups recompute the full prefill. Turn on the option above.">
       ⚠ 已开 <code>--l3-evict</code> 但未开 P3 门：<code>--prefix-kv</code> 会被静默打掉，多轮追问将全量重算 prefill。建议开启上面这项。
     </div>
-    <label class="fld"><span class="t" data-en="Eviction ratio (--l3-ratio)">淘汰比例 (--l3-ratio)</span><input type="number" id="f_l3_ratio" min="0" max="0.99" step="0.05" value="0.75"></label>
-    <label class="fld"><span class="t" data-en="Trigger: minimum context length (--l3-min-seq)">触发时机: 最小上下文长度 (--l3-min-seq)</span><input type="number" id="f_l3_min_seq" min="0" value="128"></label>
+    <div class="fldgrid">
+      <label class="fld"><span class="t" data-en="Eviction ratio (--l3-ratio)">淘汰比例 (--l3-ratio)</span><input type="number" id="f_l3_ratio" min="0" max="0.99" step="0.05" value="0.75"></label>
+      <label class="fld"><span class="t" data-en="Trigger: minimum context length (--l3-min-seq)">触发时机: 最小上下文长度 (--l3-min-seq)</span><input type="number" id="f_l3_min_seq" min="0" value="128"></label>
+    </div>
     <label class="fld"><span class="t" data-en="Eviction cache save path (--l3-path)">淘汰缓存保存路径 (--l3-path)</span><input type="text" id="f_l3_path" placeholder="默认 kv_l3.bin（引擎工作目录）" data-en-ph="default kv_l3.bin (engine working directory)"></label>
-    <label class="fld"><span class="t" data-en="Max saved size MB (--l3-max-size)">最大保存大小 MB (--l3-max-size)</span><input type="number" id="f_l3_max_size" min="0" value="0"></label>
-    <label class="fld"><span class="t" data-en="Idle TTL minutes for user eviction files (--l3-user-ttl)">用户淘汰文件闲置 TTL 分钟 (--l3-user-ttl)</span><input type="number" id="f_l3_user_ttl" min="0" value="30"></label>
+    <div class="fldgrid">
+      <label class="fld"><span class="t" data-en="Max saved size MB (--l3-max-size)">最大保存大小 MB (--l3-max-size)</span><input type="number" id="f_l3_max_size" min="0" value="0"></label>
+      <label class="fld"><span class="t" data-en="Idle TTL minutes for user eviction files (--l3-user-ttl)">用户淘汰文件闲置 TTL 分钟 (--l3-user-ttl)</span><input type="number" id="f_l3_user_ttl" min="0" value="30"></label>
+    </div>
     <div style="font-size:11px;color:var(--tx2);line-height:1.7" data-en-html='0 = always evict after prefill; N&gt;0 = start evicting when the context reaches N tokens (measured value 128; smaller means more wasted eviction overhead).<br>The path may be an eMMC mount point (e.g. /mnt/emmc/kv_l3.bin); max size 0 = unlimited.<br>Each user has an independent cache file, auto-deleted after TTL idle minutes (0 = never clean up).<br><b style="color:var(--warn)">When --l3-evict is on, be sure to also enable the P3 gate above, otherwise KV prefix reuse is silently dropped.</b>'>
       0 = prefill 后总是淘汰；N&gt;0 = 上下文达到 N tokens 才启动淘汰（实测口径 128，越小越白付驱逐开销）。<br>
       路径可填 eMMC 挂载点（如 /mnt/emmc/kv_l3.bin）；最大大小 0 = 不限制。<br>
@@ -300,6 +363,7 @@ a{color:var(--acc)}
   <!-- 有效优化组合（实测台账） -->
   <div class="card" style="grid-column:1/-1">
     <h2><span data-en="Effective Optimization Combos (measured ledger)">有效优化组合（实测台账）</span><span class="sub" data-en="Click Apply to fill the combo into the form; all are single-flag A/B measurements on the same binary">点「套用」把该组合填进表单；全部为同一二进制单开关 A/B 实测</span></h2>
+    <div class="tablewrap">
     <table class="combos">
       <thead><tr>
         <th style="width:15%" data-en="Combo">组合</th><th style="width:15%" data-en="Use case">适用场景</th>
@@ -308,6 +372,7 @@ a{color:var(--acc)}
       </tr></thead>
       <tbody id="comboBody"></tbody>
     </table>
+    </div>
     <div style="font-size:11px;color:var(--tx2);line-height:1.9;margin-top:10px" data-en-html='<b>Platform tags</b>: <span class="ptag ram">RAM saver</span> effective in memory-constrained cases · <span class="ptag x86">x86 reproduced</span> independently reproduced on local x86 · <span class="ptag x86no">x86 no gain</span> no/negative gain on x86 (<b>board-side ARM data still governs</b>)<br><b>Three hard rules</b>: ① <code>--l3-evict</code> requires <code>VLLM_L3_PREFIX_REUSE=1</code>; ② <code>--sparse-k</code> must not go below 32; ③ encrypted VQF can only be fully resident (per-layer <code>VLLM_VQF_STREAM</code> unavailable).<br><b>Mutually exclusive</b>: <code>--kv-q4</code> × <code>--sparse-attn</code>; <code>--spec</code> × {<code>--sparse-attn</code>, <code>--l3-evict</code>, <code>--batch-max</code>}.'>
       <b>平台标签</b>：
       <span class="ptag ram">省 RAM</span> 内存受限场景有效 ·
@@ -327,14 +392,18 @@ a{color:var(--acc)}
     <div style="font-size:12px;line-height:1.8" id="resStatus">-</div>
     <div class="sec" data-en="Idle auto-downgrade (model-level global idle → step down one level at a time)">空闲自动降级（模型级全局空闲 → 逐级降档）</div>
     <div class="chkrow"><input type="checkbox" id="f_res_auto"><label for="f_res_auto" data-en="Enable idle step-by-step auto-downgrade (how long since the client interacted: full residency → KV per-layer eviction → weight window → initial layers → KV to disk + exit)">启用空闲逐级自动降级（客户多久没交互：全层驻留 → KV逐层淘汰 → 权重窗口 → 初始层 → KV落盘退出）</label></div>
-    <label class="fld"><span class="t" data-en="L4→L3 KV per-layer eviction: idle wait seconds (0=stay at L4)">L4→L3 KV 逐层淘汰：空闲等待秒 (0=停在 L4)</span><input type="number" id="f_res_idle4" min="0" value="300"></label>
-    <label class="fld"><span class="t" data-en="L3→L2 weight window: idle wait seconds (0=stay at L3)">L3→L2 权重窗口：空闲等待秒 (0=停在 L3)</span><input type="number" id="f_res_idle3" min="0" value="900"></label>
-    <label class="fld"><span class="t" data-en="L2→L1 initial layers: idle wait seconds (0=stay at L2)">L2→L1 初始层：空闲等待秒 (0=停在 L2)</span><input type="number" id="f_res_idle2" min="0" value="1800"></label>
-    <label class="fld"><span class="t" data-en="L1→L0 KV to disk + unload: idle wait seconds (0=stay at L1)">L1→L0 KV落盘+卸载：空闲等待秒 (0=停在 L1)</span><input type="number" id="f_res_idle1" min="0" value="3600"></label>
+    <div class="fldgrid c2">
+      <label class="fld"><span class="t" data-en="L4→L3 KV per-layer eviction: idle wait seconds (0=stay at L4)">L4→L3 KV 逐层淘汰：空闲等待秒 (0=停在 L4)</span><input type="number" id="f_res_idle4" min="0" value="300"></label>
+      <label class="fld"><span class="t" data-en="L3→L2 weight window: idle wait seconds (0=stay at L3)">L3→L2 权重窗口：空闲等待秒 (0=停在 L3)</span><input type="number" id="f_res_idle3" min="0" value="900"></label>
+      <label class="fld"><span class="t" data-en="L2→L1 initial layers: idle wait seconds (0=stay at L2)">L2→L1 初始层：空闲等待秒 (0=停在 L2)</span><input type="number" id="f_res_idle2" min="0" value="1800"></label>
+      <label class="fld"><span class="t" data-en="L1→L0 KV to disk + unload: idle wait seconds (0=stay at L1)">L1→L0 KV落盘+卸载：空闲等待秒 (0=停在 L1)</span><input type="number" id="f_res_idle1" min="0" value="3600"></label>
+    </div>
     <label class="fld"><span class="t" data-en="L2 weight-window resident layers w_keep (keep layers 0..N)">L2 权重窗口保留层数 w_keep（保留层 0..N）</span><input type="number" id="f_res_wkeep" min="0" value="8"></label>
     <div class="sec" data-en="Proactive downgrade on memory pressure (soft watermark; drop one level when below)">内存紧张主动降级（软水位，低于自动降一档）</div>
-    <label class="fld"><span class="t" data-en='Soft watermark MB (0=off; works with the "Core Config - minimum free memory" hard 503)'>软水位 MB（0=关闭；与"核心配置-最低可用内存"硬 503 配合）</span><input type="number" id="f_res_soft" min="0" value="0"></label>
-    <label class="fld"><span class="t" data-en="Lowest level allowed for auto-downgrade (0=unloadable · 3=KV eviction only · 4=no auto-downgrade)">允许自动降到的档位（0=可卸载 · 3=仅KV淘汰 · 4=不自动降）</span><input type="number" id="f_res_lowlvl" min="0" max="4" value="0"></label>
+    <div class="fldgrid">
+      <label class="fld"><span class="t" data-en='Soft watermark MB (0=off; works with the "Core Config - minimum free memory" hard 503)'>软水位 MB（0=关闭；与"核心配置-最低可用内存"硬 503 配合）</span><input type="number" id="f_res_soft" min="0" value="0"></label>
+      <label class="fld"><span class="t" data-en="Lowest level allowed for auto-downgrade (0=unloadable · 3=KV eviction only · 4=no auto-downgrade)">允许自动降到的档位（0=可卸载 · 3=仅KV淘汰 · 4=不自动降）</span><input type="number" id="f_res_lowlvl" min="0" max="4" value="0"></label>
+    </div>
     <div class="row" style="margin-top:10px">
       <button id="btn_res_cfg" class="primary" data-en="Apply policy parameters">应用策略参数</button>
       <button id="btn_res_l4" title="KV 全驻留 + 权重不主动释放" data-en="L4 full-layer residency" data-en-title="KV fully resident + weights not proactively released">L4 全层驻留</button>
@@ -428,6 +497,7 @@ let logAuto = true;
 let logLevel = "";        /* ""=all, "info", "warn", "error", "debug" */
 let allLogLines = [];
 let logBytes = 0;
+let compCfg = null;   /* K-ADMIN-001：组件配置（三个独立页维护），保存时原样回填 */
 
 const $ = id => document.getElementById(id);
 const num = id => parseInt($(id).value, 10) || 0;
@@ -604,8 +674,16 @@ async function opResSet(level){
       {method:"POST", headers:{"Content-Type":"application/json"},
        body: JSON.stringify({level: level})});
     if (r && r.ok){
-      m.textContent = T("已切换至 ", "Switched to ") + (r.level_name || ("L" + level));
-      m.style.color = "";
+      if (r.clamped){
+        /* 能力钳制：请求 L2/L1 但权重分层未启用 → 只到 L3。显式说明，不静默。 */
+        m.textContent = T("已切换至 ", "Switched to ") + (r.level_name || ("L" + r.level)) +
+          T("（请求的 L" + r.requested + " 不可用：L2/L1 需权重分层（明文 VQF + VLLM_VQF_STREAM），已钳制）",
+            " (requested L" + r.requested + " unavailable: L2/L1 need weight layering (plaintext VQF + VLLM_VQF_STREAM); clamped)");
+        m.style.color = "var(--warn,#b80)";
+      } else {
+        m.textContent = T("已切换至 ", "Switched to ") + (r.level_name || ("L" + level));
+        m.style.color = "";
+      }
     } else {
       m.textContent = T("切换失败: ", "Switch failed: ") + (r && r.error ? r.error : T("未知错误", "unknown error"));
       m.style.color = "var(--bad,#d44)";
@@ -695,6 +773,7 @@ async function loadStatus(){
 function fillForm(c){
   const ev = c.env || {};   /* 必须在下面的 ev.* 读取之前声明（原实现声明靠后，触发 TDZ） */
   $("f_model_dir").value = c.model_dir || "";
+  $("f_model_id").value = c.model_id || "";
   $("f_kv_q4").checked = !!c.kv_q4;
   $("f_prefix_cache").checked = !!c.prefix_cache;
   $("f_prefix_kv").checked = c.prefix_kv !== false;
@@ -759,14 +838,32 @@ function fillForm(c){
   $("f_moe_par").checked = ev.VLLM_MOE_PAR !== "0";
   $("f_moe_q4simd").checked = ev.VLLM_MOE_Q4SIMD !== "0";
   $("f_auto_start").checked = !!c.auto_start;
+  /* K-ADMIN-001：组件配置（embed/kb/laya/yolo）与云边协同（cloud_*）由独立页或
+   * config.json 维护，主管理页无对应输入框；这里原样留存，保存时回填，避免主管理页
+   * 保存时把它们从 config.json 抹掉。（cloud_key 为凭据，不走 config.json，故不含。） */
+  compCfg = {
+    embed_model: c.embed_model || "",
+    kb_root: c.kb_root || "",
+    laya_pack: c.laya_pack || "",
+    yolo_model: c.yolo_model || "",
+    yolo_backend: c.yolo_backend || "vqf",
+    rknn_lib: c.rknn_lib || "",
+    yolo_conf: (c.yolo_conf == null ? 0 : c.yolo_conf),
+    yolo_iou: (c.yolo_iou == null ? 0 : c.yolo_iou),
+    yolo_core_mask: (c.yolo_core_mask == null ? 0 : c.yolo_core_mask),
+    cloud_endpoint: c.cloud_endpoint || "",
+    cloud_model: c.cloud_model || "",
+    cloud_fallback: c.cloud_fallback || "never"
+  };
   updateP3Warn();
   updateTrackWarn();
   badgeT($("cfgBadge"), "配置: 已载入", "Config: loaded", "ok");
   applyLang();
 }
 function collectForm(){
-  return {
+  const o = {
     model_dir: $("f_model_dir").value.trim(),
+    model_id: $("f_model_id").value.trim(),
     kv_q4: bool("f_kv_q4"),
     prefix_cache: bool("f_prefix_cache"),
     prefix_kv: bool("f_prefix_kv"),
@@ -806,6 +903,9 @@ function collectForm(){
     device: $("f_device").value,
     env: collectEnv()
   };
+  /* K-ADMIN-001：组件配置由三个独立页维护，主管理页保存时原样回填。 */
+  if (compCfg) Object.assign(o, compCfg);
+  return o;
 }
 function collectEnv(){
   const ev = { OMP_NUM_THREADS: $("f_omp").value.trim() || "4" };

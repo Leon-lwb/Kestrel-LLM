@@ -28,6 +28,11 @@
 #include "vllm_rulebook.h"   /* 规则包注册中心（管理面：列表/删除） */
 #include "vllm_session.h"    /* 会话存储（管理面：列表/详情/删除） */
 #include "vllm_audit.h"      /* 管理面审计日志（SM3 哈希链） */
+#include "vllm_kvstore.h"    /* K-ADMIN-001：知识库（.vkb）管理面 */
+#include "vllm_media.h"      /* K-ADMIN-001：base64 / 图像解码（YOLO 在线试检测） */
+#include "vllm_yolo.h"       /* K-ADMIN-001：检测模型加载/推理 */
+#include "vllm_npu.h"        /* K-ADMIN-001：RKNN 后端句柄（.rknn 试检测） */
+#include "vllm_platform.h"   /* st_now_sec：试检测计时 */
 
 /* VQF 分层驻留运行状态（vqf.c；避免在 serve 侧引入完整 VQF 头） */
 extern int vqf_stream_state(int *keep, int *nl, int *nseg,
@@ -71,6 +76,20 @@ static const char *admin_log_path(const VLLMServerCtx *ctx) {
     if (ctx->log_path && ctx->log_path[0]) return ctx->log_path;
     const char *e = getenv("VLLM_ADMIN_LOG");
     if (e && e[0]) return e;
+    /* 候选回退：引擎自身不写日志文件，日志由启动方（supervisor / 启动脚本）
+     * 重定向而来，路径随启动方式而异。依次探测常见落点，取第一个可读的；
+     * 都不存在时返回默认路径（面板会显式报错，不静默）。 */
+    static const char *cands[] = {
+        "/NewVLLM/logs/engine.log",   /* vllm_mgr.py 默认（VLLM_MGR_REPO=/NewVLLM） */
+        "./logs/engine.log",          /* 引擎工作目录相对路径 */
+        "logs/engine.log",
+        "/root/_vfy/_serve.log",      /* 板端手工 nohup 启动的历史落点 */
+        NULL
+    };
+    for (int i = 0; cands[i]; i++) {
+        FILE *f = fopen(cands[i], "rb");
+        if (f) { fclose(f); return cands[i]; }
+    }
     return "/NewVLLM/logs/engine.log";
 }
 
@@ -90,6 +109,37 @@ static const char *review_html_path(void) {
     FILE *f = fopen("./review.html", "rb");
     if (f) { fclose(f); return "./review.html"; }
     return "/NewVLLM/review.html";
+}
+
+/* K-ADMIN-001：三个配置管理页的磁盘候选路径（内嵌版为兜底）。 */
+static const char *kb_html_path(void) {
+    const char *e = getenv("VLLM_KB_HTML");
+    if (e && e[0]) return e;
+    FILE *f = fopen("./kb.html", "rb");
+    if (f) { fclose(f); return "./kb.html"; }
+    return "/NewVLLM/kb.html";
+}
+static const char *laya_html_path(void) {
+    const char *e = getenv("VLLM_LAYA_HTML");
+    if (e && e[0]) return e;
+    FILE *f = fopen("./laya.html", "rb");
+    if (f) { fclose(f); return "./laya.html"; }
+    return "/NewVLLM/laya.html";
+}
+static const char *yolo_html_path(void) {
+    const char *e = getenv("VLLM_YOLO_HTML");
+    if (e && e[0]) return e;
+    FILE *f = fopen("./yolo.html", "rb");
+    if (f) { fclose(f); return "./yolo.html"; }
+    return "/NewVLLM/yolo.html";
+}
+/* 云端模型（可选）配置页的磁盘候选路径；VLLM_CLOUD_HTML 可覆盖。 */
+static const char *cloud_html_path(void) {
+    const char *e = getenv("VLLM_CLOUD_HTML");
+    if (e && e[0]) return e;
+    FILE *f = fopen("./cloud.html", "rb");
+    if (f) { fclose(f); return "./cloud.html"; }
+    return "/NewVLLM/cloud.html";
 }
 
 /* ---------- system readings (Linux /proc; null elsewhere) ---------- */
@@ -262,6 +312,7 @@ static void json_put_str(VJson *obj, const char *key, const char *val) {
 static VJson *build_config_json(const VLLMServerCtx *ctx) {
     VJson *o = vjson_new_object();
     json_put_str(o, "model_dir", ctx->model_dir);
+    json_put_str(o, "model_id", ctx->model_id);
     vjson_obj_set(o, "kv_q4", vjson_new_bool(g_kv_q4));
     vjson_obj_set(o, "prefix_cache", vjson_new_bool(ctx->prefix_cache));
     vjson_obj_set(o, "prefill_q8", vjson_new_bool(g_st_prefill_q8));
@@ -308,6 +359,32 @@ static VJson *build_config_json(const VLLMServerCtx *ctx) {
     /* 模型加载格式：v1.0 起引擎为纯 VQF 运行时，无格式可选（加载时自动定位
      * 模型目录内的 model.vqf），故不再持久化 format 字段。 */
     json_put_str(o, "device", ctx->device_id);
+    /* K-ADMIN-001：协作/感知组件配置（YOLO / Laya / Embedding / 知识库根目录）。
+     * 引擎侧多不消费这些值（除 embed/laya/yolo 已在启动时生效），此处回填给
+     * /admin/{kb,laya,yolo} 三个配置页预填，保存后由 tools/ops/vllm_mgr.py
+     * 组装成 CLI，重启生效。 */
+    json_put_str(o, "embed_model", ctx->embed_model_dir ? ctx->embed_model_dir : "");
+    json_put_str(o, "kb_root", ctx->kb_root ? ctx->kb_root : "");
+    json_put_str(o, "laya_pack", ctx->laya_pack ? ctx->laya_pack : "");
+    json_put_str(o, "yolo_model", ctx->yolo_model ? ctx->yolo_model : "");
+    json_put_str(o, "yolo_backend", ctx->yolo_backend == 1 ? "rknn" : "vqf");
+    json_put_str(o, "rknn_lib", ctx->yolo_rknn_lib ? ctx->yolo_rknn_lib : "");
+    vjson_obj_set(o, "yolo_conf", vjson_new_number((double)ctx->yolo_conf));
+    vjson_obj_set(o, "yolo_iou", vjson_new_number((double)ctx->yolo_iou));
+    vjson_obj_set(o, "yolo_core_mask", vjson_new_number((double)ctx->yolo_core_mask));
+    /* K-E2E-005 视频源检测：默认视频源 + 抽帧参数（管理页 /admin/yolo 回填） */
+    json_put_str(o, "yolo_video_src", ctx->yolo_video_src ? ctx->yolo_video_src : "");
+    vjson_obj_set(o, "yolo_video_frames", vjson_new_number((double)ctx->yolo_video_frames));
+    vjson_obj_set(o, "yolo_video_interval_ms", vjson_new_number((double)ctx->yolo_video_interval_ms));
+    /* 云边协同：云端上游回退（管理页/手工配置可见；cloud_key 为凭据，不回填）。 */
+    json_put_str(o, "cloud_endpoint", ctx->cloud_endpoint ? ctx->cloud_endpoint : "");
+    json_put_str(o, "cloud_model", ctx->cloud_model ? ctx->cloud_model : "");
+    json_put_str(o, "cloud_fallback",
+                 ctx->cloud_fallback == 2 ? "always" :
+                 ctx->cloud_fallback == 1 ? "on-unready" : "never");
+    /* 拒答与转人工（K-E2E-004）：kb_abstain=0 表示关闭；handoff_url 为空表示不回调。 */
+    vjson_obj_set(o, "kb_abstain", vjson_new_number((double)ctx->kb_abstain));
+    json_put_str(o, "handoff_url", ctx->handoff_url ? ctx->handoff_url : "");
     VJson *env = vjson_new_object();
     json_put_str(env, "OMP_NUM_THREADS",
                  getenv_int_str("OMP_NUM_THREADS", "4"));
@@ -468,6 +545,25 @@ static void admin_json_reply_cap(VHttpResponse *resp, VJson *root, size_t cap) {
 
 static void admin_json_reply(VHttpResponse *resp, VJson *root) {
     admin_json_reply_cap(resp, root, 16384);
+}
+
+/* 本文件私有的 JSON 错误回包（vllm_server.c 的同名函数是 static，跨 TU 不可见）。
+ * 与之一致：堆分配 body，由服务端在发送后释放 resp->body_owned。 */
+static void json_error(VHttpResponse *resp, int status, const char *message) {
+    char *body = (char *)malloc(512);
+    if (body) {
+        vhttp_json_error(message, body, 512);
+        resp->body = body;
+        resp->body_len = strlen(body);
+        resp->body_owned = body;
+    } else {
+        static const char oom[] =
+            "{\"error\":{\"message\":\"Out of memory\",\"type\":\"server_error\"}}";
+        resp->body = oom;
+        resp->body_len = sizeof(oom) - 1;
+    }
+    resp->status = status;
+    resp->content_type = "application/json";
 }
 
 static void handle_admin_status(const VLLMServerCtx *ctx, VHttpResponse *resp) {
@@ -736,6 +832,57 @@ static void handle_admin_config_save(const VLLMServerCtx *ctx,
     VJson *o = vjson_new_object();
     vjson_obj_set(o, "ok", vjson_new_bool(1));
     json_put_str(o, "path", path);
+    json_put_str(o, "note",
+        "saved. Restart the engine (via vllm_mgr / supervisor) to apply.");
+    admin_json_reply(resp, o);
+}
+
+/* POST /admin/api/config/patch  {..partial keys..}
+ * —— 读取现有 config.json，按键合并（只覆盖给出的顶层键，其余原样保留）后写回。
+ * 三个组件配置页（/admin/kb|laya|yolo）各自只持有少数键，必须用本端点，否则
+ * /admin/api/config/save 会用部分对象整体覆盖 config.json，抹掉其它设置。 */
+static void handle_admin_config_patch(const VLLMServerCtx *ctx,
+                                      const VHttpRequest *req, VHttpResponse *resp) {
+    VJson *patch = NULL;
+    if (!req->body || req->body_len == 0) {
+        json_error(resp, 400, "empty JSON body");
+        return;
+    }
+    patch = vjson_parse(req->body);
+    if (!patch || patch->type != VJ_OBJECT) {
+        vjson_free(patch);
+        json_error(resp, 400, "invalid JSON object");
+        return;
+    }
+    const char *path = admin_config_path(ctx);
+    /* 读现有配置（不存在或不可解析则从空对象起） */
+    VJson *root = NULL;
+    char *buf = (char *)malloc(256 * 1024);
+    if (buf) {
+        size_t n = read_file_bounded(path, buf, 256 * 1024);
+        if (n > 0) root = vjson_parse(buf);
+        free(buf);
+    }
+    if (!root || root->type != VJ_OBJECT) {
+        vjson_free(root);
+        root = vjson_new_object();
+    }
+    int merged = 0;
+    for (size_t i = 0; i < patch->u.obj.n; i++) {
+        VJsonPair *pr = &patch->u.obj.pairs[i];
+        if (!pr->key) continue;
+        VJson *clone = vjson_clone(pr->val);
+        if (clone) { vjson_obj_set(root, pr->key, clone); merged++; }
+    }
+    char werr[256];
+    int rc = config_write_file(path, root, werr, sizeof(werr));
+    vjson_free(root);
+    vjson_free(patch);
+    if (rc != 0) { json_error(resp, 500, werr); return; }
+    VJson *o = vjson_new_object();
+    vjson_obj_set(o, "ok", vjson_new_bool(1));
+    json_put_str(o, "path", path);
+    vjson_obj_set(o, "merged", vjson_new_number((double)merged));
     json_put_str(o, "note",
         "saved. Restart the engine (via vllm_mgr / supervisor) to apply.");
     admin_json_reply(resp, o);
@@ -1046,7 +1193,17 @@ static void handle_admin_policy_set(VLLMServerCtx *ctx,
         vjson_obj_set(o, "ok", vjson_new_bool(1));
         vjson_obj_set(o, "level", vjson_new_number((double)rc));
         json_put_str(o, "level_name", vllm_res_level_name(rc));
-        json_put_str(o, "note", "policy level switched");
+        if (rc != level) {
+            /* 能力钳制（如 L2/L1 需权重分层：明文 VQF + VLLM_VQF_STREAM）——
+             * 显式回报请求档与生效档，避免被读成"切换成功"（不静默）。 */
+            vjson_obj_set(o, "requested", vjson_new_number((double)level));
+            vjson_obj_set(o, "clamped", vjson_new_bool(1));
+            json_put_str(o, "note",
+                "requested level not available (L2/L1 need weight layering: "
+                "plaintext VQF + VLLM_VQF_STREAM); clamped to the effective level");
+        } else {
+            json_put_str(o, "note", "policy level switched");
+        }
     } else if (rc == -3) {
         vjson_obj_set(o, "ok", vjson_new_bool(0));
         vjson_obj_set(o, "level", vjson_new_number((double)prev));
@@ -1138,6 +1295,21 @@ static void handle_review_page(VHttpResponse *resp) {
 
 void vllm_review_page(VHttpResponse *resp) {
     handle_review_page(resp);
+}
+
+/* K-ADMIN-001：三个配置管理页（各自独立成页；数据走同源 /admin/api/*）。 */
+static void handle_kb_page(VHttpResponse *resp) {
+    serve_html_page(resp, embedded_kb_html, kb_html_path(), "kb.html", "VLLM_KB_HTML");
+}
+static void handle_laya_page(VHttpResponse *resp) {
+    serve_html_page(resp, embedded_laya_html, laya_html_path(), "laya.html", "VLLM_LAYA_HTML");
+}
+static void handle_yolo_page(VHttpResponse *resp) {
+    serve_html_page(resp, embedded_yolo_html, yolo_html_path(), "yolo.html", "VLLM_YOLO_HTML");
+}
+/* 云端模型（可选）配置页：独立成页，云端为可选能力。 */
+static void handle_cloud_page(VHttpResponse *resp) {
+    serve_html_page(resp, embedded_cloud_html, cloud_html_path(), "cloud.html", "VLLM_CLOUD_HTML");
 }
 
 /* ================================================================
@@ -1866,6 +2038,526 @@ static void handle_admin_audit(VLLMServerCtx *ctx, const VHttpRequest *req,
     admin_json_reply_cap(resp, o, 4u << 20);
 }
 
+/* ================================================================
+ * K-ADMIN-001：组件配置管理面（知识库 / YOLO / Laya）
+ *
+ * 约定（与「保存配置 + 重启生效」一致）：
+ *   - 配置项经 /admin/api/config/save 持久化，重启时由 tools/ops/vllm_mgr.py
+ *     组装成 CLI（--embed-model / --kb-root / --laya-pack / --yolo-model ...）；
+ *   - 本节的 /test* 端点**只读**：临时加载模型推理后即释放，不改服务状态。
+ * ================================================================ */
+
+/* 解析请求体 JSON（调用方负责 vjson_free）。失败时写 400 并返回 NULL。 */
+static VJson *adm_parse_body(const VHttpRequest *req, VHttpResponse *resp) {
+    if (!req->body || req->body_len == 0) { json_error(resp, 400, "empty JSON body"); return NULL; }
+    VJson *j = vjson_parse(req->body);
+    if (!j || j->type != VJ_OBJECT) {
+        vjson_free(j);
+        json_error(resp, 400, "invalid JSON object");
+        return NULL;
+    }
+    return j;
+}
+
+/* 读 .vkb 头部（magic 'VKB1' | u32 dim | u32 n），不整库载入。返回 0 成功。 */
+static int adm_kb_peek(const char *path, int *dim, int *n, long *bytes) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    unsigned char h[12];
+    size_t rd = fread(h, 1, sizeof(h), f);
+    if (bytes) { fseek(f, 0, SEEK_END); *bytes = ftell(f); }
+    fclose(f);
+    if (rd != sizeof(h) || memcmp(h, "VKB1", 4) != 0) return -1;
+    int d = 0, nn = 0;
+    memcpy(&d, h + 4, 4);
+    memcpy(&nn, h + 8, 4);
+    if (dim) *dim = d;
+    if (n) *n = nn;
+    return 0;
+}
+
+/* 就地 URL 解码（%XX）。查询串里的路径参数由前端 encodeURIComponent 转义
+ * （'/' 会变成 %2F），C 端读取后必须解码才能当文件路径使用。 */
+static void adm_url_decode(char *s) {
+    char *d = s;
+    while (*s) {
+        if (*s == '%' && isxdigit((unsigned char)s[1]) && isxdigit((unsigned char)s[2])) {
+            int hi = s[1] <= '9' ? s[1] - '0' : (tolower((unsigned char)s[1]) - 'a' + 10);
+            int lo = s[2] <= '9' ? s[2] - '0' : (tolower((unsigned char)s[2]) - 'a' + 10);
+            *d++ = (char)((hi << 4) | lo);
+            s += 3;
+        } else {
+            *d++ = *s++;
+        }
+    }
+    *d = 0;
+}
+
+/* GET /admin/api/kb/list?dir=<root> —— 列出目录下的 .vkb（含维度/条数/大小）。 */
+static void handle_admin_kb_list(const VLLMServerCtx *ctx, const VHttpRequest *req,
+                                 VHttpResponse *resp) {
+    char dir[1024];
+    dir[0] = 0;
+    if (req->query) {
+        const char *q = strstr(req->query, "dir=");
+        if (q) {
+            snprintf(dir, sizeof(dir), "%s", q + 4);
+            char *amp = strchr(dir, '&');
+            if (amp) *amp = 0;
+        }
+    }
+    if (!dir[0] && ctx->kb_root) snprintf(dir, sizeof(dir), "%s", ctx->kb_root);
+    if (!dir[0]) snprintf(dir, sizeof(dir), ".");
+    adm_url_decode(dir);   /* 目录名可能含空格/中文（前端 encodeURIComponent） */
+
+    VJson *o = vjson_new_object();
+    json_put_str(o, "dir", dir);
+    VJson *arr = vjson_new_array();
+    DIR *dp = opendir(dir);
+    if (!dp) {
+        json_put_str(o, "error", "cannot open directory");
+        vjson_obj_set(o, "files", arr);
+        admin_json_reply(resp, o);
+        return;
+    }
+    struct dirent *de;
+    while ((de = readdir(dp)) != NULL) {
+        size_t nl = strlen(de->d_name);
+        if (nl < 4 || strcmp(de->d_name + nl - 4, ".vkb") != 0) continue;
+        char full[2048];
+        snprintf(full, sizeof(full), "%s/%s", dir, de->d_name);
+        int dim = 0, cnt = 0; long bytes = 0;
+        if (adm_kb_peek(full, &dim, &cnt, &bytes) != 0) continue;
+        VJson *it = vjson_new_object();
+        json_put_str(it, "name", de->d_name);
+        json_put_str(it, "path", full);
+        vjson_obj_set(it, "dim", vjson_new_number((double)dim));
+        vjson_obj_set(it, "count", vjson_new_number((double)cnt));
+        vjson_obj_set(it, "bytes", vjson_new_number((double)bytes));
+        vjson_array_push(arr, it);
+    }
+    closedir(dp);
+    vjson_obj_set(o, "files", arr);
+    admin_json_reply(resp, o);
+}
+
+/* GET /admin/api/kb/docs?path=<vkb> —— 文档列表（下标 + 摘要）。 */
+static void handle_admin_kb_docs(const VLLMServerCtx *ctx, const VHttpRequest *req,
+                                 VHttpResponse *resp) {
+    (void)ctx;
+    char path[1024];
+    path[0] = 0;
+    if (req->query) {
+        const char *q = strstr(req->query, "path=");
+        if (q) {
+            snprintf(path, sizeof(path), "%s", q + 5);
+            char *amp = strchr(path, '&');
+            if (amp) *amp = 0;
+        }
+    }
+    adm_url_decode(path);   /* 前端 encodeURIComponent 会把 '/' 转义为 %2F */
+    if (!path[0]) { json_error(resp, 400, "'path' is required"); return; }
+    VLLMKVStore kb; vllm_kv_init(&kb, 0);
+    if (vllm_kv_load(&kb, path) != 0) {
+        vllm_kv_free(&kb);
+        json_error(resp, 404, "vector store load failed");
+        return;
+    }
+    VJson *o = vjson_new_object();
+    json_put_str(o, "path", path);
+    vjson_obj_set(o, "dim", vjson_new_number((double)kb.dim));
+    vjson_obj_set(o, "count", vjson_new_number((double)kb.n));
+    VJson *arr = vjson_new_array();
+    for (int i = 0; i < kb.n; i++) {
+        VJson *it = vjson_new_object();
+        vjson_obj_set(it, "index", vjson_new_number((double)i));
+        vjson_obj_set(it, "len", vjson_new_number((double)strlen(kb.meta[i])));
+        json_put_str(it, "meta", kb.meta[i]);
+        vjson_array_push(arr, it);
+    }
+    vjson_obj_set(o, "docs", arr);
+    vllm_kv_free(&kb);
+    admin_json_reply_cap(resp, o, 4u << 20);
+}
+
+/* POST /admin/api/kb/add  {path, docs:[...]} —— 逐条 embed 后追加并落盘。 */
+static void handle_admin_kb_add(VLLMServerCtx *ctx, const VHttpRequest *req,
+                                VHttpResponse *resp) {
+    VJson *b = adm_parse_body(req, resp);
+    if (!b) return;
+    const char *path = vjson_str(vjson_obj_get(b, "path"));
+    VJson *docs = vjson_obj_get(b, "docs");
+    if (!path || !path[0] || !docs || docs->type != VJ_ARRAY || vjson_array_len(docs) == 0) {
+        json_error(resp, 400, "'path' and non-empty 'docs' array required");
+        vjson_free(b);
+        return;
+    }
+    VLLMKVStore kb; vllm_kv_init(&kb, 0);
+    int existed = (vllm_kv_load(&kb, path) == 0);
+    if (!existed) vllm_kv_init(&kb, 0);
+
+    const int MAXDIM = 4096;
+    float *vec = (float *)malloc((size_t)MAXDIM * sizeof(float));
+    if (!vec) { vllm_kv_free(&kb); vjson_free(b); json_error(resp, 500, "out of memory"); return; }
+
+    int added = 0;
+    const char *err = NULL;
+    while (added < (int)vjson_array_len(docs)) {
+        const char *txt = vjson_str(vjson_array_get(docs, added));
+        if (!txt || !txt[0]) { err = "empty doc"; break; }
+        int dim = vllm_serve_embed_text(ctx, txt, vec);
+        if (dim <= 0) { err = "embedding failed (model not ready?)"; break; }
+        if (dim > MAXDIM) { err = "embedding dim unsupported"; break; }
+        if (kb.dim == 0) kb.dim = dim;
+        else if (kb.dim != dim) { err = "dimension mismatch vs existing store"; break; }
+        if (vllm_kv_add(&kb, txt, vec) != 0) { err = "add failed (out of memory)"; break; }
+        added++;
+    }
+    free(vec);
+    int save_rc = (err == NULL) ? vllm_kv_save(&kb, path) : -1;
+    int total = kb.n, kdim = kb.dim;
+    vllm_kv_free(&kb);
+
+    /* 注意：`path` 指向请求体 b，必须等响应字段取完后再释放 b（否则 UAF）。 */
+    if (err) { vjson_free(b); json_error(resp, 500, err); return; }
+    if (save_rc != 0) {
+        vjson_free(b);
+        json_error(resp, 500, "save failed (check path/permissions)");
+        return;
+    }
+    VJson *o = vjson_new_object();
+    vjson_obj_set(o, "ok", vjson_new_bool(1));
+    json_put_str(o, "path", path);
+    vjson_obj_set(o, "added", vjson_new_number((double)added));
+    vjson_obj_set(o, "total", vjson_new_number((double)total));
+    vjson_obj_set(o, "dim", vjson_new_number((double)kdim));
+    vjson_free(b);
+    admin_json_reply(resp, o);
+}
+
+/* POST /admin/api/kb/search  {path, query, top_k} —— 在线检索试查。 */
+static void handle_admin_kb_search(VLLMServerCtx *ctx, const VHttpRequest *req,
+                                   VHttpResponse *resp) {
+    VJson *b = adm_parse_body(req, resp);
+    if (!b) return;
+    const char *path = vjson_str(vjson_obj_get(b, "path"));
+    const char *query = vjson_str(vjson_obj_get(b, "query"));
+    if (!path || !path[0] || !query || !query[0]) {
+        json_error(resp, 400, "'path' and 'query' are required");
+        vjson_free(b);
+        return;
+    }
+    int top_k = 3;
+    VJson *jk = vjson_obj_get(b, "top_k");
+    if (jk && jk->type == VJ_NUMBER) {
+        top_k = (int)jk->u.number;
+        if (top_k <= 0) top_k = 1;
+        if (top_k > 16) top_k = 16;
+    }
+    VLLMKVStore kb; vllm_kv_init(&kb, 0);
+    if (vllm_kv_load(&kb, path) != 0) {
+        vllm_kv_free(&kb); vjson_free(b);
+        json_error(resp, 404, "vector store load failed");
+        return;
+    }
+    const int MAXDIM = 4096;
+    float *qv = (float *)malloc((size_t)MAXDIM * sizeof(float));
+    if (!qv) { vllm_kv_free(&kb); vjson_free(b); json_error(resp, 500, "out of memory"); return; }
+    int dim = vllm_serve_embed_text(ctx, query, qv);
+    if (dim <= 0) {
+        free(qv); vllm_kv_free(&kb); vjson_free(b);
+        json_error(resp, 503, "embedding failed (model not ready?)");
+        return;
+    }
+    VJson *o = vjson_new_object();
+    json_put_str(o, "path", path);
+    json_put_str(o, "query", query);
+    vjson_obj_set(o, "dim", vjson_new_number((double)dim));
+    VJson *arr = vjson_new_array();
+    if (kb.dim == dim && kb.n > 0) {
+        int k = top_k < kb.n ? top_k : kb.n;
+        int kc = k;                                  /* 候选数（重排开时放大） */
+        int rn = vllm_kb_rerank_candidates();
+        if (rn > kc) kc = (rn < kb.n) ? rn : kb.n;
+        int *ix = (int *)malloc((size_t)kc * sizeof(int));
+        float *sc = (float *)malloc((size_t)kc * sizeof(float));
+        if (ix && sc) {
+            vllm_kv_search(&kb, qv, kc, ix, sc);
+            if (kc > k) {                            /* 词面混合重排（显式回报，不静默） */
+                vllm_kb_rerank(query, &kb, ix, sc, kc);
+                VJson *rj = vjson_new_object();
+                vjson_obj_set(rj, "on", vjson_new_bool(1));
+                vjson_obj_set(rj, "candidates", vjson_new_number((double)kc));
+                vjson_obj_set(o, "rerank", rj);
+            }
+            for (int i = 0; i < k; i++) {
+                VJson *it = vjson_new_object();
+                vjson_obj_set(it, "index", vjson_new_number((double)ix[i]));
+                vjson_obj_set(it, "score", vjson_new_number((double)sc[i]));
+                json_put_str(it, "meta", kb.meta[ix[i]]);
+                vjson_array_push(arr, it);
+            }
+            if (k > 0) {   /* K-E2E-003：回引擎自算的证据分，供拒答门标定对拍 */
+                VJson *ej = vjson_new_object();
+                vjson_obj_set(ej, "top1_cos", vjson_new_number((double)sc[0]));
+                vjson_obj_set(ej, "coverage",
+                              vjson_new_number(vllm_kb_coverage(query, kb.meta[ix[0]])));
+                vjson_obj_set(ej, "evidence",
+                              vjson_new_number(vllm_kb_evidence(query, kb.meta[ix[0]], sc[0])));
+                vjson_obj_set(o, "evidence", ej);
+            }
+        }
+        free(ix); free(sc);
+    } else if (kb.dim != dim) {
+        json_put_str(o, "error", "dimension mismatch (store vs embedding model)");
+    }
+    vjson_obj_set(o, "results", arr);
+    free(qv); vllm_kv_free(&kb); vjson_free(b);
+    admin_json_reply_cap(resp, o, 4u << 20);
+}
+
+/* POST /admin/api/kb/delete  {path} 或 {path, indices:[..]} —— 删库/删条目。 */
+static void handle_admin_kb_delete(VLLMServerCtx *ctx, const VHttpRequest *req,
+                                   VHttpResponse *resp) {
+    (void)ctx;
+    VJson *b = adm_parse_body(req, resp);
+    if (!b) return;
+    const char *path = vjson_str(vjson_obj_get(b, "path"));
+    if (!path || !path[0]) { json_error(resp, 400, "'path' is required"); vjson_free(b); return; }
+    VJson *idxs = vjson_obj_get(b, "indices");
+    if (!idxs || idxs->type != VJ_ARRAY || vjson_array_len(idxs) == 0) {
+        /* 无 indices = 删库 */
+        if (unlink(path) != 0) {
+            vjson_free(b);
+            json_error(resp, 404, "delete failed (file missing?)");
+            return;
+        }
+        VJson *o = vjson_new_object();
+        vjson_obj_set(o, "ok", vjson_new_bool(1));
+        json_put_str(o, "dropped", path);
+        vjson_free(b);
+        admin_json_reply(resp, o);
+        return;
+    }
+    VLLMKVStore kb; vllm_kv_init(&kb, 0);
+    if (vllm_kv_load(&kb, path) != 0) {
+        vllm_kv_free(&kb); vjson_free(b);
+        json_error(resp, 404, "vector store load failed");
+        return;
+    }
+    /* 降序删除，避免下标漂移 */
+    int ndel = 0;
+    size_t ni = vjson_array_len(idxs);
+    int *tmp = (int *)malloc(ni * sizeof(int));
+    if (tmp) {
+        for (size_t i = 0; i < ni; i++) {
+            VJson *v = vjson_array_get(idxs, i);
+            tmp[i] = (v && v->type == VJ_NUMBER) ? (int)v->u.number : -1;
+        }
+        for (size_t i = 0; i < ni; i++)
+            for (size_t j = i + 1; j < ni; j++)
+                if (tmp[j] > tmp[i]) { int t = tmp[i]; tmp[i] = tmp[j]; tmp[j] = t; }
+        for (size_t i = 0; i < ni; i++)
+            if (tmp[i] >= 0 && vllm_kv_del(&kb, tmp[i]) == 0) ndel++;
+        free(tmp);
+    }
+    int save_rc = vllm_kv_save(&kb, path);
+    int total = kb.n;
+    vllm_kv_free(&kb);
+    vjson_free(b);
+    if (save_rc != 0) { json_error(resp, 500, "save failed"); return; }
+    VJson *o = vjson_new_object();
+    vjson_obj_set(o, "ok", vjson_new_bool(1));
+    vjson_obj_set(o, "deleted", vjson_new_number((double)ndel));
+    vjson_obj_set(o, "total", vjson_new_number((double)total));
+    admin_json_reply(resp, o);
+}
+
+/* POST /admin/api/yolo/test  {image_b64, model?, backend?, rknn_lib?, conf?, iou?}
+ * —— 临时加载模型试检测（不改服务状态；请求内加载/释放，天然线程安全）。 */
+static void handle_admin_yolo_test(VLLMServerCtx *ctx, const VHttpRequest *req,
+                                   VHttpResponse *resp) {
+    VJson *b = adm_parse_body(req, resp);
+    if (!b) return;
+    const char *img = vjson_str(vjson_obj_get(b, "image_b64"));
+    if (!img || !img[0]) { json_error(resp, 400, "'image_b64' is required"); vjson_free(b); return; }
+    const char *model = vjson_str(vjson_obj_get(b, "model"));
+    if (!model || !model[0]) model = ctx->yolo_model;
+    const char *backend = vjson_str(vjson_obj_get(b, "backend"));
+    if (!backend || !backend[0])
+        backend = ctx->yolo_backend == 1 ? "rknn" : "vqf";
+    const char *rknn_lib = vjson_str(vjson_obj_get(b, "rknn_lib"));
+    if (!rknn_lib || !rknn_lib[0]) rknn_lib = ctx->yolo_rknn_lib;
+    float conf = ctx->yolo_conf, iou = ctx->yolo_iou;
+    VJson *jc = vjson_obj_get(b, "conf");
+    if (jc && jc->type == VJ_NUMBER) conf = (float)jc->u.number;
+    VJson *ji = vjson_obj_get(b, "iou");
+    if (ji && ji->type == VJ_NUMBER) iou = (float)ji->u.number;
+    if (!model || !model[0]) {
+        json_error(resp, 400, "no model (set 'model' or start with --yolo-model)");
+        vjson_free(b);
+        return;
+    }
+
+    /* base64 → 图像 */
+    size_t enclen = 0;
+    uint8_t *enc = media_base64_decode(img, &enclen);
+    if (!enc || enclen == 0) {
+        free(enc); vjson_free(b);
+        json_error(resp, 400, "base64 decode failed");
+        return;
+    }
+    int iw = 0, ih = 0;
+    uint8_t *rgb = media_load_image_memory(enc, enclen, &iw, &ih);
+    free(enc);
+    if (!rgb) { vjson_free(b); json_error(resp, 400, "image decode failed"); return; }
+
+    vllm_npu_t *tmp_npu = NULL;
+    StYoloModel *m = NULL;
+    int is_rknn = (strcmp(backend, "rknn") == 0);
+    if (is_rknn) {
+        vllm_npu_cfg_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.backend = VLLM_NPU_BACKEND_RKNN;
+        cfg.rknn_path = (rknn_lib && rknn_lib[0]) ? rknn_lib : NULL;
+        cfg.verbosity = 0;
+        if (vllm_npu_init(&tmp_npu, &cfg) != 0 || !vllm_npu_available(tmp_npu)) {
+            if (tmp_npu) vllm_npu_destroy(tmp_npu);
+            media_free_image(rgb); vjson_free(b);
+            json_error(resp, 503, "librknnrt unavailable (check rknn_lib)");
+            return;
+        }
+        m = st_yolo_load_rknn(model, tmp_npu, ctx->yolo_core_mask);
+    } else {
+        st_yolo_set_default_npu(NULL);   /* 试检测走纯 CPU，不干扰 serve 的 NPU 状态 */
+        m = st_yolo_load(model);
+    }
+    if (!m) {
+        if (tmp_npu) vllm_npu_destroy(tmp_npu);
+        media_free_image(rgb); vjson_free(b);
+        json_error(resp, 500, "model load failed (check path/format vs backend)");
+        return;
+    }
+
+    YoloDet dets[300];
+    double t0 = st_now_sec();
+    int n = st_yolo_detect(m, rgb, iw, ih, conf, iou, dets, 300);
+    double ms = (st_now_sec() - t0) * 1000.0;
+
+    VJson *o = vjson_new_object();
+    json_put_str(o, "model", model);
+    json_put_str(o, "backend", is_rknn ? "rknn" : "vqf");
+    vjson_obj_set(o, "width", vjson_new_number((double)iw));
+    vjson_obj_set(o, "height", vjson_new_number((double)ih));
+    vjson_obj_set(o, "ms", vjson_new_number(ms));
+    vjson_obj_set(o, "n", vjson_new_number((double)(n > 0 ? n : 0)));
+    VJson *arr = vjson_new_array();
+    for (int i = 0; i < n; i++) {
+        char cn[64];
+        if (st_yolo_class_name(m, dets[i].cls, cn, sizeof(cn)) != 0)
+            snprintf(cn, sizeof(cn), "class_%d", dets[i].cls);
+        VJson *it = vjson_new_object();
+        vjson_obj_set(it, "cls", vjson_new_number((double)dets[i].cls));
+        json_put_str(it, "name", cn);
+        vjson_obj_set(it, "score", vjson_new_number((double)dets[i].score));
+        VJson *bx = vjson_new_array();
+        vjson_array_push(bx, vjson_new_number((double)dets[i].x1));
+        vjson_array_push(bx, vjson_new_number((double)dets[i].y1));
+        vjson_array_push(bx, vjson_new_number((double)dets[i].x2));
+        vjson_array_push(bx, vjson_new_number((double)dets[i].y2));
+        vjson_obj_set(it, "box", bx);
+        vjson_array_push(arr, it);
+    }
+    vjson_obj_set(o, "detections", arr);
+    if (n < 0) json_put_str(o, "error", "detect failed");
+
+    st_yolo_free(m);
+    if (tmp_npu) vllm_npu_destroy(tmp_npu);
+    media_free_image(rgb);
+    vjson_free(b);
+    admin_json_reply_cap(resp, o, 1u << 20);
+}
+
+/* POST /admin/api/cloud/test  {endpoint?, model?}
+ * 云端连通性测试（可选功能）：向 {endpoint}/v1/chat/completions 发一条 1-token
+ * 探针，校验「可达 / 鉴权 / 模型」三件事。仅明文 http://（vhttp_post_json 对
+ * https:// 返回 -2，本端点如实回报）。只读，不改引擎本地状态。 */
+static void handle_admin_cloud_test(const VLLMServerCtx *ctx,
+                                    const VHttpRequest *req, VHttpResponse *resp) {
+    VJson *b = adm_parse_body(req, resp);
+    if (!b) return;
+    const char *ep = vjson_str(vjson_obj_get(b, "endpoint"));
+    if (!ep || !ep[0]) ep = ctx->cloud_endpoint;
+    const char *model = vjson_str(vjson_obj_get(b, "model"));
+    if (!model || !model[0]) model = ctx->cloud_model;
+    if (!ep || !ep[0]) {
+        vjson_free(b);
+        json_error(resp, 400, "no endpoint (set 'endpoint' or start with --cloud-endpoint)");
+        return;
+    }
+    char url[1200];
+    size_t el = strlen(ep);
+    if (ep[el - 1] == '/')
+        snprintf(url, sizeof(url), "%sv1/chat/completions", ep);
+    else
+        snprintf(url, sizeof(url), "%s/v1/chat/completions", ep);
+
+    size_t fcap = strlen(model ? model : "") + 256;
+    char *fwd = (char *)malloc(fcap);
+    if (!fwd) { vjson_free(b); json_error(resp, 500, "out of memory"); return; }
+    int flen = snprintf(fwd, fcap,
+        "{\"model\":\"%s\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],"
+        "\"max_tokens\":1,\"stream\":false}",
+        (model && model[0]) ? model : "default");
+    if (flen <= 0 || (size_t)flen >= fcap) {
+        free(fwd); vjson_free(b);
+        json_error(resp, 500, "probe build failed");
+        return;
+    }
+
+    char auth[512]; auth[0] = '\0';
+    const char *key = getenv("VLLM_CLOUD_KEY");
+    if (key && key[0]) snprintf(auth, sizeof(auth), "Authorization: Bearer %s\r\n", key);
+
+    char *out = NULL; int st = 0; char ct[128] = "";
+    double t0 = st_now_sec();
+    int rc = vhttp_post_json(url, auth, fwd, (size_t)flen, &out, &st, ct, sizeof(ct));
+    double ms = (st_now_sec() - t0) * 1000.0;
+    free(fwd);
+
+    /* 注意：ep/model 指向 b 的字符串，必须在响应字段写完后才能 free(b)。 */
+    VJson *o = vjson_new_object();
+    json_put_str(o, "endpoint", ep);
+    json_put_str(o, "model", model ? model : "");
+    vjson_obj_set(o, "ms", vjson_new_number(ms));
+    if (rc != 0 || !out) {
+        vjson_obj_set(o, "ok", vjson_new_bool(0));
+        vjson_obj_set(o, "status", vjson_new_number(0));
+        json_put_str(o, "error", rc == -2
+                     ? "https unsupported (front a TLS-terminating gateway); use http://"
+                     : "cloud uplink unreachable (check endpoint / network)");
+        vjson_obj_set(o, "rc", vjson_new_number((double)rc));
+        free(out);
+        vjson_free(b);
+        admin_json_reply_cap(resp, o, 1u << 20);
+        return;
+    }
+    vjson_obj_set(o, "ok", vjson_new_bool(1));
+    vjson_obj_set(o, "status", vjson_new_number((double)st));
+    json_put_str(o, "content_type", ct[0] ? ct : "");
+    size_t n = strlen(out);
+    char *snip = (char *)malloc(401);
+    if (snip) {
+        size_t k = n > 400 ? 400 : n;
+        memcpy(snip, out, k); snip[k] = '\0';
+        json_put_str(o, "raw", snip);
+        free(snip);
+    }
+    free(out);
+    vjson_free(b);
+    admin_json_reply_cap(resp, o, 1u << 20);
+}
+
 /* ---------- router (called from vllm_server.c) ---------- */
 
 void vllm_admin_route(VLLMServerCtx *ctx, const VHttpRequest *req,
@@ -1884,6 +2576,9 @@ void vllm_admin_route(VLLMServerCtx *ctx, const VHttpRequest *req,
     } else if (strcmp(req->method, "POST") == 0 &&
                strcmp(req->path, "/admin/api/config/save") == 0) {
         handle_admin_config_save(ctx, req, resp);
+    } else if (strcmp(req->method, "POST") == 0 &&
+               strcmp(req->path, "/admin/api/config/patch") == 0) {
+        handle_admin_config_patch(ctx, req, resp);
     } else if (strcmp(req->method, "POST") == 0 &&
                strcmp(req->path, "/admin/api/model/load") == 0) {
         handle_admin_model_load(ctx, req, resp);
@@ -1923,6 +2618,40 @@ void vllm_admin_route(VLLMServerCtx *ctx, const VHttpRequest *req,
     } else if (strcmp(req->method, "GET") == 0 &&
                strcmp(req->path, "/admin/api/audit") == 0) {
         handle_admin_audit(ctx, req, resp);
+    /* ---- K-ADMIN-001：配置管理页 + 组件管理 API ---- */
+    } else if (strcmp(req->method, "GET") == 0 &&
+               strcmp(req->path, "/admin/kb") == 0) {
+        handle_kb_page(resp);
+    } else if (strcmp(req->method, "GET") == 0 &&
+               strcmp(req->path, "/admin/laya") == 0) {
+        handle_laya_page(resp);
+    } else if (strcmp(req->method, "GET") == 0 &&
+               strcmp(req->path, "/admin/yolo") == 0) {
+        handle_yolo_page(resp);
+    } else if (strcmp(req->method, "GET") == 0 &&
+               strcmp(req->path, "/admin/cloud") == 0) {
+        handle_cloud_page(resp);
+    } else if (strcmp(req->method, "GET") == 0 &&
+               strcmp(req->path, "/admin/api/kb/list") == 0) {
+        handle_admin_kb_list(ctx, req, resp);
+    } else if (strcmp(req->method, "GET") == 0 &&
+               strcmp(req->path, "/admin/api/kb/docs") == 0) {
+        handle_admin_kb_docs(ctx, req, resp);
+    } else if (strcmp(req->method, "POST") == 0 &&
+               strcmp(req->path, "/admin/api/kb/add") == 0) {
+        handle_admin_kb_add(ctx, req, resp);
+    } else if (strcmp(req->method, "POST") == 0 &&
+               strcmp(req->path, "/admin/api/kb/search") == 0) {
+        handle_admin_kb_search(ctx, req, resp);
+    } else if (strcmp(req->method, "POST") == 0 &&
+               strcmp(req->path, "/admin/api/kb/delete") == 0) {
+        handle_admin_kb_delete(ctx, req, resp);
+    } else if (strcmp(req->method, "POST") == 0 &&
+               strcmp(req->path, "/admin/api/yolo/test") == 0) {
+        handle_admin_yolo_test(ctx, req, resp);
+    } else if (strcmp(req->method, "POST") == 0 &&
+               strcmp(req->path, "/admin/api/cloud/test") == 0) {
+        handle_admin_cloud_test(ctx, req, resp);
     } else {
         static const char nf[] = "{\"error\":\"admin: not found\"}";
         resp->status = 404;

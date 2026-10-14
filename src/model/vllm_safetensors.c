@@ -5100,6 +5100,7 @@ static void gemm_q8_0_8x4_neon(int n, float *__restrict s, size_t bs,
  * no net gain over the plain 8-token chunking (~-0.6% within noise) - the
  * 8x8 tile already halves the weight re-reads vs 4x4, so the Q4 4x4 asm's
  * row-slice L3-residency win does NOT transfer here. Keep it simple. */
+static volatile uint64_t g_q8_probe_sink;   /* K-EMB-002 纯读探针 sink（防 DCE） */
 typedef struct {
     float *out; const uint8_t *q8_w;
     int nb, cols, rows, n_batch;
@@ -5111,6 +5112,30 @@ static void vllm_q8x8_b0_worker(void *ctx_, int it) {
     int nt = c->n_batch - t0;
     if (nt > 8) nt = 8;
     const uint8_t *act = g_q8r_scratch + (size_t)it * c->nb * 272;
+    /* K-EMB-002 Phase 0 纯读探针（VLLM_Q8_PROBE=1）：只按与真 GEMM 相同的访问
+     * 模式读权重/激活字节（每 64B 取 1 字节 ⇒ 触发整条 cache line 取回），跳过
+     * 全部 vdot/累加/存储 ⇒ 量出「纯读地板」，用于判别 prefill GEMM 是 DRAM 带宽
+     * 受限（H1）还是算力/停顿受限（H2）。默认关，零行为影响（仅诊断）。 */
+    {
+        static int g_probe = -1;
+        if (g_probe < 0) {
+            const char *e = getenv("VLLM_Q8_PROBE");
+            g_probe = (e && e[0] == '1') ? 1 : 0;
+            if (g_probe) fprintf(stderr, "[Q8PROBE] engaged (pure-read floor)\n");
+        }
+        if (g_probe) {
+            uint64_t s = 0;
+            const size_t grp_bytes = (size_t)c->nb * 272;
+            const int ngrp = (c->rows + 7) / 8;
+            for (int g = 0; g < ngrp; g++) {
+                const uint8_t *p = c->q8_w + (size_t)g * grp_bytes;
+                for (size_t i = 0; i < grp_bytes; i += 64) s += p[i];
+            }
+            for (size_t i = 0; i < grp_bytes; i += 64) s += act[i];
+            g_q8_probe_sink = s;
+            return;
+        }
+    }
     if (nt == 4) {
         gemm_q8_0_8x4_neon(c->cols, c->out + (size_t)t0 * c->rows, (size_t)c->rows,
                            c->q8_w, act, nt, c->rows);
@@ -6843,12 +6868,32 @@ static void vllm_q4_gu_b_worker(void *ctx_, int r) {
     }
 }
 
+/* K-DENSE-014 G0 复核取证：证明 ARM 稠密 FFN 走的是 Q4 权重 × int8 激活
+ * + vdotq_s32（i8x16_dot_s32）的近似轨，而非 x86 侧的 st_q4_row_dot
+ * （Q4×f32 标量）——即稠密 FFN 本来就是 int8-dot，不存在"移植 actq"的空间。
+ * VLLM_DENSE_PROBE=1 开启，每个投影 × 每阶段只打印一次；默认关，零生产影响。
+ * 复现：VLLM_DENSE_PROBE=1 vllm_kestrel --stream-test --model *.q4.vqf ... */
+static void dense_actq_probe(const char *proj, int n_batch, int rows, int cols, int repack) {
+    static int on = -1;
+    static int seen[4] = {0, 0, 0, 0};
+    if (on < 0) { const char *e = getenv("VLLM_DENSE_PROBE"); on = e ? 1 : 0; }
+    if (!on) return;
+    int slot = (proj[0] == 'g' ? 0 : 2) + (n_batch == 1 ? 1 : 0);
+    if (seen[slot]) return;
+    seen[slot] = 1;
+    fprintf(stderr, "[DENSE-PROBE] proj=%s phase=%s path=arm-neon-int8 repack=%d n_batch=%d rows=%d cols=%d "
+                    "act=int8 vdotq_s32=1 m4f=%d\n",
+            proj, n_batch == 1 ? "decode" : "prefill", repack, n_batch, rows, cols,
+            spec_m4f_decode_env());
+}
+
 static void dyn_matvec_q4_q8_fused_gate_up_batched_neon(
     float *__restrict gate_out, float *__restrict up_out,
     const uint8_t *__restrict q4_gate, const uint8_t *__restrict q4_up,
     const float *__restrict x_batch, int rows, int cols, int n_batch) {
     int n_blocks = cols / 32;
     int row_stride = n_blocks * 18;
+    dense_actq_probe("gate_up", n_batch, rows, cols, g_st_q4_repack ? 1 : 0);
     int8_t *xq; float *xd;
     if (xq_scratch_ensure(&xq, &xd,
                           (size_t)n_batch * cols,
@@ -6929,6 +6974,7 @@ static void dyn_matvec_q4_q8_fused_down_residual_batched_neon(
     int hidden_dim, int ffn_dim, int n_batch) {
     int n_blocks = ffn_dim / 32;
     int row_stride = n_blocks * 18;
+    dense_actq_probe("down", n_batch, hidden_dim, ffn_dim, g_st_q4_repack ? 1 : 0);
     int8_t *xq; float *xd;
     if (xq_scratch_ensure(&xq, &xd,
                           (size_t)n_batch * ffn_dim,
@@ -9310,9 +9356,13 @@ static int g_kv_nof32 = 0;
 static void kv_nof32_poll(STQwenInferenceState *st) {
     g_kv_nof32 = 0;
     const char *nf = getenv("VLLM_KV_NOF32");
-    if (nf && nf[0] == '1' && st->use_kv_q8 && !g_xq_pages) {
+    /* K-KV-002 G4（2026-10-08）：**默认开**（未设 / 非 "0"）；逃生舱 `VLLM_KV_NOF32=0`。
+     * 仅 q8 档生效；`VLLM_KV_F32=1`（use_kv_q8=0）与 `VLLM_XQ_PAGES=1` 仍自动回退双份。 */
+    int on = !(nf && nf[0] == '0');
+    if (on && st->use_kv_q8 && !g_xq_pages) {
         g_kv_nof32 = 1;
-        fprintf(stderr, "[KV] P3 nof32 mode: f32 canonical KV arrays NOT allocated\n");
+        fprintf(stderr, "[KV] P3 nof32 mode (default on; VLLM_KV_NOF32=0 disables): "
+                        "f32 canonical KV arrays NOT allocated\n");
         fflush(stderr);
     }
 }
@@ -9718,6 +9768,14 @@ int st_qwen_inference_init(STQwenInferenceState *st, const STModelWeights *weigh
                 return -1;
             }
         }
+    } else {
+        /* 立项 K-KV-002 (G2) 生效性凭证：证明「f32 正典确实未分配」。
+         * 依据 perf_axiom_silent_fallback_false_pass_v1 —— 判据 PASS 只证输出
+         * 正确、不证优化生效，故必须打印一条能自证「它真的跑了」的诊断。
+         * 位置在 init（计时窗口之外），不污染 A/B 取数。 */
+        fprintf(stderr, "[KV-NOF32] f32 canon skipped: nl=%d n_blocks=%d "
+                        "k_cache[l]=v_cache[l]=NULL (q8 single-copy)\n",
+                nl, n_blocks);
     }
 
     st->is_allocated = 1;
@@ -11831,6 +11889,28 @@ static int moe_q4_actq_ok(void) {
 #endif
 }
 
+/* 立项 K-ACTQ-013：**decode（逐 token）路径**的独立 actq 门。
+ * 语义：① 显式 `VLLM_ACTQ_DEC=0/1` 优先（`=0` 逃生舱，回退精确轨）；
+ *       ② 未设时若显式给了 `VLLM_ACTQ` 则**沿用其值**（向后兼容旧单门语义）；
+ *       ③ 两者都未设 ⇒ **默认 ON**（G4 默认化；解耦于批式 `_GU/_DN`，避免连坐未验证的批式 dn）。
+ * 生效性凭证：`[ACTQ-DEC] DEC int8-dot ON/OFF (default; escape: VLLM_ACTQ_DEC=0)` + 真执行过时 `ENGAGED`。 */
+static int actq_dec_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("VLLM_ACTQ_DEC");
+        const char *g = getenv("VLLM_ACTQ");
+        int src = 0;   /* 0=default, 1=explicit _DEC, 2=inherited VLLM_ACTQ */
+        if (e)      { v = (e[0] == '1') ? 1 : 0; src = 1; }
+        else if (g) { v = (g[0] == '1') ? 1 : 0; src = 2; }
+        else        { v = 1; }
+        fprintf(stderr, "[ACTQ-DEC] DEC int8-dot %s%s\n", v ? "ON" : "OFF",
+                src == 1 ? " (explicit; escape: VLLM_ACTQ_DEC=0)"
+                         : (src == 2 ? " (inherited from VLLM_ACTQ)"
+                                     : " (default; escape: VLLM_ACTQ_DEC=0)"));
+    }
+    return v;
+}
+
 #if defined(__aarch64__) && defined(ST_HAVE_NEON) && !ST_ARCH_X86 && ST_NEON_DOTPROD
 /* 行 ri 的 legacy 字节 bb（bb=4q+s，q=chunk、s=子列）位于 chunk q 的
  * 偏移 ri*4+s。TAB[q][ri][L] = (L>>2)==q ? ri*4+(L&3) : 0x80 —— 对 4 个
@@ -13064,7 +13144,7 @@ static void st_moe_ffn_sparse_q4(const STModelWeights *w, int l,
     int8_t xq[2048]; float xd[64];
     int16_t xq16[2048]; float xd16[64];
     int actq16 = actq16_env();
-    int actq = moe_q4_actq_ok();
+    int actq = actq_dec_on();   /* K-ACTQ-013：decode 独立门（未设=默认 ON；`=0` 逃生舱） */
     if (actq16 && (d > 2048 || nbG > 64)) actq16 = 0;   /* 小栈缓冲上限 */
     if (actq16) actq = 0;                                /* 互斥：s16 轨优先 */
     if (actq && (d > 2048 || nbG > 64)) actq = 0;   /* 小栈缓冲上限 */
@@ -13085,8 +13165,8 @@ static void st_moe_ffn_sparse_q4(const STModelWeights *w, int l,
         static int actq_logged = 0;
         if (!actq_logged) {
             actq_logged = 1;
-            printf("[ACTQ] VLLM_ACTQ=1: q4 MoE int8-dot approximate track ON "
-                   "(l=0, d=%d nbG=%d)\n", d, nbG);
+            printf("[ACTQ] decode int8-dot approximate track ON "
+                   "(gate: VLLM_ACTQ_DEC; l=0, d=%d nbG=%d)\n", d, nbG);
             fflush(stdout);
         }
         quantize_row_q8_0_act(x_ffn, xq, xd, d);
@@ -14531,6 +14611,18 @@ static int st_moe_ffn_sparse_q4_batch(const STModelWeights *w, int l, int nb,
         float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
         for (int k = 0; k < tk; k++) pr[(size_t)t*tk+k] *= inv;
     }
+    /* 立项 K-L0-004 (N1)：批式（prefill）路径也累积 router 热度。
+     * 原实现只在 decode 稀疏路径（st_moe_ffn_sparse_q4/q8）累积 ⇒ prefill 主导
+     * 时热度样本与主导相位不符。此处与 decode 同语义：每层每个被选中专家计一次。
+     * 默认关（仅 VLLM_EW_HEAT=1 时 g_moe_heat_on=1）⇒ 零行为改动、零浮点影响。 */
+    if (g_moe_heat_on && g_moe_heat_ne > 0 && l >= 0 && l < g_moe_heat_nl) {
+        uint32_t *h = g_moe_heat + (size_t)l * (size_t)g_moe_heat_ne;
+        for (int t = 0; t < nb; t++)
+            for (int j = 0; j < tk; j++) {
+                int e = sel[(size_t)t * tk + j];
+                if (e >= 0 && e < g_moe_heat_ne) h[e]++;
+            }
+    }
     st2_ctx ctx;
     ctx.G = G; ctx.U = U; ctx.D = D; ctx.X = X; ctx.Y = Y;
     ctx.xq = xq; ctx.xd = xd; ctx.avq = avq; ctx.avd = avd;
@@ -14644,6 +14736,23 @@ static int arm2_batch_env(void) {   /* 2026-09-10 起默认开；VLLM_MOE_BATCH=
     if (v < 0) { const char *e = getenv("VLLM_MOE_BATCH"); v = (e && e[0] == '0') ? 0 : 1; }
     return v;
 }
+/* 立项 K-PF-005 L1：ARM gu 的 k 方向交错深度 W（`VLLM_MOE_ILV_ARM`）。
+ *   W=2/4 → 内层 k 循环把 W 个 token 的「载入相」与「计算相」拆开交错，给出
+ *           W 条独立累加链（提升 MLP/ILP，对治 warm 档的停顿受限）；
+ *   W=0/1 → 关（默认），走与改动前**逐字同形**的原 k 循环（逃生舱 = 现状内核）。
+ * 数值：每个 token 仍按 cb 升序、用同一浮点表达式累加，组间不共享任何累加器
+ *   → 与逐 token 参考核逐位相同（A≡C，同 x86 §9.46/§9.47 的位级安全论证）。 */
+static int arm2_ilv_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *s = getenv("VLLM_MOE_ILV_ARM");
+        v = (s && s[0]) ? atoi(s) : 0;   /* 未设 = 关（G2 先默认关，待 G3 通过由 G4 决定默认化） */
+        if (v < 0) v = 0;
+        if (v > 4) v = 4;
+        fprintf(stderr, "[MOEILVARM] gu k-interleave W=%d\n", v);
+    }
+    return v;
+}
 typedef struct {
     const uint8_t *G, *U, *D;
     const float *X;                 /* [nb][d] */
@@ -14656,9 +14765,196 @@ typedef struct {
     int *ex_t; int *ex_j;           /* 归属表（token, rank） */
     int *sel; float *pr;            /* [nb][tk] */
     int verify;
-    int actq;                      /* 1=SDOT 近似轨；0=精确轨 f32 乘加 */
+    int actq_gu, actq_dn;          /* 立项 K-ACTQ-009：gu/dn **独立**门（1=SDOT 近似轨，0=精确轨）；
+                                    * 未设 `VLLM_ACTQ_GU/_DN` 时各自继承 `VLLM_ACTQ`（旧语义兼容）。 */
+    int ilv_arm;                   /* 立项 K-PF-005 L1：gu k 方向交错深度 W（VLLM_MOE_ILV_ARM，0=关） */
+    int dn_order;                  /* 立项 K-DN-006：dn 任务序（0=行组主序现状 / 1=专家主序） */
+    int gu_order;                  /* 立项 K-GU-010：gu 任务序（0=行组主序现状 / 1=专家主序） */
+    const int *eord;               /* 立项 K-DN-012：dn 专家槽位置换（NULL=现状连续切分） */
     int nb, tk, d, ef, ne, nbG, ggB, gdB, ge4, cbe, nsel;
 } arm2_ctx;
+
+/* 立项 K-DN-006（G4）：dn 任务序。默认 **专家主序**（e 最慢）；`VLLM_MOE_DN_ORDER=0` 为逃生舱，
+ * 回退现状的**行组主序**（rg = idx/ne, e = idx%ne，与改动前逐字同形）。
+ * 动机：行组主序下每个 rg 都要把全部专家的 `av` 行重复流一遍（每层 ~3 GB），专家主序让同一
+ * 专家的 m 行驻留（每层 ~6 MB）。**只改任务映射，浮点累加序不变 ⇒ A≡C 位级**。
+ * G3 实测：dn 段 −30.1%、端到端 prefill −12.2%（板端 t4，governor=performance，零缺页）。
+ * ⚠️ 就地订正（2026-10-08）：台账/立项条目登记的**权威终值**为 **dn −30.6% / prefill −16.4%**
+ *    （4 轮交错、过 5× 效应门；去 gu 漂移后 dn ≈ −26.8%）。上面 −30.1/−12.2 为早期单批读数，保留不改。 */
+static int arm2_dn_order_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *s = getenv("VLLM_MOE_DN_ORDER");
+        v = (s && s[0] == '0') ? 0 : 1;   /* 默认专家主序；=0 回退行组主序 */
+        fprintf(stderr, "[MOEDNORD] dn order=%s (escape: VLLM_MOE_DN_ORDER=0)\n",
+                v ? "exp-major" : "rg-major");
+    }
+    return v;
+}
+/* G4 条件④：启用条件不满足时**自动回退**行组主序（并打印，避免静默回退）。 */
+static inline int arm2_dn_use_exp(const arm2_ctx *c) {
+    if (!c->dn_order) return 0;
+    if (c->d > 0 && (c->d & 3) == 0 && c->ne > 0) return 1;
+    static volatile int warned = 0;
+    if (!__atomic_exchange_n(&warned, 1, __ATOMIC_RELAXED))
+        fprintf(stderr, "[MOEDNORD] auto-fallback to rg-major (d=%d ne=%d)\n", c->d, c->ne);
+    return 0;
+}
+
+/* 立项 K-DN-012：dn 负载均衡装桶（`VLLM_MOE_DN_BAL`）。**只改任务映射 ⇒ 位级安全**。
+ * 动机：exp-major + `vllm_tp_parfor` 静态连续切分 ⇒ 线程 t 恰好拿到**连续的 KC 个专家**，
+ *   而真实 m_e 强偏斜（板端热度实测 max/mean ≈ 7.2）⇒ 负载不均 max/mean = **1.243**
+ *   （慢线程比均值多干 24.3%），是 dn 残余间隙中**可解释的主项**。
+ * 方案：按 m_e **降序做 LPT**（最长优先）装桶 + **每桶容量固定 = ne/nt** ⇒ 组 g 占槽位
+ *   `[g*KC,(g+1)*KC)`，与连续切分的边界一致 ⇒ **每个 (e,rg) 任务的浮点表达式与累加序一字不改**。
+ *   ⚠️ 关键约束：**同一专家的全部 rg 仍在同一槽位** ⇒ K-DN-006 依赖的「同专家 `av` 跨 rg
+ *   复用（512 次）」模式保持不变（否则会反噬 K-DN-006 的收益）。
+ * 分配仿真（真实热度）：连续 1.243 → **LPT+容量 1.000**；对照：交错 1.220、蛇形 1.035、
+ *   降序连续 2.875（更差）。 */
+static int arm2_dn_bal_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *s = getenv("VLLM_MOE_DN_BAL");
+        v = (s && s[0] == '0') ? 0 : 1;   /* G4 默认**开**（G3 已过：位级 A≡C + dn −24.9%）；=0 逃生舱 */
+        fprintf(stderr, "[MOEDNBAL] dn bal=%s (escape: VLLM_MOE_DN_BAL=0)\n", v ? "ON" : "OFF");
+    }
+    return v;
+}
+/* 按 `ex_off`（专家→归属表偏移）构造专家槽位置换 `eord[ne]`。
+ * 返回**负载不均改善比**（现状 max/mean ÷ 装桶后 max/mean）；<0 = 未启用/条件不满足。
+ * 确定性：m_e 降序、并列按专家 id 升序；LPT 并列取最小桶号。 */
+static double arm2_dn_build_eord(const int *ex_off, int ne, int nt, int *eord) {
+    if (nt < 2 || nt > 8 || ne < nt || (ne % nt) != 0) {
+        static volatile int warned = 0;
+        if (!__atomic_exchange_n(&warned, 1, __ATOMIC_RELAXED))
+            fprintf(stderr, "[MOEDNBAL] auto-fallback to contiguous (ne=%d nt=%d)\n", ne, nt);
+        return -1.0;
+    }
+    const int KC = ne / nt;
+    int *ord = (int *)malloc((size_t)ne * sizeof(int));
+    long long *bw = (long long *)malloc((size_t)nt * sizeof(long long));
+    int *bn = (int *)malloc((size_t)nt * sizeof(int));
+    if (!ord || !bw || !bn) { free(ord); free(bw); free(bn); return -1.0; }
+#define DN_M_OF(e) ((long long)ex_off[(e) + 1] - (long long)ex_off[(e)])
+    long long tot = 0, cur_max = 0;
+    for (int t = 0; t < nt; t++) {
+        long long s = 0;
+        for (int e = t * KC; e < (t + 1) * KC; e++) s += DN_M_OF(e);
+        if (s > cur_max) cur_max = s;
+        tot += s;
+    }
+    for (int e = 0; e < ne; e++) ord[e] = e;
+    for (int i = 1; i < ne; i++) {          /* 插入排序（ne<=128） */
+        int v = ord[i];
+        long long mv = DN_M_OF(v);
+        int j = i - 1;
+        while (j >= 0 && (DN_M_OF(ord[j]) < mv || (DN_M_OF(ord[j]) == mv && ord[j] > v))) {
+            ord[j + 1] = ord[j]; j--;
+        }
+        ord[j + 1] = v;
+    }
+    for (int t = 0; t < nt; t++) { bw[t] = 0; bn[t] = 0; }
+    for (int i = 0; i < ne; i++) {
+        int e = ord[i], best = -1;
+        for (int t = 0; t < nt; t++) {
+            if (bn[t] >= KC) continue;
+            if (best < 0 || bw[t] < bw[best]) best = t;
+        }
+        if (best < 0) { free(ord); free(bw); free(bn); return -1.0; }
+        eord[best * KC + bn[best]] = e;
+        bw[best] += DN_M_OF(e);
+        bn[best]++;
+    }
+    long long new_max = 0;
+    for (int t = 0; t < nt; t++) if (bw[t] > new_max) new_max = bw[t];
+#undef DN_M_OF
+    free(ord); free(bw); free(bn);
+    if (cur_max <= 0 || new_max <= 0 || tot <= 0) return -1.0;
+    {   /* K-DN-012 G3：verbose 下暴露原始三项（cur_mean = tot/nt），用于核对效应是否
+         * 由"负载不均"独立解释（仅第 0 层读数不足以解释端到端 −25%）。 */
+        const char *vb = getenv("VLLM_MOE_DN_BAL_VERBOSE");
+        if (vb && vb[0] == '1')
+            fprintf(stderr, "[MOEDNBAL-RAW] nt=%d tot=%lld cur_max=%lld new_max=%lld mean=%.1f"
+                            " imbalance=%.3f bal=%.3f\n",
+                    nt, tot, cur_max, new_max, (double)tot / nt,
+                    (double)cur_max / ((double)tot / nt), (double)new_max / ((double)tot / nt));
+    }
+    return (double)cur_max / (double)new_max;
+}
+
+/* 立项 K-GU-010：gu 任务序。默认 **行组主序**（= 改动前现状）；`VLLM_MOE_GU_ORDER=1` 启用**专家主序**。
+ * 动机：行组主序下固定一行组扫 128 专家 ⇒ 各专家 token 的 `x` 行互不复用；专家主序让同一专家的
+ * m 行 `x` 跨 `ge4`(=192) 个行组驻留（与 K-DN-006 对 dn 的改法同构）。**只改任务映射 ⇒ A≡C 位级**。
+ * ⚠️ 与 dn 的差异：dn 的 `av` 工作集 = nsel×ef = 6 MB（与 nb 无关）；gu 的 `x` = nb×d×4（随 nb 增大
+ *    ⇒ 大 batch 时可能超 L3，收益或小于 dn）。 */
+static int arm2_gu_order_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *s = getenv("VLLM_MOE_GU_ORDER");
+        v = (s && s[0] == '1') ? 1 : 0;   /* G2 先默认关；待 G3 通过由 G4 决定默认化 */
+        fprintf(stderr, "[MOEGUORD] gu order=%s (escape: VLLM_MOE_GU_ORDER=1)\n",
+                v ? "exp-major" : "rg-major");
+    }
+    return v;
+}
+/* 生效性凭证（`silent_fallback_false_pass`）：真执行过 exp-major 映射时打印一次。
+ * 非原子旗标：竞态最坏为重复打印一行，不产生热点缓存行争用（本函数在内核热路径被调用）。 */
+static void arm2_gu_mark(void) {
+    static int seen = 0;
+    if (!seen) { seen = 1; fprintf(stderr, "[MOEGUORD] gu exp-major ENGAGED (actual)\n"); }
+}
+/* G4 条件④：启用条件不满足时**自动回退**行组主序（并打印，避免静默回退）。 */
+static inline int arm2_gu_use_exp(const arm2_ctx *c) {
+    if (!c->gu_order) return 0;
+    if (c->ne > 0 && c->ge4 > 0) { arm2_gu_mark(); return 1; }
+    static volatile int warned = 0;
+    if (!__atomic_exchange_n(&warned, 1, __ATOMIC_RELAXED))
+        fprintf(stderr, "[MOEGUORD] auto-fallback to rg-major (ne=%d ge4=%d)\n", c->ne, c->ge4);
+    return 0;
+}
+
+/* 立项 K-ACTQ-009：ACTQ **拆门**（gu / dn 独立）。
+ * 动机：`VLLM_ACTQ` 原为单门，同时控制 gu、av 量化、dn 三处派发（`gate_decoupling_before_default_enablement`）。
+ * 语义：`VLLM_ACTQ_GU` / `VLLM_ACTQ_DN` 各自 `=1` 启用；**未设则继承 `VLLM_ACTQ`**（旧行为逐字不变）。
+ * 生效性凭证：两门各打印一次实际状态 —— ARM 批式路径此前**没有任何 actq 诊断**（原 `[ACTQ]` 行来自
+ * 另一条非批式代码路径且只打一次），属于 `silent_fallback_false_pass` 风险点，本项一并补上。
+ * 逃生舱：`VLLM_ACTQ_GU=0` / `VLLM_ACTQ_DN=0`（各自回退精确轨）。
+ *
+ * 立项 K-ACTQ-010（G4，2026-10-08）：**`VLLM_ACTQ_GU` 默认化 = 未设即 ON**。依据：
+ *   质量 ΔNLL +0.061149（默认环境）/ +0.082794（`VLLM_KV_NOF32=0` 逃生舱），均 ≤ +0.10；
+ *   NIAH 5/5（双档）；性能 prefill −38.1%（ctx246，t4，过 5× 效应门 31×）。
+ *   4K 贪婪分叉 pos 23/32 属 near-tie（良性对照 `nof32=0` 为 26/32，其 ΔNLL 仅 +0.004）
+ *   ⇒ 按 K-KV-002 §7.4 先例重冻为「语义级稳健」判据（详见条目 §8.9）。
+ *   `VLLM_ACTQ_DN` **维持未设继承旧单门（默认关）**；decode 路径未拆门，亦维持精确。
+ *   ⇒ 生产默认 = 批式 gu int8-dot ON + dn 精确 + decode 精确。 */
+static int arm2_actq_sub_on(const char *name, const char *env, int *slot, int def_on) {
+    if (*slot < 0) {
+        const char *s = getenv(env);
+        int inherited = 0, defaulted = 0;
+        if (s) {
+            *slot = (s[0] == '1') ? 1 : 0;
+        } else if (def_on) {
+            *slot = 1;                               /* K-ACTQ-010 G4：默认化 */
+            defaulted = 1;
+        } else {
+            *slot = moe_q4_actq_ok();                /* 继承旧单门 */
+            inherited = 1;
+        }
+        fprintf(stderr, "[ACTQ-%s] %s int8-dot %s%s%s\n", name, name,
+                *slot ? "ON" : "OFF",
+                inherited ? " (inherited from VLLM_ACTQ)" : "",
+                defaulted ? " (default; escape: =0)" : "");
+    }
+    return *slot;
+}
+static int arm2_actq_gu_on(void) {
+    static int v = -1;
+    return arm2_actq_sub_on("GU", "VLLM_ACTQ_GU", &v, 1);   /* K-ACTQ-010 G4：默认 ON */
+}
+static int arm2_actq_dn_on(void) {
+    static int v = -1;
+    return arm2_actq_sub_on("DN", "VLLM_ACTQ_DN", &v, 0);   /* 维持默认关（未测 dn/4K） */
+}
 
 /* tile 头 8B 的 4 个 f16 行 scale → f32[4] */
 static inline void arm2_scales4(const uint8_t *t, float *s) {
@@ -14691,11 +14987,66 @@ static inline void arm2_rows4(const uint8_t *tile, const uint8x16_t tab[4][4],
         hi[ri] = arm2_nib_hi(R);
     }
 }
+/* 立项 K-PF-005 L1：gu 内层 k 方向交错体（编译期常量展开，同 x86 §9.47 ST2_ILV_BODY）。
+ * 语义与逐 token 循环**逐位相同**：只把 WC 个 token 的计算顺序交错（先统一发载入、
+ * 再统一计算），每个 token 仍按 cb 升序、用同一浮点表达式累加，组间不共享累加器。 */
+#define ARM2_ILV_ACTQ_BODY(WC)                                                  \
+    do {                                                                        \
+        int8x16_t XL[WC], XH[WC];                                               \
+        float XDC[WC];                                                          \
+        for (int j = 0; j < (WC); j++) {                                        \
+            int tj = c->ex_t[o0 + k + j];                                       \
+            const int8_t *xsj = c->xq + (size_t)tj * c->d + (size_t)cb * 32;    \
+            XL[j] = vld1q_s8(xsj);                                              \
+            XH[j] = vld1q_s8(xsj + 16);                                         \
+            XDC[j] = c->xd[(size_t)tj * c->nbG + cb];                           \
+        }                                                                       \
+        for (int j = 0; j < (WC); j++) {                                        \
+            int32x4_t gd0 = vaddq_s32(i8x16_dot_s32(glo[0], XL[j]), i8x16_dot_s32(ghi[0], XH[j])); \
+            int32x4_t gd1 = vaddq_s32(i8x16_dot_s32(glo[1], XL[j]), i8x16_dot_s32(ghi[1], XH[j])); \
+            int32x4_t gd2 = vaddq_s32(i8x16_dot_s32(glo[2], XL[j]), i8x16_dot_s32(ghi[2], XH[j])); \
+            int32x4_t gd3 = vaddq_s32(i8x16_dot_s32(glo[3], XL[j]), i8x16_dot_s32(ghi[3], XH[j])); \
+            int32x4_t ud0 = vaddq_s32(i8x16_dot_s32(ulo[0], XL[j]), i8x16_dot_s32(uhi[0], XH[j])); \
+            int32x4_t ud1 = vaddq_s32(i8x16_dot_s32(ulo[1], XL[j]), i8x16_dot_s32(uhi[1], XH[j])); \
+            int32x4_t ud2 = vaddq_s32(i8x16_dot_s32(ulo[2], XL[j]), i8x16_dot_s32(uhi[2], XH[j])); \
+            int32x4_t ud3 = vaddq_s32(i8x16_dot_s32(ulo[3], XL[j]), i8x16_dot_s32(uhi[3], XH[j])); \
+            int32x4_t pgv = vpaddq_s32(vpaddq_s32(gd0, gd1), vpaddq_s32(gd2, gd3)); \
+            int32x4_t puv = vpaddq_s32(vpaddq_s32(ud0, ud1), vpaddq_s32(ud2, ud3)); \
+            gacc[k + j] = vaddq_f32(gacc[k + j],                                \
+                    vmulq_f32(vmulq_f32(scg, vdupq_n_f32(XDC[j])), vcvtq_f32_s32(pgv))); \
+            uacc[k + j] = vaddq_f32(uacc[k + j],                                \
+                    vmulq_f32(vmulq_f32(scu, vdupq_n_f32(XDC[j])), vcvtq_f32_s32(puv))); \
+        }                                                                       \
+    } while (0)
+/* 精确轨（actq=0）：wf 已预计算（wfg/wfu），交错体只需把 WC 个 token 的激活指针
+ * 先取齐、再按 kk 升序对 WC 条独立累加链交错乘加。 */
+#define ARM2_ILV_EXACT_BODY(WC)                                                 \
+    do {                                                                        \
+        const float *XP[WC];                                                    \
+        for (int j = 0; j < (WC); j++)                                          \
+            XP[j] = c->X + (size_t)c->ex_t[o0 + k + j] * c->d + (size_t)cb * 32; \
+        for (int kk = 0; kk < 32; kk++) {                                       \
+            for (int j = 0; j < (WC); j++) {                                    \
+                float32x4_t xv = vdupq_n_f32(XP[j][kk]);                        \
+                gacc[k + j] = vaddq_f32(gacc[k + j], vmulq_f32(wfg[kk], xv));   \
+                uacc[k + j] = vaddq_f32(uacc[k + j], vmulq_f32(wfu[kk], xv));   \
+            }                                                                   \
+        }                                                                       \
+    } while (0)
+/* 生效性凭证（`silent_fallback_false_pass`）：W>=2 交错体**真的执行过**时打印一次。
+ * 不能只打印请求的 W —— 若几何/轨道把它钳成 W=1，那属于静默回退，必须能区分。 */
+static void arm2_ilv_mark(void) {
+    static volatile int seen = 0;
+    if (!__atomic_exchange_n(&seen, 1, __ATOMIC_RELAXED))
+        fprintf(stderr, "[MOEILVARM] gu interleave ENGAGED (W>=2 actual)\n");
+}
 /* gu：task = (行组 g, 专家 e)，行组主序（同 x86 2a-d）。tile 行收集每块一次，
  * 供该专家的 |T_e| 个 token 复用；f32 累加表达式与逐 token 核逐字同形。 */
 static void arm2_gu_worker(void *c_, int idx) {
     arm2_ctx *c = c_;
-    int g = idx / c->ne, e = idx - g * c->ne;
+    int g, e;   /* K-GU-010：任务序（默认 rg-major = 改动前逐字同形） */
+    if (arm2_gu_use_exp(c)) { e = idx / c->ge4; g = idx - e * c->ge4; }
+    else                    { g = idx / c->ne;  e = idx - g * c->ne; }
     int o0 = c->ex_off[e], o1 = c->ex_off[e + 1];
     int m = o1 - o0;
     if (m <= 0) return;
@@ -14721,6 +15072,15 @@ static void arm2_gu_worker(void *c_, int idx) {
         arm2_rows4(gt, tab, glo, ghi);
         arm2_rows4(ut, tab, ulo, uhi);
         float32x4_t scg = vld1q_f32(scg4), scu = vld1q_f32(scu4);
+        if (c->ilv_arm >= 2) {
+            /* L1：k 方向交错（W=4 → 2 → 1 尾档，编译期常量展开） */
+            for (int k = 0; k < m; ) {
+                if (c->ilv_arm >= 4 && k + 4 <= m) { arm2_ilv_mark(); ARM2_ILV_ACTQ_BODY(4); k += 4; continue; }
+                if (k + 2 <= m)                    { arm2_ilv_mark(); ARM2_ILV_ACTQ_BODY(2); k += 2; continue; }
+                ARM2_ILV_ACTQ_BODY(1); k += 1;
+            }
+            continue;
+        }
         for (int k = 0; k < m; k++) {
             int t = c->ex_t[o0 + k];
             const int8_t *xs = c->xq + (size_t)t * c->d + (size_t)cb * 32;
@@ -14759,7 +15119,9 @@ static void arm2_gu_worker(void *c_, int idx) {
  * 逐 k f32 乘加序与 q4x4_tile32_neon 逐位一致（vmul+vadd 不收缩）。 */
 static void arm2_gu_worker_exact(void *c_, int idx) {
     arm2_ctx *c = c_;
-    int g = idx / c->ne, e = idx - g * c->ne;
+    int g, e;   /* K-GU-010：任务序（默认 rg-major = 改动前逐字同形） */
+    if (arm2_gu_use_exp(c)) { e = idx / c->ge4; g = idx - e * c->ge4; }
+    else                    { g = idx / c->ne;  e = idx - g * c->ne; }
     int o0 = c->ex_off[e], o1 = c->ex_off[e + 1];
     int m = o1 - o0;
     if (m <= 0) return;
@@ -14774,6 +15136,15 @@ static void arm2_gu_worker_exact(void *c_, int idx) {
         float32x4_t wfg[32], wfu[32];
         q4x4_tile32_wf_neon(gt, wfg);
         q4x4_tile32_wf_neon(ut, wfu);
+        if (c->ilv_arm >= 2) {
+            /* L1：k 方向交错（默认轨 = 精确轨；W=4 → 2 → 1 尾档） */
+            for (int k = 0; k < m; ) {
+                if (c->ilv_arm >= 4 && k + 4 <= m) { arm2_ilv_mark(); ARM2_ILV_EXACT_BODY(4); k += 4; continue; }
+                if (k + 2 <= m)                    { arm2_ilv_mark(); ARM2_ILV_EXACT_BODY(2); k += 2; continue; }
+                ARM2_ILV_EXACT_BODY(1); k += 1;
+            }
+            continue;
+        }
         for (int k = 0; k < m; k++) {
             int t = c->ex_t[o0 + k];
             const float *x = c->X + (size_t)t * c->d + (size_t)cb * 32;
@@ -14798,7 +15169,13 @@ static void arm2_gu_worker_exact(void *c_, int idx) {
 
 static void arm2_dn_worker(void *c_, int idx) {
     arm2_ctx *c = c_;
-    int rg = idx / c->ne, e = idx - rg * c->ne;
+    int rg, e;   /* K-DN-006：任务序同 dn_worker_exact */
+    if (arm2_dn_use_exp(c)) {
+        int cs = c->d >> 2;
+        int ei = idx / cs;
+        rg = idx - ei * cs;
+        e = c->eord ? c->eord[ei] : ei;   /* K-DN-012：均衡装桶（NULL = 现状连续切分） */
+    } else { rg = idx / c->ne;      e = idx - rg * c->ne; }
     int o0 = c->ex_off[e], o1 = c->ex_off[e + 1];
     int m = o1 - o0;
     if (m <= 0) return;
@@ -14841,7 +15218,13 @@ static void arm2_dn_worker(void *c_, int idx) {
 /* 精确轨（actq=0）dn：wf 预计算跨 token 复用；存未加权 acc → combine 内 FMA。 */
 static void arm2_dn_worker_exact(void *c_, int idx) {
     arm2_ctx *c = c_;
-    int rg = idx / c->ne, e = idx - rg * c->ne;
+    int rg, e;
+    if (arm2_dn_use_exp(c)) {
+        int cs = c->d >> 2;
+        int ei = idx / cs;
+        rg = idx - ei * cs;
+        e = c->eord ? c->eord[ei] : ei;   /* K-DN-012：均衡装桶（NULL = 现状连续切分） */
+    } else { rg = idx / c->ne;      e = idx - rg * c->ne; }
     int o0 = c->ex_off[e], o1 = c->ex_off[e + 1];
     int m = o1 - o0;
     if (m <= 0) return;
@@ -14890,6 +15273,59 @@ static void arm2_quant_worker(void *c_, int k) {
     quantize_row_q8_0_act(c->av + (size_t)k * c->ef, c->avq + (size_t)k * c->ef,
                           c->avd + (size_t)k * c->cbe, c->ef);
 }
+/* 立项 K-MOE-007：批式 router GEMM 并行化。按**专家**切分到线程池。
+ * 每个 (t,e) 点积完全独立、其内部 i 升序累加序不变 ⇒ 位级 A≡C。
+ * G4 已默认化（未设 = 1 = 按专家并行）：G3 实测 rout −73.2%（60× 噪声）、
+ * tok −69.4%（57×）、位级 A≡C。逃生舱 `VLLM_MOE_ROUT_MP=0` 回退串行。 */
+typedef struct { const float *router, *X; float *rlg; int ne, nb, d, mp; } arm2_rout_ctx;
+static int arm2_rout_mp_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *s = getenv("VLLM_MOE_ROUT_MP");
+        v = (s && s[0] == '0') ? 0 : 1;   /* G4 默认开（K-MOE-007） */
+        fprintf(stderr, "[MOEROUTMP] router parallel=%s (escape: VLLM_MOE_ROUT_MP=0)\n",
+                v ? "on" : "off");
+    }
+    return v;
+}
+/* G4 条件④：启用条件不满足时**自动回退**串行（并打印）。 */
+static inline int arm2_rout_use_mp(const arm2_rout_ctx *c) {
+    if (!c->mp) return 0;
+    if (c->ne >= 2 && c->nb > 0 && c->d > 0) return 1;
+    static volatile int warned = 0;
+    if (!__atomic_exchange_n(&warned, 1, __ATOMIC_RELAXED))
+        fprintf(stderr, "[MOEROUTMP] auto-fallback to serial (ne=%d nb=%d d=%d)\n",
+                c->ne, c->nb, c->d);
+    return 0;
+}
+static void arm2_rout_worker(void *c_, int e) {
+    arm2_rout_ctx *c = c_;
+    const int nb = c->nb, d = c->d;
+    const float *rw = c->router + (size_t)e * d;
+    int t = 0;
+    for (; t + 4 <= nb; t += 4) {
+        const float *x0 = c->X + (size_t)(t + 0) * d;
+        const float *x1 = c->X + (size_t)(t + 1) * d;
+        const float *x2 = c->X + (size_t)(t + 2) * d;
+        const float *x3 = c->X + (size_t)(t + 3) * d;
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        for (int i = 0; i < d; i++) {
+            float r = rw[i];
+            s0 += r * x0[i]; s1 += r * x1[i];
+            s2 += r * x2[i]; s3 += r * x3[i];
+        }
+        c->rlg[(size_t)(t + 0) * c->ne + e] = s0;
+        c->rlg[(size_t)(t + 1) * c->ne + e] = s1;
+        c->rlg[(size_t)(t + 2) * c->ne + e] = s2;
+        c->rlg[(size_t)(t + 3) * c->ne + e] = s3;
+    }
+    for (; t < nb; t++) {
+        const float *xt = c->X + (size_t)t * d;
+        float s = 0.0f;
+        for (int i = 0; i < d; i++) s += rw[i] * xt[i];
+        c->rlg[(size_t)t * c->ne + e] = s;
+    }
+}
 /* 返回 1=已处理，0=不适用（调用方回落逐 token）。 */
 static int st_moe_ffn_sparse_q4_batch_arm(const STModelWeights *w, int l, int nb,
                                           const float *X, float *Y) {
@@ -14933,7 +15369,15 @@ static int st_moe_ffn_sparse_q4_batch_arm(const STModelWeights *w, int l, int nb
     double t_entry = st_now_sec();   /* ARM：moe_now 仅 x86 区定义，用平台头时钟 */
     const float *router = w->moe_router + (size_t)l * ne * d;
     /* 批式 router（同 x86 2a-e）：专家外层 → 权重每层只读一次；token 内层 4 路展开，
-     * 每条链内部 i 升序、运算形式与逐 token 路径逐字同形 → per-(t,e) 位级同值。 */
+     * 每条链内部 i 升序、运算形式与逐 token 路径逐字同形 → per-(t,e) 位级同值。
+     * 立项 K-MOE-007：该段**完全串行**（实测占 `tok` 的 94.7%、MoE 的 4.2%）；
+     * 开启时按**专家**切分到线程池（worker 逐字同形 ⇒ 位级 A≡C）。 */
+    arm2_rout_ctx rc;
+    rc.router = router; rc.X = X; rc.rlg = rlg;
+    rc.ne = ne; rc.nb = nb; rc.d = d; rc.mp = arm2_rout_mp_on();
+    if (arm2_rout_use_mp(&rc)) {
+        vllm_tp_parfor(0, ne, arm2_rout_worker, &rc);
+    } else {
     for (int e = 0; e < ne; e++) {
         const float *rw = router + (size_t)e * d;
         int t = 0;
@@ -14960,6 +15404,8 @@ static int st_moe_ffn_sparse_q4_batch_arm(const STModelWeights *w, int l, int nb
             rlg[(size_t)t * ne + e] = s;
         }
     }
+    }
+    double t_r0 = getenv("VLLM_MOE_2B_SEG") ? st_now_sec() : 0.0;   /* K-MOE-007 探针：router 段末 */
     for (int t = 0; t < nb; t++) {
         const float *xt = X + (size_t)t * d;
         quantize_row_q8_0_act(xt, xq + (size_t)t * d, xd + (size_t)t * nbG, d);
@@ -14987,6 +15433,16 @@ static int st_moe_ffn_sparse_q4_batch_arm(const STModelWeights *w, int l, int nb
         float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
         for (int k = 0; k < tk; k++) pr[(size_t)t*tk+k] *= inv;
     }
+    /* 立项 K-L0-004 (N1)：批式（prefill）路径也累积 router 热度（ARM 镜像，
+     * 与 x86 st2 侧同语义）。默认关（仅 VLLM_EW_HEAT=1）⇒ 零行为改动。 */
+    if (g_moe_heat_on && g_moe_heat_ne > 0 && l >= 0 && l < g_moe_heat_nl) {
+        uint32_t *h = g_moe_heat + (size_t)l * (size_t)g_moe_heat_ne;
+        for (int t = 0; t < nb; t++)
+            for (int j = 0; j < tk; j++) {
+                int e = sel[(size_t)t * tk + j];
+                if (e >= 0 && e < g_moe_heat_ne) h[e]++;
+            }
+    }
     /* 与逐 token 路径同源的专家预取（只动页表/页缓存，浮点零改动）。
      * 形态 A 守卫：批式期间抑制专家级同步（批内激活集≈全体专家）。默认关时为空操作。 */
     vqf_sa_set_batch(1);
@@ -15000,7 +15456,12 @@ static int st_moe_ffn_sparse_q4_batch_arm(const STModelWeights *w, int l, int nb
     ctx.nb = nb; ctx.tk = tk; ctx.d = d; ctx.ef = ef; ctx.nbG = nbG;
     ctx.ggB = ggB; ctx.gdB = gdB; ctx.ge4 = ge4; ctx.cbe = ef >> 5;
     ctx.verify = (getenv("VLLM_MOE_2B_VERIFY") && getenv("VLLM_MOE_2B_VERIFY")[0] == '1') ? 1 : 0;
-    ctx.actq = moe_q4_actq_ok();
+    ctx.actq_gu = arm2_actq_gu_on();   /* K-ACTQ-009：gu 门（未设则继承 VLLM_ACTQ） */
+    ctx.actq_dn = arm2_actq_dn_on();   /* K-ACTQ-009：dn 门（未设则继承 VLLM_ACTQ） */
+    ctx.ilv_arm = arm2_ilv_on();   /* K-PF-005 L1：gu k 方向交错深度（默认 0=关） */
+    ctx.dn_order = arm2_dn_order_on();   /* K-DN-006：dn 任务序（默认 0=现状行组主序） */
+    ctx.gu_order = arm2_gu_order_on();   /* K-GU-010：gu 任务序（G2 默认 0=现状行组主序） */
+    ctx.eord = NULL;                     /* K-DN-012：dn 均衡装桶（默认关，见下） */
     /* 专家→(token,rank) 归属表（确定性：按 token/rank 升序填） */
     memset(ex_off, 0, ((size_t)ne + 1) * sizeof(int));
     for (size_t k = 0; k < nsel; k++) {
@@ -15017,21 +15478,56 @@ static int st_moe_ffn_sparse_q4_batch_arm(const STModelWeights *w, int l, int nb
             ex_t[pos] = t; ex_j[pos] = j;
         }
     memset(av, 0, nsel * (size_t)ef * sizeof(float));
+    /* K-DN-012：dn 均衡装桶（位级安全，只改任务映射）。G4 默认**开**；`VLLM_MOE_DN_BAL=0` 逃生舱。
+     * 每层重算（m_e 逐层变化）；条件不满足自动回退（不建 eord ⇒ ctx.eord 保持 NULL）。 */
+    int *eord_buf = NULL;
+    {
+        int nt_dn = vllm_tp_threads();
+        int want = arm2_dn_bal_on();
+        int ok = want && ctx.dn_order && !ctx.actq_dn &&
+                 nt_dn >= 2 && nt_dn <= 8 && ne >= nt_dn && (ne % nt_dn) == 0;
+        if (want && !ok) {   /* 反静默回退：请求了 ON 但外层条件不满足，必须打印原因 */
+            static volatile int warned2 = 0;
+            if (!__atomic_exchange_n(&warned2, 1, __ATOMIC_RELAXED))
+                fprintf(stderr, "[MOEDNBAL] NOT engaged (dn_order=%d actq_dn=%d nt=%d ne=%d)"
+                                " -> contiguous\n", ctx.dn_order, ctx.actq_dn, nt_dn, ne);
+        }
+        if (ok) {
+            eord_buf = (int *)malloc((size_t)ne * sizeof(int));
+            if (eord_buf) {
+                double bg = arm2_dn_build_eord(ex_off, ne, nt_dn, eord_buf);
+                if (bg > 0.0) {
+                    ctx.eord = eord_buf;
+                    static volatile int bal_logged = 0;
+                    /* K-DN-012 G3：默认只打首层；`VLLM_MOE_DN_BAL_VERBOSE=1` 打**逐层**不均
+                     * （仅第 0 层的读数不足以解释端到端效应，见 G3 记录）。 */
+                    const char *vb = getenv("VLLM_MOE_DN_BAL_VERBOSE");
+                    int verbose = (vb && vb[0] == '1');
+                    if (verbose || !__atomic_exchange_n(&bal_logged, 1, __ATOMIC_RELAXED))
+                        fprintf(stderr, "[MOEDNBAL] dn bal ENGAGED l=%d nt=%d KC=%d imbalance %.3f -> %.3f\n",
+                                l, nt_dn, ne / nt_dn, bg, 1.0);
+                } else {
+                    free(eord_buf); eord_buf = NULL;
+                }
+            }
+        }
+    }
     int seg = (getenv("VLLM_MOE_2B_SEG") && getenv("VLLM_MOE_2B_SEG")[0] == '1') ? 1 : 0;
     double s0 = seg ? st_now_sec() : 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0;
-    vllm_tp_parfor(0, ne * ge4, ctx.actq ? arm2_gu_worker : arm2_gu_worker_exact, &ctx);
+    vllm_tp_parfor(0, ne * ge4, ctx.actq_gu ? arm2_gu_worker : arm2_gu_worker_exact, &ctx);
     if (seg) s1 = st_now_sec();
-    if (ctx.actq) {
+    if (ctx.actq_dn) {   /* av 量化仅为 dn 轨服务 ⇒ 由 dn 门决定（K-ACTQ-009） */
         vllm_tp_parfor(0, (int)nsel, arm2_quant_worker, &ctx);
     }
     if (seg) s2 = st_now_sec();
-    vllm_tp_parfor(0, ne * (d >> 2), ctx.actq ? arm2_dn_worker : arm2_dn_worker_exact, &ctx);
+    vllm_tp_parfor(0, ne * (d >> 2), ctx.actq_dn ? arm2_dn_worker : arm2_dn_worker_exact, &ctx);
     if (seg) s3 = st_now_sec();
+    free(eord_buf);   /* K-DN-012：dn 用毕即可释放（combine 不读 eord） */
     vllm_tp_parfor(0, nb, arm2_combine_worker, &ctx);
     if (seg) {
         s4 = st_now_sec();
-        printf("[2BSEG-ARM] l=%d tok=%.2f gu=%.2f q=%.2f dn=%.2f cmb=%.2f (ms)\n",
-               l, (s0 - t_entry) * 1e3, (s1 - s0) * 1e3, (s2 - s1) * 1e3,
+        printf("[2BSEG-ARM] l=%d tok=%.2f rout=%.2f gu=%.2f q=%.2f dn=%.2f cmb=%.2f (ms)\n",
+               l, (s0 - t_entry) * 1e3, (t_r0 - t_entry) * 1e3, (s1 - s0) * 1e3, (s2 - s1) * 1e3,
                (s3 - s2) * 1e3, (s4 - s3) * 1e3);
         fflush(stdout);
     }
@@ -15577,6 +16073,7 @@ int st_moe_ep_selftest(STModelWeights *w, int nranks_max) {
      * 若强制失效，宁可显式 FAIL 也不能让 M2 变成「s16 vs 精确轨」的假对拍。 */
     int env_blocked = moe_q4_actq_ok();
     if (actq16_env()) env_blocked = 1;
+    if (actq_dec_on()) env_blocked = 1;   /* K-ACTQ-013：decode 近似轨也须显式关闭才能验证精确轨 */
 #if defined(__AVX2__) && ST_ARCH_X86
     if (moe_fuse_env() || dn_d2_env()) env_blocked = 1;
 #endif
@@ -17923,6 +18420,24 @@ static void spec_verify_attention(STQwenInferenceState *st, int l,
     st->attn_buf = save_a;
 }
 
+/* ================================================================
+ * K-EMB-001：句子向量（embedding）取值钩子
+ *
+ * 官方 Qwen3-Embedding 的 recipe = **last-token pooling + L2 normalize**
+ * （1_Pooling/config.json: pooling_mode_lasttoken=true；modules.json 的
+ * 2_Normalize）。引擎在 prefill 末位本就算出 `normed_b` = 末位 token 的
+ * final-norm 隐状态（与送 lm_head 的同一向量），正是该 pooling 的输入。
+ *
+ * 用法：调用方在 prefill 前 `st_embed_request(out, dim)`；prefill 收尾时把
+ * L2 归一化结果写入 out[0..dim) 并**自动清空钩子（一次性）**，避免污染后续
+ * 请求。未设置时对生成路径**零行为改变**；lm_head 仍照常计算（为了不改
+ * 现有控制流与日志）。
+ * ================================================================ */
+static float *g_embed_out = NULL;
+static int    g_embed_dim = 0;
+
+void st_embed_request(float *out, int dim) { g_embed_out = out; g_embed_dim = dim; }
+
 int st_qwen_model_prefill_batch(STQwenInferenceState *st,
                                   const int *token_ids, int n_tokens)
 {
@@ -17959,6 +18474,24 @@ int st_qwen_model_prefill_batch(STQwenInferenceState *st,
     double t_qkv = 0.0, t_o = 0.0, t_gu = 0.0, t_down = 0.0;
     double t0;
     double t_pf0 = st_now_sec();   /* prefill profile base (VLLM_DEC_PROF) */
+
+    /* K-EMB-002 Phase 2：embedding 无 decode ⇒ 跳过**只为 decode 服务**的开销
+     * （imp_head 注意力质量图 / KV int8 压缩包 / 末尾 LM head logits）。触发条件
+     * 限定 embedding（`g_embed_out` 已登记）⇒ 对 chat 路径零影响；对向量输出**位级
+     * 无影响**（attention 走 f32 正典，imp_head/logits 仅 decode 用）。
+     * env `VLLM_EMB_SKIP_WASTE`，**默认 1（G4 已默认化 2026-10-11；`=0` 为逃生舱）**。 */
+    int emb_skip = 0;
+    int emb_skip_kvq8 = 0;
+    if (g_embed_out) {
+        static int g_esw = -1;
+        if (g_esw < 0) { const char *e = getenv("VLLM_EMB_SKIP_WASTE"); g_esw = (e && e[0] == '0') ? 0 : 1; }
+        emb_skip = g_esw;
+        /* KV q8 包仅在被 int8 注意力或 nof32 正典读取时才需要 ⇒ 否则可跳。 */
+        emb_skip_kvq8 = emb_skip && !g_kv_nof32 && !st_attn_i8_enabled();
+        if (emb_skip)
+            fprintf(stderr, "[EMB-SKIP] waste-skip engaged (imp_head=NULL lmhead=skip kvq8=%d)\n",
+                    emb_skip_kvq8);
+    }
 
     if (n_tokens <= 0 || !token_ids) return 0;
     if (!w->has_q8 && !w->has_q4) {
@@ -18295,7 +18828,7 @@ int st_qwen_model_prefill_batch(STQwenInferenceState *st,
                         }
                     }
                 }
-                if (st->use_kv_q8) {
+                if (st->use_kv_q8 && !emb_skip_kvq8) {
                     int8_t *kdst = kv_row_i8(st->k_cache_q8[l], cl, kv_dim, st->kv_bs);
                     int8_t *vdst = kv_row_i8(st->v_cache_q8[l], cl, kv_dim, st->kv_bs);
                     kv_quantize_per_head(kdst, vdst,
@@ -18331,6 +18864,7 @@ int st_qwen_model_prefill_batch(STQwenInferenceState *st,
                 t0 = st_now_sec();
                 float scale = 1.0f / sqrtf((float)hd);
                 int seq_len = st->cache_len[l];
+                float *imp_h = emb_skip ? NULL : st->imp_head;   /* K-EMB-002：embedding 免质量图累加 */
                 if (seq_len > seq_stride)
                     fprintf(stderr, "[KV-OOB] pack seq_len=%d > stride=%d l=%d\n",
                             seq_len, seq_stride, l);
@@ -18417,7 +18951,7 @@ int st_qwen_model_prefill_batch(STQwenInferenceState *st,
                                               v8_pack, vs8_pack,
                                               nb, prev_len, seq_stride, nh, nkv, hd, scale,
                                               st->scores_buf, st->max_kv_slots,
-                                              st->imp_head);
+                                              imp_h);
                 } else
 #endif
                 if (!vexact && sparse_pf_v && g_sparse_attn &&
@@ -18428,12 +18962,12 @@ int st_qwen_model_prefill_batch(STQwenInferenceState *st,
                                                   g_sparse_block,
                                                   st_sparse_pf_k_eff((seq_len + g_sparse_block - 1) / g_sparse_block),
                                                   g_sparse_probe,
-                                                  st->imp_head);
+                                                  imp_h);
                 } else if (!vexact) {
                     st_attn_batched_packed(att, qb, k_pack, v_pack, nb, prev_len,
                                            seq_stride, nh, nkv, hd, scale,
                                            st->scores_buf, st->max_kv_slots,
-                                           st->imp_head);
+                                           imp_h);
                 }
                 GUARD_CHK(g_cn_imphead, imphead, "imp_head", l, tok_offset + nb);
                 GUARD_CHK(g_cn_scores, scores2, "scores_buf", l, tok_offset + nb);
@@ -18720,6 +19254,7 @@ int st_qwen_model_prefill_batch(STQwenInferenceState *st,
     /* Phase 1.5: reduce per-head attention mass into the per-token importance
      * potential consumed by sparse decode selection. O(nh * seq_len), done once
      * per prefill. Deterministic (serial, fixed order). */
+    if (!emb_skip)   /* K-EMB-002：embedding 无 decode ⇒ 质量图无用，免归约 */
     {
         const size_t stride = (size_t)st->max_kv_slots;
         /* P3：下界取 pf_base。本轮只对 [pf_base, seq_len) 这几个 query 做了
@@ -18775,10 +19310,22 @@ int st_qwen_model_prefill_batch(STQwenInferenceState *st,
     } else {
         float *last_hidden = hidden_b + (size_t)(last_nb - 1) * d;
         dyn_rms_norm(normed_b, last_hidden, w->final_norm, d, eps);
-        if (use_q4 && w->q4_lm_weight)
-            dyn_matvec_q4_q8(st->logits, w->q4_lm_weight, normed_b, vc, d);
-        else
-            dyn_matvec_q8(st->logits, w->q8_lm_weight, normed_b, vc, d);
+        if (!emb_skip) {   /* K-EMB-002：embedding 不产 token ⇒ LM head logits 无用 */
+            if (use_q4 && w->q4_lm_weight)
+                dyn_matvec_q4_q8(st->logits, w->q4_lm_weight, normed_b, vc, d);
+            else
+                dyn_matvec_q8(st->logits, w->q8_lm_weight, normed_b, vc, d);
+        }
+    }
+
+    /* K-EMB-001 取值：末位 final-norm 隐状态 → L2 归一化 → 一次性拷出。 */
+    if (g_embed_out && g_embed_dim > 0) {
+        int en = g_embed_dim < d ? g_embed_dim : d;
+        double ss = 0.0;
+        for (int i = 0; i < en; i++) ss += (double)normed_b[i] * normed_b[i];
+        float inv = (ss > 0.0) ? (float)(1.0 / sqrt(ss)) : 0.0f;
+        for (int i = 0; i < en; i++) g_embed_out[i] = normed_b[i] * inv;
+        g_embed_out = NULL; g_embed_dim = 0;
     }
 
     /* 诊断（与 decode 的 [LTOP] 对称）：prefill 末位 top-8 原始 logits。

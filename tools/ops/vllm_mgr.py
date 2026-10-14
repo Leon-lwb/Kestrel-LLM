@@ -33,6 +33,28 @@ Config file schema (written by the admin page):
   "session_dir": ""       -> --session-dir（留空 = 关闭服务端会话存储）
   "session_limit": 0      -> --session-limit（>0 时注入；0 = 引擎默认 1024）
   "audit_log": ""         -> --audit-log（留空 = 用 <session_dir>/admin_audit.jsonl）
+组件配置（K-ADMIN-001；由管理页 /admin/{kb,laya,yolo} 写入，各自独立成页）：
+  "embed_model": ""       -> --embed-model（向量模型目录；留空 = 复用主模型）
+  "kb_root": ""           -> --kb-root（知识库根目录，管理页浏览 .vkb）
+  "laya_pack": ""         -> --laya-pack（Laya 决策权重包目录）
+  "yolo_model": ""        -> --yolo-model（检测模型，VQF v4 或 .rknn）
+  "yolo_backend": "vqf"   -> --yolo-backend（vqf | rknn）
+  "rknn_lib": ""          -> --rknn-lib（librknnrt.so 路径，rknn 后端用）
+  "yolo_conf": 0.0        -> --yolo-conf（>0 时注入）
+  "yolo_iou": 0.0         -> --yolo-iou（>0 时注入）
+  "yolo_core_mask": 0     -> --yolo-core-mask（>0 时注入）
+视频源检测（K-E2E-005；YOLO 卡片下配置，留空/0 = 不注入）：
+  "yolo_video_src": ""    -> --yolo-video-src（默认视频源：file|dir|http://|rtsp://）
+  "yolo_video_frames": 0  -> --yolo-video-frames（/v1/detect_video 默认抽帧数）
+  "yolo_video_interval_ms": 0 -> --yolo-video-interval-ms（常驻拉流抽帧间隔）
+云边协同（云端上游回退；默认 never = 不注入，零回归）：
+  "cloud_endpoint": ""    -> --cloud-endpoint（http://host[:port]；仅明文 http）
+  "cloud_model": ""       -> --cloud-model（转发时覆盖的模型名）
+  "cloud_fallback": "never" -> --cloud-fallback（never | on-unready | always）
+  凭据不走本文件：请用 env VLLM_CLOUD_KEY（cfg["env"]）或手工 --cloud-key
+拒答与转人工（K-E2E-004；由管理页 /admin/kb 写入）：
+  "kb_abstain": 0        -> --kb-abstain（0 = 关；>0 时 /v1/rag 证据分低于此值即拒答）
+  "handoff_url": ""      -> --handoff-url（拒答/escalate 时 POST 通知外部工单系统；留空 = 不回调）
 规则包需离线预处理：vllm_kestrel --serve --auto-load --model <dir>
   --rulebook-dir <dir> --rulebook-build <手册文件> --rulebook-id <id> ...
 
@@ -102,6 +124,11 @@ def build_cmd(cfg, bin_):
            "--threads", str(int(cfg.get("threads", 8))),
            "--max-queued", str(int(cfg.get("max_queued", 16))),
            "--min-free-mb", str(int(cfg.get("min_free_mb", 2048)))]
+    # 对外模型标识（/v1/models、OpenAI 请求的 model 字段）。缺省时引擎回落到内置
+    # 默认名，会与实际模型不符 —— 因此管理页的「模型 ID」写入 config.json 后在此透传。
+    _mi = str(cfg.get("model_id") or "").strip()
+    if _mi:
+        cmd += ["--model-id", _mi]
     # 连续批处理（--batch-max N，0/1 = 关，上限 32）：多用户并发档。
     _bm = int(cfg.get("batch_max") or 0)
     if _bm > 0:
@@ -183,6 +210,82 @@ def build_cmd(cfg, bin_):
     mp = cfg.get("min_p")
     if mp:
         cmd += ["--min-p", str(float(mp))]
+    # K-ADMIN-001：协作/感知组件配置（由管理页 /admin/{kb,laya,yolo} 写入 config.json，
+    # 保存后重启生效）。全部为可选项，留空即不注入对应 CLI 参数。
+    _em = str(cfg.get("embed_model") or "").strip()
+    if _em:
+        cmd += ["--embed-model", _em]
+    _kr = str(cfg.get("kb_root") or "").strip()
+    if _kr:
+        cmd += ["--kb-root", _kr]
+    _lp = str(cfg.get("laya_pack") or "").strip()
+    if _lp:
+        cmd += ["--laya-pack", _lp]
+    _ym = str(cfg.get("yolo_model") or "").strip()
+    if _ym:
+        cmd += ["--yolo-model", _ym]
+    _yb = str(cfg.get("yolo_backend") or "").strip()
+    if _yb in ("rknn", "vqf"):
+        cmd += ["--yolo-backend", _yb]
+    _rl = str(cfg.get("rknn_lib") or "").strip()
+    if _rl:
+        cmd += ["--rknn-lib", _rl]
+    try:
+        _ycf = float(cfg.get("yolo_conf") or 0)
+    except (TypeError, ValueError):
+        _ycf = 0.0
+    if _ycf > 0:
+        cmd += ["--yolo-conf", str(_ycf)]
+    try:
+        _yiou = float(cfg.get("yolo_iou") or 0)
+    except (TypeError, ValueError):
+        _yiou = 0.0
+    if _yiou > 0:
+        cmd += ["--yolo-iou", str(_yiou)]
+    try:
+        _ycm = int(cfg.get("yolo_core_mask") or 0)
+    except (TypeError, ValueError):
+        _ycm = 0
+    if _ycm > 0:
+        cmd += ["--yolo-core-mask", str(_ycm)]
+    # K-E2E-005 视频源检测：默认视频源 + 抽帧参数（留空/0 = 不注入，零回归）
+    _yvs = str(cfg.get("yolo_video_src") or "").strip()
+    if _yvs:
+        cmd += ["--yolo-video-src", _yvs]
+    try:
+        _yvf = int(cfg.get("yolo_video_frames") or 0)
+    except (TypeError, ValueError):
+        _yvf = 0
+    if _yvf > 0:
+        cmd += ["--yolo-video-frames", str(_yvf)]
+    try:
+        _yvi = int(cfg.get("yolo_video_interval_ms") or 0)
+    except (TypeError, ValueError):
+        _yvi = 0
+    if _yvi > 0:
+        cmd += ["--yolo-video-interval-ms", str(_yvi)]
+    # 云边协同：云端上游回退（默认不注入 = never，零回归）。
+    # 凭据（Bearer）不走 config.json：请用 env VLLM_CLOUD_KEY（见 cfg["env"] 透传）。
+    _ce = str(cfg.get("cloud_endpoint") or "").strip()
+    if _ce:
+        cmd += ["--cloud-endpoint", _ce]
+        _cm = str(cfg.get("cloud_model") or "").strip()
+        if _cm:
+            cmd += ["--cloud-model", _cm]
+        _cfb = str(cfg.get("cloud_fallback") or "never").strip()
+        if _cfb in ("on-unready", "always"):
+            cmd += ["--cloud-fallback", _cfb]
+    # 拒答与转人工（K-E2E-004）：kb_abstain>0 才注入（0 = 关闭，零回归）；
+    # handoff_url 留空 = 不回调外部系统。
+    try:
+        _kab = float(cfg.get("kb_abstain") or 0)
+    except (TypeError, ValueError):
+        _kab = 0.0
+    if _kab > 0:
+        cmd += ["--kb-abstain", str(_kab)]
+    _hu = str(cfg.get("handoff_url") or "").strip()
+    if _hu:
+        cmd += ["--handoff-url", _hu]
     # Load-on-use / unload-when-idle (用时加载 / 不用时卸载): the model is
     # loaded on the first request and auto-unloaded after idle seconds.
     if cfg.get("auto_load"):
@@ -196,6 +299,10 @@ def build_cmd(cfg, bin_):
         # Manual mode: the engine starts with the model NOT loaded; the
         # admin page triggers the load (VQF 单文件，量化由文件固化).
         cmd.append("--no-auto-load")
+    else:
+        # auto_start = 常驻：supervisor 拉起引擎并同步加载模型（引擎侧
+        # g_serve_auto_load 默认为 0，必须显式 --auto-load 才会在启动时加载）。
+        cmd.append("--auto-load")
     return cmd
 
 
@@ -563,7 +670,7 @@ def supervise_loop(stop_event):
       * auto_relaunch the engine when restart.flag is present and the engine
         is down (the admin page arms it before shutting the engine down);
       * if config.auto_start is enabled, automatically start the engine when
-        it is down (with the model loaded: no --no-auto-load is passed)."""
+        it is down (build_cmd then adds --auto-load so the model loads too)."""
     while not stop_event.wait(2.0):
         try:
             if engine_pids():

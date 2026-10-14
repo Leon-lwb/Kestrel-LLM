@@ -513,6 +513,12 @@ void st_qwen_model_forward(STQwenInferenceState *st, int token_id);
 int st_qwen_model_prefill_batch(STQwenInferenceState *st,
                                 const int *token_ids, int n_tokens);
 
+/* K-EMB-001：句子向量（embedding）取值钩子。调用方在 prefill 前登记 out/dim，
+ * prefill 收尾把**末位 token 的 final-norm 隐状态做 L2 归一化**后写入
+ * out[0..dim)（官方 Qwen3-Embedding 的 last-token pooling + Normalize），
+ * 然后自动清空（一次性）。未登记时对生成路径零行为改变。 */
+void st_embed_request(float *out, int dim);
+
 /* MoE 专家级驻留：真实 router 热度采集（EW 标定 H 用）。
  * reset 清零并开启（FFN 内按层累计被选中专家）；save 落盘 "l:e:count"。 */
 void st_moe_heat_reset(const STModelWeights *w);

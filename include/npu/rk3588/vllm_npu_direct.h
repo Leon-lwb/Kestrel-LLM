@@ -104,12 +104,19 @@ int vllm_npu_direct_info(vllm_npu_direct_t *d, uint32_t *hw_version,
  * pointer-reuse after an engine-side evict. Capacity is bounded; on overflow
  * the oldest slot is evicted (LRU ring).
  * Returns 0 on success, nonzero on failure (caller falls back to CPU).
+ *
+ * nt_hint (0 = default): N per NPU pass. The default (1024) suits a few large
+ * GEMMs; many small GEMMs (conv-as-GEMM) instead want a SMALLER Nt combined
+ * with a LARGER G so each call submits fewer (n_tiles * K/G) passes - the
+ * submit count, not the FLOPs, dominates that regime (~0.5 ms/submit). Valid
+ * range 64..1024, multiple of the N alignment (int8 32 / int4 64); otherwise
+ * the default is used. Env VLLM_NPU_NT still overrides when nt_hint == 0.
  */
 int vllm_npu_direct_gemm_gw(vllm_npu_direct_t *d, float *out,
                             const int8_t *Aq, const float *a_scale,
                             const int8_t *Wq, const float *b_scale,
                             int M, int N, int K, int G, int prec,
-                            uint64_t wkey);
+                            uint64_t wkey, int nt_hint);
 
 /**
  * Self-test: opens the device, allocates a BO, runs a small group-wise matmul
@@ -117,6 +124,51 @@ int vllm_npu_direct_gemm_gw(vllm_npu_direct_t *d, float *out,
  * pass (or the device is absent), nonzero on a failed check.
  */
 int vllm_npu_direct_selftest(vllm_npu_direct_t *d, const char *sdk_tag);
+
+/**
+ * M3 Phase-1: self-contained native regular-convolution calibration.
+ *
+ * Opens its OWN device handle (independent of vllm_npu_t), runs one small
+ * regular 3x3 convolution (C=16, H=W=8, stride=1, pad=1, groups=1, OC=16,
+ * int8 feature/weight, int32 output) through the CNA CONV_MODE=0 path and
+ * compares it element-wise against a CPU oracle (standard int32 accumulate,
+ * no quantisation scaling). Prints `[NPU-CONV-CALIB] ... PASS/FAIL
+ * max|Δ|=...`. The calibrated matmul path is NOT touched.
+ *
+ * Returns 0 on PASS (or when the rknpu node is absent -> SKIP), nonzero on a
+ * failed check. On submit failure it fails loudly and does NOT retry.
+ */
+int vllm_npu_direct_conv_calib(int verbosity, int core_mask);
+
+/**
+ * M3 Phase-2: reusable native regular-convolution entry (single submit).
+ *
+ * Reuses the Phase-1 geometry. The caller pre-packs:
+ *   - feat_q: NC1HWC2 (C2=16) int8 feature [C_al][Hband][W], C_al % 16 == 0;
+ *             banding/halo/zero-padding is the caller's responsibility, and
+ *             the geometry passed here must satisfy
+ *             OW = (W + 2*pad - KW)/stride + 1, OH_band = (Hband + 2*pad -
+ *             KH)/stride + 1  (a pre-padded band uses pad == 0).
+ *   - wq: signed-int8 weight cube for OC channels (see
+ *         vllm_npu_direct_pack_weight_conv), already sliced for the OC band;
+ *         oc grouping is LOCAL to this call (oc 0..OC-1).
+ * Runs ONE CNA CONV_MODE=0 pass and de-interleaves the DPU int32 cube back to
+ * out[oc*OH_band*OW + oh*OW + ow] (raw accumulator, no scaling). `pad` is the
+ * hardware symmetric top/left pad (0 when the caller pre-pads).
+ *
+ * Returns 0 on success. Any nonzero -> the caller MUST fall back (no retry on
+ * a failed submit: that can wedge the 0.9.x driver).
+ */
+int vllm_npu_direct_conv_i32(vllm_npu_direct_t *d, int32_t *out,
+                             const int8_t *feat_q, const int8_t *wq,
+                             int C_al, int Hband, int W,
+                             int KH, int KW, int stride, int pad,
+                             int OH_band, int OW, int OC, int OC_off,
+                             int wbank_hint);
+
+/** Feature [C][H][W] int8 (C = C_al, multiple of 16) -> NC1HWC2 C2=16. */
+void vllm_npu_direct_pack_feature_conv(int8_t *dst, const int8_t *feat,
+                                       int C, int H, int W);
 
 #ifdef __cplusplus
 }

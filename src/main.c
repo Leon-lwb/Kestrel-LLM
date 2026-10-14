@@ -18,10 +18,14 @@
 #include "vllm_safetensors.h"
 #include "vqf.h"
 #include "vllm_vision.h"
+#include "vllm_laya.h"      /* K-LAYA-001：Laya 决策模型（ModernBERT 编码器 + 决策头） */
+#include "vllm_yolo.h"      /* K-YOLO-001：YOLO 目标检测（自有格式 VQF v4） */
+#include "vllm_kvstore.h"   /* K-COLLAB-001 P0：向量库（记忆层核心存储，零依赖） */
 #include "vllm_media.h"
 #include "vllm_tokenizer_qwen.h"
 #include "vllm_platform.h"
 #include "vllm_npu.h"
+#include "vllm_npu_direct.h"   /* K-YOLO-001 M3：--npu-calib-conv 原生卷积自检入口 */
 #include "vllm_http.h"
 #include "vllm_server.h"
 #include "vllm_rulebook.h"   /* 规则包注册中心：预置命名上下文（--rulebook-dir） */
@@ -37,6 +41,10 @@
 #include <math.h>
 #include <locale.h>   /* setlocale */
 #include "vllm_util.h"
+#if defined(_WIN32)
+#include <io.h>         /* _setmode（--embed-stdin 二进制读取） */
+#include <fcntl.h>      /* _O_BINARY */
+#endif
 #if !defined(_WIN32)
 #include <sys/mman.h>   /* 文件映射（VQF mmap 诊断/页控制） */
 #include <unistd.h>     /* ftruncate */
@@ -540,6 +548,48 @@ static int  g_serve_port = -1;
 static int  g_serve_port_explicit = 0;  /* set only by --port (no interactive prompt) */
 static const char *g_serve_model_dir = NULL;
 static int g_stream_test = 0;   /* --stream-test: AirLLM 型分层驻留验证 */
+
+/* K-EMB-001：句子向量（embedding）CLI 入参 */
+static const char *g_embed_text = NULL;   /* --embed <text>    单一输入 */
+static const char *g_embed_file = NULL;   /* --embed-file <p>  每行一个输入 */
+static const char *g_embed_out  = NULL;   /* --embed-out <p>   向量落盘（每行一个） */
+static int g_embed_stdin = 0;             /* --embed-stdin：stdin 整段为一个输入（保 UTF-8，规避 Windows argv ANSI 损坏） */
+static const char *g_embed_model = NULL;  /* --embed-model <dir>：serve 专用 embedding 模型（NULL=复用主模型） */
+
+/* K-COLLAB-001 P0：向量库自测 */
+static int g_kb_test = 0;                 /* --kb-test：向量库核心自测（合成向量 J1 + 持久化 round-trip） */
+static const char *g_kb_path  = NULL;     /* --kb-build/--kb-search：向量库文件路径 */
+static const char *g_kb_docs  = NULL;     /* --kb-docs：meta 文件（每行一条 doc 文本） */
+static const char *g_kb_vecs  = NULL;     /* --kb-vecs：向量文件（每行 dim 个 float，与 docs 行对齐） */
+static const char *g_kb_query = NULL;     /* --kb-query：query 向量文件（单行 dim 个 float） */
+static int g_kb_k = 5;                    /* --kb-k：检索 top-k（默认 5） */
+
+/* K-LAYA-001：Laya 决策模型（非自回归，ModernBERT 编码器 + 决策头） */
+static const char *g_laya_pack  = NULL;   /* --laya-pack <dir>   laya_f16.bin + manifest 所在目录 */
+static const char *g_laya_cases = NULL;   /* --laya-cases <file> 用例文件（qtype n ids... nm markers...） */
+static const char *g_laya_tok   = NULL;   /* --laya-tok <dir>    ModernBERT 分词器目录（vocab.bin+merges.bin） */
+static int         g_laya_decide = 0;     /* --laya-decide      端到端决策（--laya-pack 目录 + --laya-cases 请求 JSON） */
+/* K-YOLO-001：YOLO 目标检测（自有格式 VQF v4） */
+static const char *g_yolo_model = NULL;   /* --yolo-model <x.vqf> */
+static int         g_yolo_backend = 0;    /* K-YOLO-003 --yolo-backend: 0=VQF v4(默认), 1=官方 .rknn */
+static const char *g_rknn_lib = NULL;     /* K-YOLO-003 --rknn-lib <librknnrt.so> */
+static int         g_yolo_core_mask = 0;  /* K-YOLO-003 --yolo-core-mask（0=runtime 默认） */
+static vllm_npu_t *g_npu_rknn = NULL;     /* yolo_backend==1 时的 RKNN 句柄（见 vllm_serve_main） */
+static const char *g_kb_root = NULL;      /* K-ADMIN-001 --kb-root <dir>：知识库根目录（管理页浏览 .vkb） */
+static const char *g_cloud_endpoint = NULL; /* 云边协同 --cloud-endpoint http://host[:port]（NULL=关） */
+static const char *g_cloud_model = NULL;  /* --cloud-model：转发时覆盖的 model 名（可选） */
+static const char *g_cloud_key = NULL;    /* --cloud-key：Authorization: Bearer 令牌（可选） */
+static int         g_cloud_fallback = 0;  /* --cloud-fallback 0=never(默认) 1=on-unready 2=always */
+static float       g_kb_abstain = 0.f;    /* K-E2E-004 --kb-abstain <ev_min>（0=关） */
+static const char *g_handoff_url = NULL;  /* K-E2E-004 --handoff-url http://...（NULL=不回调） */
+static const char *g_yolo_image = NULL;   /* --yolo-image <img>   检测并输出 JSON */
+static const char *g_yolo_rawin  = NULL;  /* --yolo-raw <in.f32>  数值门：原始 NCHW 输入 */
+static const char *g_yolo_rawout = NULL;  /* --yolo-raw-out <out.f32> 数值门：输出 [4+nc, A] */
+static float       g_yolo_conf = 0.f;     /* --yolo-conf */
+static float       g_yolo_iou  = 0.f;     /* --yolo-iou */
+static const char *g_yolo_video_src = NULL;   /* K-E2E-005 --yolo-video-src <file|dir|http://|rtsp://> */
+static int         g_yolo_video_frames = 0;   /* --yolo-video-frames：单次抽帧默认帧数 */
+static int         g_yolo_video_interval_ms = 0; /* --yolo-video-interval-ms：常驻拉流间隔 */
 static int g_stream_warmup = 0; /* --warmup: 先跑一轮丢弃的 prefill+decode（§9.40 页缓存预热） */
 static int g_stream_n    = 12;  /* --stream-n N: decode token 数 */
 static int g_stream_ctx  = 0;   /* --stream-ctx N: 把 prompt 填充到 ~N token（§9.28 长上下文） */
@@ -660,9 +710,11 @@ static int  g_res_w_keep = 0;                 /* 0 = 使用默认(8) */
 static int    g_npu_enabled = 0;
 static int    g_npu_selftest = 0;
 static int    g_npu_calib_only = 0;
+static int    g_npu_calib_conv = 0;   /* --npu-calib-conv：原生卷积自检 */
 static vllm_npu_backend_t g_npu_backend = VLLM_NPU_BACKEND_AUTO;
 static const char *g_npu_model_dir = NULL;
 static double g_npu_flops_threshold = 1e8;
+static int    g_npu_threshold_set = 0;   /* --npu-threshold 是否显式给出 */
 static vllm_npu_t *g_npu = NULL;
 /* Heap-integrity triage: reports _HEAPOK / _HEAPBADNODE / _HEAPBADPTR.
  * Only the FIRST corruption site is printed (later ones are noise). */
@@ -1673,20 +1725,29 @@ static void test_longctx_quality_ab(STModelWeights *w, const STModelConfig *cfg,
         }
 
         /* Teacher-forced NLL with F32 KV cache (use_kv_q8=0), to quantify the
-         * INT8 KV quantization error against the exact float reference. */
+         * INT8 KV quantization error against the exact float reference.
+         * VLLM_KV_NOF32=1 下 f32 正典**未分配**（k_cache[l]=NULL）⇒ 该参考档不可用：
+         * 必须跳过并标注，否则运行期强置 use_kv_q8=0 会去读不存在的 f32 行 → 段错误。
+         * 有正典时走原路径，逐位不变。 */
+        int have_f32_canon = (ist.k_cache != NULL && ist.k_cache[0] != NULL);
         memcpy(ist.cache_len,    saved_cache_len, (size_t)nl * sizeof(int));
         memcpy(ist.hidden,       saved_hidden,    (size_t)dim * sizeof(float));
         memcpy(ist.logits,       saved_logits,    (size_t)vc * sizeof(float));
         ist.seq_len = saved_seq;
-        ist.use_kv_q8 = 0;
-        ist.use_kv_q4 = 0;   /* Q4 模式下也要切回 F32 参考路径 */
-        fprintf(stderr, "[STAGE] ppl-f32 start\n"); fflush(stderr);
-        for (int t = 0; t < n_ref; t++) {
-            nll_f32 += logits_nll(ist.logits, vc, ref_ids[t]);
-            st_qwen_model_forward(&ist, ref_ids[t]);
+        if (have_f32_canon) {
+            ist.use_kv_q8 = 0;
+            ist.use_kv_q4 = 0;   /* Q4 模式下也要切回 F32 参考路径 */
+            fprintf(stderr, "[STAGE] ppl-f32 start\n"); fflush(stderr);
+            for (int t = 0; t < n_ref; t++) {
+                nll_f32 += logits_nll(ist.logits, vc, ref_ids[t]);
+                st_qwen_model_forward(&ist, ref_ids[t]);
+            }
+            ist.use_kv_q8 = 1;
+            ist.use_kv_q4 = g_kv_q4 ? 1 : 0;   /* 恢复压缩模式 */
+        } else {
+            fprintf(stderr, "[STAGE] ppl-f32 skipped (VLLM_KV_NOF32: no f32 canon)\n");
+            fflush(stderr);
         }
-        ist.use_kv_q8 = 1;
-        ist.use_kv_q4 = g_kv_q4 ? 1 : 0;   /* 恢复压缩模式 */
 
         float ppl = expf(nll / (float)n_ref);
         float ppl_f32 = expf(nll_f32 / (float)n_ref);
@@ -1697,8 +1758,12 @@ static void test_longctx_quality_ab(STModelWeights *w, const STModelConfig *cfg,
         if (got && got_at == 0 && GEN_MAX <= 32)
             printf("         [WARN] 命中在第 0 个 token 且生成长度仅 %d —— 建议 "
                    "--longctx-gen 提到 64+ 再看后段是否答得完（判据会高估）\n", GEN_MAX);
-        printf("         Answer PPL (teacher-forced)  Q8=%.3f  F32=%.3f  (Q8/F32=%.4f)\n",
-               ppl, ppl_f32, ppl_f32 > 0.0f ? ppl / ppl_f32 : 0.0f);
+        if (have_f32_canon)
+            printf("         Answer PPL (teacher-forced)  Q8=%.3f  F32=%.3f  (Q8/F32=%.4f)\n",
+                   ppl, ppl_f32, ppl_f32 > 0.0f ? ppl / ppl_f32 : 0.0f);
+        else
+            printf("         Answer PPL (teacher-forced)  Q8=%.3f  F32=n/a (VLLM_KV_NOF32: 无 f32 正典)\n",
+                   ppl);
         printf("         Greedy (exact): \"%s\"\n", buf_out);
         printf("         Decode  %.1f ms/tok  (%.1f tok/s)\n",
                ms_gen, (ms_gen > 0.0) ? 1000.0 / ms_gen : 0.0);
@@ -3137,6 +3202,368 @@ static int run_longctx_quality(const char *model_dir) {
     return 0;
 }
 
+/* K-EMB-001：句子向量（embedding）CLI。
+ * 只做 prefill，输出末位 token final-norm 隐状态的 **L2 归一化**向量
+ * （官方 Qwen3-Embedding = last-token pooling + Normalize）。
+ * ⚠️ 输入走**裸文本**分词（不套 chat 模板）：套模板会改变向量，官方亦不加。 */
+/* 读入整个 stdin（二进制）为单一 UTF-8 输入；**保留原样**（含末尾换行）。
+ * 用于 --embed-stdin：规避 Windows CRT 把 argv 里的 UTF-8 当 ANSI(GBK) 转码
+ * 导致中文/非 ASCII 损坏（本地质量门必须走此路；Linux argv 本无此问题）。
+ * 不裁剪尾部：模板等输入的末尾换行是有意义的 token，调用方负责精确内容。 */
+static char *read_all_stdin(void) {
+#if defined(_WIN32)
+    _setmode(_fileno(stdin), _O_BINARY);
+#endif
+    size_t cap = 65536, len = 0;
+    char *b = (char *)malloc(cap);
+    if (!b) return NULL;
+    for (;;) {
+        if (len + 1 >= cap) {
+            cap <<= 1;
+            char *nb = (char *)realloc(b, cap);
+            if (!nb) { free(b); return NULL; }
+            b = nb;
+        }
+        size_t r = fread(b + len, 1, cap - len - 1, stdin);
+        if (r == 0) break;
+        len += r;
+    }
+    b[len] = '\0';
+    return b;
+}
+
+/* ---- K-COLLAB-001 P0：向量库自测（--kb-test）----
+ * 用合成向量（固定 seed）验证 J1（检索排序 vs 暴力参考一致）+ 持久化 round-trip。
+ * 不涉及 embedding 前向——纯向量库核心的确定性/正确性门。 */
+static int run_kb_test(void) {
+    printf("\n=== [KB] vector-store self-test (K-COLLAB-001 P0) ===\n");
+    const int DIM = 64, N = 100, K = 5;
+    uint32_t seed = 12345;
+    /* 合成 N 条 L2 归一向量 + 一条 query */
+    float *vecs = (float *)malloc((size_t)N * DIM * sizeof(float));
+    float qry[DIM];
+    if (!vecs) { printf("[KB] FAIL: OOM\n"); return 1; }
+    for (int n = 0; n < N; n++) {
+        double ss = 0;
+        for (int d = 0; d < DIM; d++) {
+            seed = seed * 1664525u + 1013904223u;
+            float v = ((float)(seed >> 8) / 16777216.0f) - 1.0f;
+            vecs[(size_t)n * DIM + d] = v; ss += (double)v * v;
+        }
+        float inv = (float)(1.0 / sqrt(ss));
+        for (int d = 0; d < DIM; d++) vecs[(size_t)n * DIM + d] *= inv;
+    }
+    {   double ss = 0;
+        for (int d = 0; d < DIM; d++) {
+            seed = seed * 1664525u + 1013904223u;
+            float v = ((float)(seed >> 8) / 16777216.0f) - 1.0f;
+            qry[d] = v; ss += (double)v * v;
+        }
+        float inv = (float)(1.0 / sqrt(ss));
+        for (int d = 0; d < DIM; d++) qry[d] *= inv;
+    }
+
+    VLLMKVStore kb; vllm_kv_init(&kb, DIM);
+    char meta[32];
+    for (int n = 0; n < N; n++) {
+        snprintf(meta, sizeof(meta), "doc-%03d", n);
+        if (vllm_kv_add(&kb, meta, vecs + (size_t)n * DIM) != 0) {
+            printf("[KB] FAIL: add\n"); free(vecs); vllm_kv_free(&kb); return 1;
+        }
+    }
+    printf("[KB] built n=%d dim=%d\n", kb.n, kb.dim);
+
+    /* 检索 vs 暴力参考（全排序）比对 */
+    int idx[K], ref[K]; float sc[K], refs[K];
+    vllm_kv_search(&kb, qry, K, idx, sc);
+    {   int order[N]; float alls[N];
+        for (int n = 0; n < N; n++) {
+            float s = 0; for (int d = 0; d < DIM; d++) s += qry[d] * vecs[(size_t)n * DIM + d];
+            order[n] = n; alls[n] = s;
+        }
+        for (int a = 0; a < N; a++) for (int b = a + 1; b < N; b++)
+            if (alls[b] > alls[a] || (alls[b] == alls[a] && order[b] < order[a])) {
+                float ts = alls[a]; alls[a] = alls[b]; alls[b] = ts;
+                int ti = order[a]; order[a] = order[b]; order[b] = ti;
+            }
+        for (int k = 0; k < K; k++) { ref[k] = order[k]; refs[k] = alls[k]; }
+    }
+    int j1 = 1;
+    for (int k = 0; k < K; k++)
+        if (idx[k] != ref[k]) { j1 = 0; break; }
+    printf("[KB] J1 search top-%d: %s\n", K, j1 ? "PASS (order == brute-force)" : "FAIL");
+    for (int k = 0; k < K; k++)
+        printf("        #%d idx=%d meta=%s score=%.6f\n", k, idx[k], kb.meta[idx[k]], sc[k]);
+    printf("[KB] J1 score bitwise vs ref: %s\n",
+           (memcmp(sc, refs, sizeof(sc)) == 0) ? "PASS" : "NOTE (float-order)");
+
+    /* 持久化 round-trip */
+    const char *p = "/tmp/kb_test.vkb";
+    if (vllm_kv_save(&kb, p) != 0) { printf("[KB] FAIL: save\n"); free(vecs); vllm_kv_free(&kb); return 1; }
+    VLLMKVStore kb2; vllm_kv_init(&kb2, 0);
+    if (vllm_kv_load(&kb2, p) != 0) { printf("[KB] FAIL: load\n"); free(vecs); vllm_kv_free(&kb); vllm_kv_free(&kb2); return 1; }
+    int jround = (kb2.dim == DIM && kb2.n == N) &&
+                 (memcmp(kb2.vec, kb.vec, (size_t)N * DIM * sizeof(float)) == 0);
+    for (int n = 0; n < N && jround; n++)
+        if (strcmp(kb2.meta[n], kb.meta[n]) != 0) jround = 0;
+    printf("[KB] persist round-trip (n/dim/vec/meta): %s\n", jround ? "PASS" : "FAIL");
+
+    int ok = j1 && jround;
+    printf("[KB] self-test: %s\n", ok ? "ALL PASS" : "FAIL");
+    free(vecs); vllm_kv_free(&kb); vllm_kv_free(&kb2);
+    return ok ? 0 : 1;
+}
+
+/* 读一行并去尾部换行/回车；返回长度（0=EOF 或空行）。 */
+static int kb_read_line(FILE *f, char *buf, int cap) {
+    if (!fgets(buf, cap, f)) return 0;
+    int n = (int)strlen(buf);
+    while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r')) buf[--n] = 0;
+    return n;
+}
+
+/* 把一行空格分隔的浮点解析进 out（最多 max 个）；返回解析个数。 */
+static int kb_parse_floats(const char *line, float *out, int max) {
+    int n = 0;
+    const char *p = line;
+    while (*p && n < max) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        char *end = NULL;
+        out[n++] = (float)strtod(p, &end);
+        if (end == p) break;
+        p = end;
+    }
+    return n;
+}
+
+/* ---- K-COLLAB-001 P0：从文件建库（--kb-build <kb> --kb-docs <meta> --kb-vecs <vecs>）---- */
+static int run_kb_build(const char *kb_path, const char *docs_file, const char *vecs_file) {
+    printf("\n=== [KB] build from files ===\n");
+    if (!kb_path || !docs_file || !vecs_file) {
+        printf("[KB] FAIL: need --kb-build <kb> --kb-docs <meta.txt> --kb-vecs <vecs.txt>\n");
+        return 1;
+    }
+    FILE *fd = fopen(docs_file, "rb");
+    FILE *fv = fopen(vecs_file, "rb");
+    if (!fd || !fv) {
+        printf("[KB] FAIL: cannot open docs/vecs\n");
+        if (fd) fclose(fd); if (fv) fclose(fv); return 1;
+    }
+    char mline[8192], vline[1 << 20];
+    VLLMKVStore kb; vllm_kv_init(&kb, 0);
+    int dim = 0, n = 0, bad = 0;
+    float *vec = NULL; int vec_cap = 0;
+    while (1) {
+        int ml = kb_read_line(fd, mline, sizeof(mline));
+        int vl = kb_read_line(fv, vline, sizeof(vline));
+        if (ml == 0 && vl == 0) break;
+        if ((ml == 0) != (vl == 0)) { bad = 1; printf("[KB] FAIL: docs/vecs 行数不对齐\n"); break; }
+        int nf = 0;
+        if (vec_cap == 0) {
+            /* 首行决定 dim（用堆缓冲，避免大栈数组） */
+            float *tmp = (float *)malloc((size_t)(1 << 20) * sizeof(float));
+            if (!tmp) { bad = 1; printf("[KB] FAIL: OOM\n"); break; }
+            nf = kb_parse_floats(vline, tmp, 1 << 20);
+            if (nf <= 0) { free(tmp); bad = 1; printf("[KB] FAIL: 首条向量解析失败\n"); break; }
+            dim = nf; vec_cap = dim;
+            kb.dim = dim;                        /* init(0) 后按首行回填 dim，否则 add 判 dim<=0 直接拒 */
+            vec = (float *)malloc((size_t)dim * sizeof(float));
+            if (!vec) { free(tmp); bad = 1; printf("[KB] FAIL: OOM\n"); break; }
+            memcpy(vec, tmp, (size_t)dim * sizeof(float));
+            free(tmp);
+        } else {
+            nf = kb_parse_floats(vline, vec, dim);
+            if (nf != dim) { bad = 1; printf("[KB] FAIL: 向量维度不一致 (dim=%d got=%d)\n", dim, nf); break; }
+        }
+        if (vllm_kv_add(&kb, mline, vec) != 0) { bad = 1; printf("[KB] FAIL: add OOM\n"); break; }
+        n++;
+    }
+    fclose(fd); fclose(fv);
+    free(vec);
+    if (!bad && vllm_kv_save(&kb, kb_path) == 0) {
+        printf("[KB] built %s: n=%d dim=%d\n", kb_path, n, dim);
+    } else {
+        printf("[KB] FAIL: build/save\n"); bad = 1;
+    }
+    vllm_kv_free(&kb);
+    return bad ? 1 : 0;
+}
+
+/* ---- K-COLLAB-001 P0：检索（--kb-search <kb> --kb-query <q.vec> --kb-k N）---- */
+static int run_kb_search(const char *kb_path, const char *query_file, int k) {
+    printf("\n=== [KB] search ===\n");
+    if (!kb_path || !query_file) {
+        printf("[KB] FAIL: need --kb-search <kb> --kb-query <q.vec>\n");
+        return 1;
+    }
+    VLLMKVStore kb; vllm_kv_init(&kb, 0);
+    if (vllm_kv_load(&kb, kb_path) != 0) {
+        printf("[KB] FAIL: load %s\n", kb_path); vllm_kv_free(&kb); return 1;
+    }
+    FILE *fq = fopen(query_file, "rb");
+    if (!fq) { printf("[KB] FAIL: cannot open query file\n"); vllm_kv_free(&kb); return 1; }
+    char qline[1 << 20];
+    int ql = kb_read_line(fq, qline, sizeof(qline));
+    fclose(fq);
+    if (ql <= 0) { printf("[KB] FAIL: empty query\n"); vllm_kv_free(&kb); return 1; }
+    float *qv = (float *)malloc((size_t)kb.dim * sizeof(float));
+    if (!qv) { printf("[KB] FAIL: OOM\n"); vllm_kv_free(&kb); return 1; }
+    int nf = kb_parse_floats(qline, qv, kb.dim);
+    if (nf != kb.dim) {
+        printf("[KB] FAIL: query 维度 %d != 库维度 %d\n", nf, kb.dim);
+        free(qv); vllm_kv_free(&kb); return 1;
+    }
+    if (k <= 0) k = 5;
+    int *idx = (int *)malloc((size_t)k * sizeof(int));
+    float *sc = (float *)malloc((size_t)k * sizeof(float));
+    vllm_kv_search(&kb, qv, k, idx, sc);
+    printf("[KB] top-%d (n=%d dim=%d):\n", k < kb.n ? k : kb.n, kb.n, kb.dim);
+    for (int i = 0; i < k && i < kb.n; i++)
+        printf("  #%d score=%.6f  %s\n", i, sc[i], kb.meta[idx[i]]);
+    free(idx); free(sc); free(qv); vllm_kv_free(&kb);
+    return 0;
+}
+
+static int run_embed(const char *model_dir, const char *text, const char *txt_file,
+                     const char *out_path) {
+    printf("\n=== [EMB] sentence embedding (VQF only) ===\n");
+    fflush(stdout);
+
+    char vqf_path[1024]; vqf_path[0] = 0;
+    char tok_dir[1024];
+    if (vqf_is_file(model_dir)) {
+        snprintf(vqf_path, sizeof(vqf_path), "%s", model_dir);
+        snprintf(tok_dir, sizeof(tok_dir), "%s", model_dir);
+        char *sl = strrchr(tok_dir, '/');
+        char *bs = strrchr(tok_dir, '\\');
+        char *sep = (bs && (!sl || bs > sl)) ? bs : sl;
+        if (sep) { *sep = '\0'; if (!tok_dir[0]) snprintf(tok_dir, sizeof(tok_dir), "."); }
+        else    snprintf(tok_dir, sizeof(tok_dir), ".");
+    } else {
+        if (!vqf_dir_find(model_dir, vqf_path, sizeof(vqf_path))) {
+            printf("[EMB] FAIL: %s 无 model.vqf（本功能要求自研 VQF 格式）\n", model_dir);
+            return 1;
+        }
+        snprintf(tok_dir, sizeof(tok_dir), "%s", model_dir);
+    }
+
+    STModelWeights w; memset(&w, 0, sizeof(w));
+    if (vqf_load(&w, vqf_path) != 0) { printf("[EMB] FAIL: vqf_load %s\n", vqf_path); return 1; }
+    STModelConfig *cfg = &w.cfg;
+    printf("[EMB] vqf_load OK: dim=%d layers=%d heads=%d kv=%d vocab=%d max_seq=%d\n",
+           cfg->dim, cfg->n_layers, cfg->n_heads, cfg->n_kv_heads,
+           cfg->vocab_size, cfg->max_seq_len);
+
+    QwenTokenizer tok;
+    if (qwen_tokenizer_load(&tok, tok_dir) != 0 ||
+        qwen_tokenizer_load_special(&tok, tok_dir) != 0) {
+        printf("[EMB] FAIL: tokenizer load from %s (需要 vocab.bin/config.json)\n", tok_dir);
+        st_weights_free(&w);
+        return 1;
+    }
+
+    STQwenInferenceState ist;
+    memset(&ist, 0, sizeof(ist));
+    if (st_qwen_inference_init(&ist, &w) != 0) {
+        printf("[EMB] FAIL: inference init\n");
+        st_weights_free(&w); qwen_tokenizer_free(&tok);
+        return 1;
+    }
+
+    int dim = cfg->dim;
+    float *vec = (float *)malloc((size_t)dim * sizeof(float));
+    int   *ids = (int *)malloc(sizeof(int) * ((size_t)cfg->max_seq_len + 16));
+    char  *lbuf = (char *)malloc(1u << 18);      /* 单行 256KB 上限（跨平台，不用 getline） */
+    if (!vec || !ids || !lbuf) {
+        printf("[EMB] OOM\n");
+        free(vec); free(ids); free(lbuf);
+        st_qwen_inference_free(&ist); qwen_tokenizer_free(&tok); st_weights_free(&w);
+        return 1;
+    }
+
+    FILE *fo = NULL, *fi = NULL;
+    if (out_path && out_path[0]) {
+        fo = fopen(out_path, "w");
+        if (!fo) {
+            printf("[EMB] FAIL: 无法写 %s\n", out_path);
+            free(vec); free(ids); free(lbuf);
+            st_qwen_inference_free(&ist); qwen_tokenizer_free(&tok); st_weights_free(&w);
+            return 1;
+        }
+    }
+    if (txt_file && txt_file[0]) {
+        fi = fopen(txt_file, "rb");
+        if (!fi) {
+            printf("[EMB] FAIL: 无法读 %s\n", txt_file);
+            if (fo) fclose(fo);
+            free(vec); free(ids); free(lbuf);
+            st_qwen_inference_free(&ist); qwen_tokenizer_free(&tok); st_weights_free(&w);
+            return 1;
+        }
+    }
+
+    int n_done = 0;
+    double t_all = st_now_sec();
+    for (;;) {
+        const char *cur = text;
+        if (fi) {
+            if (!fgets(lbuf, 1 << 18, fi)) break;
+            size_t r = strlen(lbuf);
+            while (r > 0 && (lbuf[r-1] == '\n' || lbuf[r-1] == '\r')) lbuf[--r] = 0;
+            if (r == 0) continue;                 /* 跳过空行 */
+            cur = lbuf;
+        } else if (n_done >= 1 || !cur) {
+            break;
+        }
+
+        /* 每个输入 = 全新序列（复刻 serve 侧 ist_reset 的全量复位分支） */
+        for (int l = 0; l < w.n_layers_allocated; l++) ist.cache_len[l] = 0;
+        ist.seq_len = 0; ist.mrope_pos = 0;
+
+        int n = qwen_tokenizer_encode(&tok, cur, ids, cfg->max_seq_len - 1);
+        if (n <= 0) { printf("[EMB] WARN: 空输入/编码失败，跳过\n"); if (!fi) break; continue; }
+        if (n > cfg->max_seq_len - 8) {
+            printf("[EMB] WARN: 输入 %d tok 超 max_seq %d，截断\n", n, cfg->max_seq_len);
+            n = cfg->max_seq_len - 8;
+        }
+        /* 官方 recipe：tokenizer(add_special_tokens=True) 会追加 EOS，last-token
+         * pooling 取到的正是该 EOS 位置（HF 实测 "hello world" → [...,151643]）。
+         * 必须复刻，否则末位落在最后一个实词上，向量与 HF 不一致。 */
+        if (n < cfg->max_seq_len && ids[n-1] != tok.eos_id) ids[n++] = tok.eos_id;
+        if (getenv("VLLM_EMB_IDS")) {             /* 诊断：对拍 HF tokenizer */
+            printf("[EMB-IDS] n=%d:", n);
+            for (int i = 0; i < n; i++) printf(" %d", ids[i]);
+            printf("\n"); fflush(stdout);
+        }
+        st_embed_request(vec, dim);               /* 登记钩子（一次性） */
+        double t0 = st_now_sec();
+        st_qwen_model_prefill_batch(&ist, ids, n);
+        double dt = st_now_sec() - t0;
+        double ss = 0.0;
+        for (int i = 0; i < dim; i++) ss += (double)vec[i] * vec[i];
+        printf("[EMB] #%d tok=%d prefill=%.3fs |v|=%.6f\n", n_done, n, dt, sqrt(ss));
+        printf("[EMB-VEC]");
+        for (int i = 0; i < dim; i++) printf(" %.8g", vec[i]);
+        printf("\n");
+        fflush(stdout);
+        if (fo) {
+            for (int i = 0; i < dim; i++) fprintf(fo, "%s%.8g", i ? " " : "", vec[i]);
+            fprintf(fo, "\n");
+        }
+        n_done++;
+        if (!fi) break;
+    }
+    printf("[EMB] done: %d 条输入，总耗时 %.2fs\n", n_done, st_now_sec() - t_all);
+    if (fo) { fclose(fo); printf("[EMB] 向量已写入 %s（每行一条，空格分隔 fp32）\n", out_path); }
+    if (fi) fclose(fi);
+    free(vec); free(ids); free(lbuf);
+    st_qwen_inference_free(&ist);
+    qwen_tokenizer_free(&tok);
+    st_weights_free(&w);
+    return n_done > 0 ? 0 : 1;
+}
+
 static int run_stream_test(const char *model_dir, int n_tokens) {
     printf("\n=== [STREAM] layer-resident validation (VQF only) ===\n");
     fflush(stdout);
@@ -3931,6 +4358,13 @@ static int serve_load_model(ServeModel *m) {
     fflush(stdout);
     fprintf(stderr, "[M-B] tokenizer loaded\n"); fflush(stderr);
 
+    /* 注意（K-COLLAB-001 P1 证否回退）：不要在此钳制 cfg->vocab_size。
+     * Qwen3-4B/1.7B/VL 的 model.vqf lm_head 是 151936 行（含 reserved token），
+     * tokenizer 是 151669 tokens，二者不一致是**正常的**。Instruct 模型的
+     * argmax 自然落在有效 token（0..151668），无需钳制；强制钳到 151669 会
+     * 使 lm_head 计算错位，导致 decode 生成 `</think>` 循环（已实测证否）。
+     * reserved token 只会在 base 模型（未微调）下命中，属模型能力边界，非引擎 bug。 */
+
     ist = (STQwenInferenceState *)calloc(1, sizeof(STQwenInferenceState));
     if (!ist) { rc = -1; goto done; }
     if (st_qwen_inference_init(ist, w) != 0) {
@@ -4205,6 +4639,7 @@ static void serve_on_start(int actual_port, void *ud) {
     printf("          GET  /health\n");
     printf("          POST /v1/chat/completions  (stream=true SSE supported)\n");
     printf("          POST /v1/completions\n");
+    printf("          POST /v1/embeddings  (K-EMB-001; last-token pooling + L2)\n");
     printf("          workers=%d queued_max=%d free_ram_min=%d MB\n",
            g_serve_threads, g_serve_max_queued, g_serve_min_free_mb);
     fflush(stdout);
@@ -4253,6 +4688,42 @@ static int vllm_serve_main(int port, const char *model_dir_arg, int auto_load) {
     /* Admin/management metadata (reported by /admin; NULL paths use the
      * board defaults in vllm_admin.c). */
     ctx.model_dir = model_dir;
+    ctx.laya_pack = g_laya_pack;   /* K-LAYA-001: --laya-pack enables POST /v1/systemone */
+    ctx.yolo_model = g_yolo_model; /* K-YOLO-001: --yolo-model enables POST /v1/detect */
+    /* K-YOLO-003：RKNN 句柄已在 main() 内按 --yolo-backend 创建（CLI/serve 共用）。 */
+    ctx.yolo_backend = g_yolo_backend;
+    ctx.yolo_npu = g_npu_rknn;
+    ctx.yolo_core_mask = g_yolo_core_mask;
+    /* K-ADMIN-001：CLI-only 项回填管理页（YOLO/Laya/KB 配置页展示） */
+    ctx.yolo_rknn_lib = g_rknn_lib;
+    ctx.yolo_conf = g_yolo_conf;
+    ctx.yolo_iou = g_yolo_iou;
+    ctx.yolo_video_src = g_yolo_video_src;              /* K-E2E-005 视频源 */
+    ctx.yolo_video_frames = g_yolo_video_frames;
+    ctx.yolo_video_interval_ms = g_yolo_video_interval_ms;
+    ctx.kb_root = g_kb_root;
+    ctx.embed_model_dir = g_embed_model; /* K-COLLAB-001 P2: --embed-model 专用 embedding 模型 */
+    /* 云边协同：云端上游回退（默认关；触发时显式标记来源，禁止静默） */
+    ctx.cloud_endpoint = g_cloud_endpoint;
+    ctx.cloud_model = g_cloud_model;
+    /* 凭据不落 config.json：--cloud-key 优先，否则取 env VLLM_CLOUD_KEY。 */
+    if (!g_cloud_key) {
+        const char *e = getenv("VLLM_CLOUD_KEY");
+        if (e && e[0]) g_cloud_key = e;
+    }
+    ctx.cloud_key = g_cloud_key;
+    ctx.cloud_fallback = g_cloud_fallback;
+    /* 拒答与转人工（K-E2E-004）：默认关；env 兜底便于不改配置文件临时启用。 */
+    ctx.kb_abstain = g_kb_abstain;
+    if (ctx.kb_abstain <= 0.f) {
+        const char *e = getenv("VLLM_KB_ABSTAIN");
+        if (e && e[0]) ctx.kb_abstain = (float)atof(e);
+    }
+    ctx.handoff_url = g_handoff_url;
+    if (!ctx.handoff_url) {
+        const char *e = getenv("VLLM_HANDOFF_URL");
+        if (e && e[0]) ctx.handoff_url = e;
+    }
     ctx.port = port;
     ctx.threads = g_serve_threads;
     ctx.npu_enabled = g_npu_enabled;
@@ -4463,6 +4934,65 @@ static int vllm_serve_main(int port, const char *model_dir_arg, int auto_load) {
 /* ================================================================
  * main
  * ================================================================ */
+/* ================================================================
+ * K-YOLO-001：YOLO 目标检测 CLI（自有格式 VQF v4）
+ * ================================================================ */
+static int yolo_run_raw(const char *vqf, const char *rawin, const char *rawout) {
+    StYoloModel *m = st_yolo_load(vqf);
+    if (!m) { fprintf(stderr, "[YOLO] load failed\n"); return 1; }
+    int iw = 0, ih = 0, nc = st_yolo_num_classes(m);
+    st_yolo_input_size(m, &iw, &ih);
+    size_t nin = (size_t)3 * iw * ih;
+    float *in = (float *)malloc(nin * sizeof(float));
+    FILE *fi = fopen(rawin, "rb");
+    if (!fi || fread(in, sizeof(float), nin, fi) != nin) {
+        fprintf(stderr, "[YOLO] raw input read failed (need %zu floats)\n", nin);
+        fclose(fi); free(in); st_yolo_free(m); return 1;
+    }
+    fclose(fi);
+    size_t cap = (size_t)(4 + nc) * 8400 + 4096;
+    float *out = (float *)malloc(cap * sizeof(float));
+    int oc = 0, oa = 0;
+    int rc = st_yolo_forward_raw(m, in, out, &oc, &oa);
+    if (rc != 0) { fprintf(stderr, "[YOLO] forward failed\n");
+        free(in); free(out); st_yolo_free(m); return 1; }
+    FILE *fo = fopen(rawout, "wb");
+    if (fo) { fwrite(out, sizeof(float), (size_t)oc * oa, fo); fclose(fo); }
+    printf("YOLO-RAW out_c=%d out_a=%d\n", oc, oa);
+    free(in); free(out); st_yolo_free(m);
+    return 0;
+}
+
+static int yolo_run_image(const char *vqf, const char *img, float conf, float iou) {
+    StYoloModel *m = (g_yolo_backend == 1)
+                         ? st_yolo_load_rknn(vqf, g_npu_rknn, g_yolo_core_mask)
+                         : st_yolo_load(vqf);   /* K-YOLO-003：CLI 亦认后端 */
+    if (!m) { fprintf(stderr, "[YOLO] load failed\n"); return 1; }
+    int w = 0, h = 0;
+    uint8_t *rgb = media_load_image(img, &w, &h);
+    if (!rgb) { fprintf(stderr, "[YOLO] image load failed: %s\n", img); st_yolo_free(m); return 1; }
+    int maxd = 300;
+    YoloDet *d = (YoloDet *)malloc((size_t)maxd * sizeof(YoloDet));
+    int n = st_yolo_detect(m, rgb, w, h, conf, iou, d, maxd);
+    if (n < 0) { fprintf(stderr, "[YOLO] detect failed\n"); free(d); media_free_image(rgb); st_yolo_free(m); return 1; }
+    char names[64];
+    const char *bn = strrchr(img, '/'); const char *bs = strrchr(img, '\\');
+    const char *base = bn > bs ? bn : bs; base = base ? base + 1 : img;
+    snprintf(names, sizeof(names), "%s", base);
+    printf("{\"image\":\"%s\",\"width\":%d,\"height\":%d,\"model_family\":%d,\"detections\":[",
+           names, w, h, st_yolo_family(m));
+    for (int i = 0; i < n; i++) {
+        char cn[64];
+        if (st_yolo_class_name(m, d[i].cls, cn, sizeof(cn)) != 0) snprintf(cn, sizeof(cn), "?");
+        printf("%s{\"cls\":%d,\"name\":\"%s\",\"score\":%.4f,\"box\":[%.1f,%.1f,%.1f,%.1f]}",
+               i ? "," : "", d[i].cls, cn, d[i].score,
+               d[i].x1, d[i].y1, d[i].x2, d[i].y2);
+    }
+    printf("]}\n");
+    free(d); media_free_image(rgb); st_yolo_free(m);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     /* RK3588/Linux: raise the main-thread stack to match the MSVC
      * /STACK:16777216 build (large local arrays: scores[4096] etc.). */
@@ -4476,8 +5006,8 @@ int main(int argc, char **argv) {
     SetConsoleCP(65001);
 #endif
 
-    printf("  vLLM-Kestrel: Axiom-Guided Exact-Attention         \n");
-    printf("  Large Language Model Inference Engine          \n");
+    printf("  vLLM-Kestrel: Edge-Cloud Coordination Platform  \n");
+    printf("  Axiom-Guided Exact-Attention edge LLM runtime  \n");
     printf("\n");
 
     /* ---- Parse command-line flags ---- */
@@ -4686,6 +5216,82 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--prefill-batch") == 0 && i + 1 < argc) {
             g_st_prefill_batch = atoi(argv[++i]);
             if (g_st_prefill_batch < 1) g_st_prefill_batch = 1;
+        } else if (strcmp(argv[i], "--embed") == 0 && i + 1 < argc) {
+            g_embed_text = argv[++i];   /* K-EMB-001：句子向量（裸文本，不套 chat 模板） */
+        } else if (strcmp(argv[i], "--embed-file") == 0 && i + 1 < argc) {
+            g_embed_file = argv[++i];   /* 每行一个输入（批量，单进程） */
+        } else if (strcmp(argv[i], "--embed-out") == 0 && i + 1 < argc) {
+            g_embed_out = argv[++i];    /* 向量落盘：每行一个（空格分隔 fp32） */
+        } else if (strcmp(argv[i], "--embed-stdin") == 0) {
+            g_embed_stdin = 1;          /* K-EMB-001：stdin 整段为一个输入（UTF-8 安全） */
+        } else if (strcmp(argv[i], "--embed-model") == 0 && i + 1 < argc) {
+            g_embed_model = argv[++i];  /* K-COLLAB-001 P2：serve 专用 embedding 模型目录 */
+        } else if (strcmp(argv[i], "--kb-test") == 0) {
+            g_kb_test = 1;              /* K-COLLAB-001 P0：向量库自测 */
+        } else if (strcmp(argv[i], "--kb-build") == 0 && i + 1 < argc) {
+            g_kb_path = argv[++i];      /* 向量库文件（建库） */
+        } else if (strcmp(argv[i], "--kb-docs") == 0 && i + 1 < argc) {
+            g_kb_docs = argv[++i];      /* meta 文件（每行一条） */
+        } else if (strcmp(argv[i], "--kb-vecs") == 0 && i + 1 < argc) {
+            g_kb_vecs = argv[++i];      /* 向量文件（每行 dim 个 float） */
+        } else if (strcmp(argv[i], "--kb-search") == 0 && i + 1 < argc) {
+            g_kb_path = argv[++i];      /* 向量库文件（检索） */
+        } else if (strcmp(argv[i], "--kb-query") == 0 && i + 1 < argc) {
+            g_kb_query = argv[++i];     /* query 向量文件 */
+        } else if (strcmp(argv[i], "--kb-k") == 0 && i + 1 < argc) {
+            g_kb_k = atoi(argv[++i]);   /* top-k（默认 5） */
+        } else if (strcmp(argv[i], "--laya-pack") == 0 && i + 1 < argc) {
+            g_laya_pack = argv[++i];    /* K-LAYA-001：Laya 权重包目录 */
+        } else if (strcmp(argv[i], "--laya-cases") == 0 && i + 1 < argc) {
+            g_laya_cases = argv[++i];   /* K-LAYA-001：Laya 用例文件 */
+        } else if (strcmp(argv[i], "--laya-tok") == 0 && i + 1 < argc) {
+            g_laya_tok = argv[++i];     /* K-LAYA-001：ModernBERT 分词器目录（--laya-cases 作输入文件） */
+        } else if (strcmp(argv[i], "--laya-decide") == 0) {
+            g_laya_decide = 1;          /* K-LAYA-001：端到端决策 */
+        } else if (strcmp(argv[i], "--yolo-model") == 0 && i + 1 < argc) {
+            g_yolo_model = argv[++i];   /* K-YOLO-001：检测模型（VQF v4） */
+        } else if (strcmp(argv[i], "--yolo-image") == 0 && i + 1 < argc) {
+            g_yolo_image = argv[++i];   /* K-YOLO-001：输入图片 */
+        } else if (strcmp(argv[i], "--yolo-raw") == 0 && i + 1 < argc) {
+            g_yolo_rawin = argv[++i];   /* K-YOLO-001：数值门输入（NCHW f32） */
+        } else if (strcmp(argv[i], "--yolo-raw-out") == 0 && i + 1 < argc) {
+            g_yolo_rawout = argv[++i];  /* K-YOLO-001：数值门输出（f32） */
+        } else if (strcmp(argv[i], "--yolo-conf") == 0 && i + 1 < argc) {
+            g_yolo_conf = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--yolo-iou") == 0 && i + 1 < argc) {
+            g_yolo_iou = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--yolo-video-src") == 0 && i + 1 < argc) {
+            g_yolo_video_src = argv[++i];   /* K-E2E-005：默认视频源（file|dir|http://|rtsp://） */
+        } else if (strcmp(argv[i], "--yolo-video-frames") == 0 && i + 1 < argc) {
+            g_yolo_video_frames = atoi(argv[++i]);   /* 单次抽帧默认帧数 */
+        } else if (strcmp(argv[i], "--yolo-video-interval-ms") == 0 && i + 1 < argc) {
+            g_yolo_video_interval_ms = atoi(argv[++i]); /* 常驻拉流抽帧间隔 */
+        } else if (strcmp(argv[i], "--yolo-backend") == 0 && i + 1 < argc) {
+            const char *v = argv[++i];
+            g_yolo_backend = (strcmp(v, "rknn") == 0) ? 1 : 0;   /* K-YOLO-003 */
+        } else if (strcmp(argv[i], "--yolo-rknn") == 0 && i + 1 < argc) {
+            g_yolo_model = argv[++i];    /* K-YOLO-003：给 .rknn 即隐含 rknn 后端 */
+            g_yolo_backend = 1;
+        } else if (strcmp(argv[i], "--rknn-lib") == 0 && i + 1 < argc) {
+            g_rknn_lib = argv[++i];      /* K-YOLO-003：librknnrt.so 路径（须 2.3.2） */
+        } else if (strcmp(argv[i], "--yolo-core-mask") == 0 && i + 1 < argc) {
+            g_yolo_core_mask = atoi(argv[++i]);   /* K-YOLO-003 */
+        } else if (strcmp(argv[i], "--kb-root") == 0 && i + 1 < argc) {
+            g_kb_root = argv[++i];   /* K-ADMIN-001：知识库根目录 */
+        } else if (strcmp(argv[i], "--cloud-endpoint") == 0 && i + 1 < argc) {
+            g_cloud_endpoint = argv[++i];  /* 云边协同：云端上游 base URL（http://） */
+        } else if (strcmp(argv[i], "--cloud-model") == 0 && i + 1 < argc) {
+            g_cloud_model = argv[++i];     /* 转发时覆盖的模型名（可选） */
+        } else if (strcmp(argv[i], "--cloud-key") == 0 && i + 1 < argc) {
+            g_cloud_key = argv[++i];       /* Authorization: Bearer 令牌（可选） */
+        } else if (strcmp(argv[i], "--cloud-fallback") == 0 && i + 1 < argc) {
+            const char *v = argv[++i];
+            g_cloud_fallback = (strcmp(v, "always") == 0) ? 2
+                             : (strcmp(v, "on-unready") == 0) ? 1 : 0;
+        } else if (strcmp(argv[i], "--kb-abstain") == 0 && i + 1 < argc) {
+            g_kb_abstain = (float)atof(argv[++i]);   /* K-E2E-004：拒答门阈值（0=关） */
+        } else if (strcmp(argv[i], "--handoff-url") == 0 && i + 1 < argc) {
+            g_handoff_url = argv[++i];               /* K-E2E-004：转人工回调地址（可选） */
         } else if (strcmp(argv[i], "--multimodal") == 0) {
             run_multimodal = 1;
         } else if (strcmp(argv[i], "--image") == 0 && i + 1 < argc) {
@@ -4699,6 +5305,7 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--npu-threshold") == 0 && i + 1 < argc) {
             g_npu_flops_threshold = atof(argv[++i]);
             if (g_npu_flops_threshold < 1e6) g_npu_flops_threshold = 1e6;
+            g_npu_threshold_set = 1;
         } else if (strcmp(argv[i], "--npu-selftest") == 0) {
             g_npu_selftest = 1;
         } else if (strcmp(argv[i], "--npu-calib") == 0) {
@@ -4708,6 +5315,11 @@ int main(int argc, char **argv) {
             g_npu_enabled = 1;
             g_npu_selftest = 1;
             g_npu_calib_only = 1;
+        } else if (strcmp(argv[i], "--npu-calib-conv") == 0) {
+            /* K-YOLO-001 M3 Phase-1：原生 3x3 卷积自检（CNA CONV_MODE=0 vs CPU
+             * oracle）。与 --npu-calib 一样需要初始化后端；跑完即退出。 */
+            g_npu_enabled = 1;
+            g_npu_calib_conv = 1;
         } else if (strcmp(argv[i], "--npu-backend") == 0 && i + 1 < argc) {
             if (strcmp(argv[++i], "direct") == 0)
                 g_npu_backend = VLLM_NPU_BACKEND_DIRECT;
@@ -4881,15 +5493,38 @@ int main(int argc, char **argv) {
         cfg.backend = g_npu_backend;
         cfg.model_dir = g_npu_model_dir;
         cfg.verbosity = 1;
+        /* K-YOLO-001 M2：检测模型（卷积小算子多）默认放开 FLOPs 阈值——否则大量卷积
+         * 亚阈值留 CPU，NPU 反而比 CPU 慢（实测 +1~3%）。LLM 路径不受影响。 */
+        if (!g_npu_threshold_set && g_yolo_model) {
+            g_npu_flops_threshold = 1e6;
+            printf("  NPU threshold: 1e6 (YOLO detect default; -npu-threshold to override)\n");
+        }
         cfg.flops_threshold = g_npu_flops_threshold;
         if (vllm_npu_init(&g_npu, &cfg) == 0) {
             st_npu_set(g_npu);
+            st_yolo_set_default_npu(g_npu);   /* K-YOLO-001 M2：检测卷积 im2col→GEMM 上 NPU */
             if (vllm_npu_available(g_npu)) {
                 printf("  NPU backend : %s\n",
                        vllm_npu_backend(g_npu) == VLLM_NPU_BACKEND_DIRECT
                            ? "direct (in-tree rknpu driver, no model conversion)"
                            : "rknn (librknnrt)");
                 if (g_npu_selftest) vllm_npu_selftest(g_npu);
+                if (g_npu_calib_conv) {
+                    /* K-YOLO-001 M3 Phase-1：原生卷积自检，自包含（自带设备句柄），
+                     * 跑完即退出。先释放后端句柄，让自检以干净设备状态打开。
+                     * 该入口仅在 Linux 侧编译（x64 stub 无 rknpu 驱动）。 */
+#ifndef _WIN32
+                    int cret;
+                    st_npu_set(NULL);
+                    vllm_npu_destroy(g_npu);
+                    g_npu = NULL;
+                    cret = vllm_npu_direct_conv_calib(1, 0);
+                    printf("\n[NPU CONV CALIBRATION COMPLETE]\n");
+                    return cret ? 1 : 0;
+#else
+                    printf("[NPU-CONV-CALIB] SKIP (x64 stub, no rknpu driver)\n");
+#endif
+                }
                 if (g_npu_calib_only) {
                     /* Calibration-only: report done and stop here. */
                     st_npu_set(NULL);
@@ -4901,6 +5536,24 @@ int main(int argc, char **argv) {
             } else {
                 printf("  NPU backend : unavailable - running CPU path only\n");
             }
+        }
+    }
+
+    /* K-YOLO-003：官方 .rknn 检测路径（opt-in）需要**独立**的 RKNN 后端句柄——
+     * 板端 AUTO 会选中 DIRECT（in-tree 驱动），不会 dlopen librknnrt。
+     * 在 main() 内创建：CLI 检测入口（--yolo-image）与 serve 共用同一句柄。 */
+    if (g_yolo_backend == 1 && g_yolo_model) {
+        vllm_npu_cfg_t rcfg;
+        memset(&rcfg, 0, sizeof(rcfg));
+        rcfg.backend = VLLM_NPU_BACKEND_RKNN;
+        rcfg.rknn_path = g_rknn_lib;      /* NULL = dlopen "librknnrt.so"（板端 1.4.0 不可用） */
+        rcfg.verbosity = 1;
+        rcfg.core_mask = g_yolo_core_mask;
+        if (vllm_npu_init(&g_npu_rknn, &rcfg) == 0 && vllm_npu_available(g_npu_rknn)) {
+            printf("  YOLO backend : rknn (%s)\n", g_rknn_lib ? g_rknn_lib : "librknnrt.so");
+        } else {
+            printf("  YOLO backend : rknn requested but librknnrt unavailable "
+                   "(requests will fail explicitly; use --rknn-lib)\n");
         }
     }
 
@@ -4935,6 +5588,63 @@ int main(int argc, char **argv) {
             return 1;
         }
         return run_longctx_quality(g_serve_model_dir);
+    }
+
+    if (g_laya_decide && g_laya_pack && g_laya_cases) {
+        /* K-LAYA-001：端到端决策（state + questions -> 带校准概率答案） */
+        return laya_decide(g_laya_pack, g_laya_cases);
+    }
+
+    if (g_yolo_model && g_yolo_rawin) {
+        /* K-YOLO-001：数值门（原始 NCHW -> [4+nc, A]） */
+        return yolo_run_raw(g_yolo_model, g_yolo_rawin,
+                            g_yolo_rawout ? g_yolo_rawout : "yolo_out.f32");
+    }
+    if (g_yolo_model && g_yolo_image) {
+        /* K-YOLO-001：单图检测（自有格式 VQF v4） */
+        return yolo_run_image(g_yolo_model, g_yolo_image, g_yolo_conf, g_yolo_iou);
+    }
+
+    if (g_laya_tok && g_laya_cases) {
+        /* K-LAYA-001：ModernBERT 分词器（text -> ids）对照 */
+        return laya_tok_dump(g_laya_tok, g_laya_cases);
+    }
+
+    if (g_laya_pack && g_laya_cases) {
+        /* K-LAYA-001：Laya 决策模型（ModernBERT 编码器 + 决策头）离线测试 */
+        return laya_run_cases(g_laya_pack, g_laya_cases);
+    }
+
+    if (g_kb_test) {
+        /* K-COLLAB-001 P0：向量库核心自测（不依赖模型/embedding） */
+        return run_kb_test();
+    }
+
+    if (g_kb_query) {
+        /* K-COLLAB-001 P0：向量库检索（向量从文件导入，不接 embedding 前向） */
+        return run_kb_search(g_kb_path, g_kb_query, g_kb_k);
+    }
+    if (g_kb_path && g_kb_docs && g_kb_vecs) {
+        /* K-COLLAB-001 P0：从文件建库（meta + 向量，行对齐） */
+        return run_kb_build(g_kb_path, g_kb_docs, g_kb_vecs);
+    }
+
+    if (g_embed_text || g_embed_file || g_embed_stdin) {
+        /* K-EMB-001：句子向量（embedding）模式
+         * （--embed / --embed-file / --embed-stdin）。 */
+        if (!g_serve_model_dir) {
+            printf("[EMB] 需要 --model <含 model.vqf 的目录或 .vqf 文件>\n");
+            return 1;
+        }
+        char *sbuf = NULL;
+        if (g_embed_stdin) {
+            sbuf = read_all_stdin();
+            if (!sbuf) { printf("[EMB] stdin 读取失败\n"); return 1; }
+        }
+        int rc = run_embed(g_serve_model_dir, sbuf ? sbuf : g_embed_text,
+                           sbuf ? NULL : g_embed_file, g_embed_out);
+        free(sbuf);
+        return rc;
     }
 
     if (g_stream_test) {
@@ -5078,6 +5788,7 @@ int main(int argc, char **argv) {
         test_performance_benchmark();
         /* Release the transparent NPU backend (no-op when never created). */
         st_npu_set(NULL);
+        st_yolo_set_default_npu(NULL);
         vllm_npu_destroy(g_npu);
         printf("\n[ALL TESTS COMPLETE]\n");
         return 0;
@@ -5098,6 +5809,7 @@ int main(int argc, char **argv) {
 
     /* Release the transparent NPU backend (no-op when it was never created). */
     st_npu_set(NULL);
+    st_yolo_set_default_npu(NULL);
     vllm_npu_destroy(g_npu);
 
     printf("\n[ALL TESTS COMPLETE]\n");

@@ -37,6 +37,9 @@
  * tools/bench/tok_ref_check.c，以及引擎内 VLLM_TOK_LINEAR=1 的强制旧路径）。
  * ================================================================ */
 
+/* 前向声明：byte-level BPE 合并表载入（定义见下方 BPE 段）。 */
+static int tok_bpe_load_bin(QwenTokenizer *tok, const char *model_dir);
+
 /* FNV-1a：短键够快，且不需要先求长度。 */
 static uint32_t tok_key_hash(const char *s, int len) {
     uint32_t h = 2166136261u;
@@ -239,6 +242,10 @@ int qwen_tokenizer_load(QwenTokenizer *tok, const char *model_dir) {
                (tok->vocab_tab_mask + 1) * 4.0 / 1048576.0,
                (double)tok->vocab_size / (double)(tok->vocab_tab_mask + 1));
     }
+    /* merges.bin（可选）：载入则启用 byte-level BPE；缺失回退贪心最长前缀。
+     * VLLM_TOK_LEGACY=1 仍可强制旧路径（位级回归对照）。 */
+    if (tok_bpe_load_bin(tok, model_dir) != 0)
+        printf("[TOK] merges.bin not found -> greedy longest-prefix (legacy)\n");
     return 0;
 }
 
@@ -248,6 +255,14 @@ void qwen_tokenizer_free(QwenTokenizer *tok) {
     free(tok->strings);
     free(tok->str_lens);
     free(tok->str_data);
+    free(tok->bpe_str);
+    free(tok->bm_off);
+    free(tok->bm_llen);
+    free(tok->bm_rlen);
+    free(tok->bm_tab);
+    free(tok->at_id);
+    free(tok->at_off);
+    free(tok->at_len);
     memset(tok, 0, sizeof(*tok));
 }
 
@@ -388,9 +403,481 @@ static int special_start_after(const char *rem, int rem_len) {
     return rem_len;
 }
 
+/* ================================================================
+ * byte-level BPE 编码（merges.bin）—— 与 HF/tokenizers 位级对齐
+ *
+ * 旧编码器（下方 qwen_tokenizer_encode 的 legacy 分支）是"逐位置取最长词表
+ * 前缀"，与 HF 的 BPE 合并序不同（"Explain" → 贪心 "Expla"+"in"，HF 为
+ * "Ex"+"plain"）。BPE 路径：
+ *   1) 先在文本里整串匹配 added_tokens（<|im_*|>/<think> 等）→ 直接出 id；
+ *   2) 否则按 Qwen 预分词正则（GPT2 家族）近似切出一个 piece；
+ *   3) raw 字节 → repr 域（GPT2 bytes_to_unicode，'Ġ'/'Ċ'）；
+ *   4) 在 repr 序列上按 merges rank 做**最小合并**（左优先）；
+ *   5) 每个符号在词表（repr 域）里查 id。
+ * merges.bin 缺失时回退 legacy 贪心（行为与改动前一致）。
+ * ================================================================ */
+
+#define TK_BPE_MAXSYM 4096
+#define TK_BPE_RBUF   (TK_BPE_MAXSYM * 4)
+
+/* raw 字节 → 引擎词表域（与 vocab.bin 的存储域一致）。
+ * 实测（对比 tokenizer.json vocab 反查 vocab.bin，151643/151643 一致）：
+ * 引擎词表存**原始字节**，仅对 b <= 0x20 的字节做 bytes_to_unicode 编码
+ * （即 codepoint = 256+b：space=0x20→U+0120 'Ġ'(C4 A0)、\n=0x0A→U+010A 'Ċ'、
+ *  tab=0x09→U+0109 …）；其余字节（含 CJK 的 0x80-0xFF 与 0x7F）全部原样。
+ * 注意：这不是标准 GPT2 bytes_to_unicode（后者把 0x7F-0xA0 也重映射），
+ * 但与本引擎 vocab.bin 一致，故 BPE 的 merges/vocab 都按此域比较。 */
+static uint8_t s_b2u_len[256];
+static char    s_b2u[256][4];
+static int     s_b2u_ready = 0;
+
+static void b2u_init(void) {
+    if (s_b2u_ready) return;
+    for (int b = 0; b < 256; b++) {
+        if (b > 0x20) {
+            /* 原样单字节（含 0x80-0xFF 与 0x7F）：引擎词表按原始字节存。 */
+            s_b2u[b][0] = (char)b; s_b2u_len[b] = 1;
+            continue;
+        }
+        /* b <= 0x20：repr 域，codepoint = 256+b，UTF-8 编码（空格/换行 → 'Ġ'/'Ċ'）。 */
+        uint32_t cp = (uint32_t)(256 + b);
+        s_b2u[b][0] = (char)(0xC0 | (cp >> 6));
+        s_b2u[b][1] = (char)(0x80 | (cp & 0x3F));
+        s_b2u_len[b] = 2;
+    }
+    s_b2u_ready = 1;
+}
+
+static uint32_t bpe_pair_hash(const char *a, int la, const char *b, int lb) {
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < la; i++) { h ^= (uint8_t)a[i]; h *= 16777619u; }
+    h ^= 0xFFu; h *= 16777619u;
+    for (int i = 0; i < lb; i++) { h ^= (uint8_t)b[i]; h *= 16777619u; }
+    return h;
+}
+
+/* 查 (a,b) 的 merge rank（列表下标）；无合并返回 -1。 */
+static int bpe_rank(const QwenTokenizer *tok, const char *a, int la,
+                    const char *b, int lb) {
+    if (!tok->bm_tab || tok->n_merges <= 0 || la <= 0 || lb <= 0) return -1;
+    uint32_t mask = (uint32_t)tok->bm_mask;
+    uint32_t h = bpe_pair_hash(a, la, b, lb) & mask;
+    for (;;) {
+        int slot = tok->bm_tab[h];
+        if (slot == 0) return -1;
+        int i = slot - 1;
+        if (tok->bm_llen[i] == la && tok->bm_rlen[i] == lb &&
+            memcmp(tok->bpe_str + tok->bm_off[i], a, (size_t)la) == 0 &&
+            memcmp(tok->bpe_str + tok->bm_off[i] + la, b, (size_t)lb) == 0)
+            return i;
+        h = (h + 1) & mask;
+    }
+}
+
+/* ---- UTF-8 解码 + Unicode 粗分类（\p{L}/\p{N}/\s 的工程近似）---- */
+static int u8_dec(const unsigned char *s, int len, uint32_t *cp) {
+    unsigned char c = s[0];
+    if (c < 0x80) { *cp = c; return 1; }
+    int n; uint32_t v;
+    if ((c & 0xE0) == 0xC0) { n = 1; v = c & 0x1F; }
+    else if ((c & 0xF0) == 0xE0) { n = 2; v = c & 0x0F; }
+    else if ((c & 0xF8) == 0xF0) { n = 3; v = c & 0x07; }
+    else { *cp = c; return 1; }
+    if (n > len - 1) { *cp = c; return 1; }
+    for (int i = 1; i <= n; i++) {
+        if ((s[i] & 0xC0) != 0x80) { *cp = c; return 1; }
+        v = (v << 6) | (uint32_t)(s[i] & 0x3F);
+    }
+    *cp = v;
+    return n + 1;
+}
+static int cp_nl(uint32_t c) { return c == '\n' || c == '\r'; }
+/* 非换行空白（\\s 减去 \\r\\n）。注意 \\s 本身含 \\r\\n，故另有 cp_ws 合并。 */
+static int cp_sp(uint32_t c) {
+    return c == ' ' || c == '\t' || c == '\v' || c == '\f' || c == 0x85 ||
+           c == 0xA0 || c == 0x1680 || (c >= 0x2000 && c <= 0x200A) ||
+           c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F ||
+           c == 0x3000;
+}
+/* \\s（含 \\r\\n）。 */
+static int cp_ws(uint32_t c) { return cp_sp(c) || cp_nl(c); }
+/* 近似 \p{N}：ASCII 数字 + 全角数字。 */
+static int cp_dig(uint32_t c) {
+    return (c >= '0' && c <= '9') || (c >= 0xFF10 && c <= 0xFF19);
+}
+/* 近似 \p{L}：ASCII 字母，或非 ASCII 且**不落在常见标点/符号块**的码点
+ * （覆盖 CJK/拉丁扩展；显式排除全角标点、CJK 标点、通用标点、符号/emoji）。 */
+static int cp_let(uint32_t c) {
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) return 1;
+    if (c < 0x80) return 0;
+    if (cp_ws(c)) return 0;
+    if (c >= 0x00A1 && c <= 0x00BF)          /* ¡¢£…¿（ª º µ 例外为字母） */
+        return (c == 0xAA || c == 0xBA || c == 0xB5) ? 1 : 0;
+    if (c == 0xD7 || c == 0xF7) return 0;    /* × ÷ */
+    if (c >= 0x2000 && c <= 0x206F) return 0;/* General Punctuation */
+    if (c >= 0x2190 && c <= 0x2BFF) return 0;/* Arrows/Math/Misc symbols */
+    if (c >= 0x2E00 && c <= 0x2E7F) return 0;/* Supplemental Punctuation */
+    if (c >= 0x3000 && c <= 0x303F) return 0;/* CJK Symbols & Punctuation */
+    if (c >= 0xFE30 && c <= 0xFE6F) return 0;/* CJK Compat Forms / small forms */
+    if (c >= 0xFF01 && c <= 0xFF0F) return 0;/* 全角标点第一段 */
+    if (c >= 0xFF1A && c <= 0xFF20) return 0;/* ：；＜＝＞？＠ */
+    if (c >= 0xFF3B && c <= 0xFF40) return 0;/* ［＼］＾＿｀ */
+    if (c >= 0xFF5B && c <= 0xFF65) return 0;/* ｛｜｝～ 及半角 katakana 标点段 */
+    if (c >= 0xFFE0 && c <= 0xFFEE) return 0;/* ￠￡… */
+    if (c >= 0x1F000 && c <= 0x1FAFF) return 0; /* 符号/emoji */
+    return 1;
+}
+
+/* 预分词：Qwen3 Split 正则（顺序即优先级）：
+ *   (?i:'s|'t|'re|'ve|'m|'ll|'d)
+ *   |[^\r\n\p{L}\p{N}]?\p{L}+ |\p{N} | ?[^\s\p{L}\p{N}]+[\r\n]*
+ *   |\s*[\r\n]+ |\s+(?!\S) |\s+
+ * 返回下一个 piece 的字节长度（≥1）。 */
+static int m_g1(const unsigned char *s, int len) {
+    if (s[0] != '\'') return 0;
+    static const char *c[] = { "s", "t", "re", "ve", "m", "ll", "d" };
+    for (int k = 0; k < 7; k++) {
+        int l = (int)strlen(c[k]);
+        if (1 + l > len) continue;
+        int ok = 1;
+        for (int i = 0; i < l; i++) {
+            char ch = (char)s[1 + i];
+            if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
+            if (ch != c[k][i]) { ok = 0; break; }
+        }
+        if (ok) return 1 + l;
+    }
+    return 0;
+}
+static int m_g2(const unsigned char *s, int len) {
+    uint32_t c; int n = u8_dec(s, len, &c);
+    int off = 0;
+    if (!cp_let(c)) {
+        if (cp_nl(c) || cp_dig(c)) return 0;
+        if (n >= len) return 0;
+        uint32_t c1; int n1 = u8_dec(s + n, len - n, &c1);
+        if (!cp_let(c1)) return 0;
+        off = n;
+    }
+    int p = off;
+    while (p < len) {
+        uint32_t cc; int nn = u8_dec(s + p, len - p, &cc);
+        if (!cp_let(cc)) break;
+        p += nn;
+    }
+    return (p > off) ? p : 0;
+}
+static int m_g3(const unsigned char *s, int len) {
+    uint32_t c; int n = u8_dec(s, len, &c);
+    return cp_dig(c) ? n : 0;
+}
+static int m_g4(const unsigned char *s, int len) {
+    int p = (s[0] == ' ') ? 1 : 0;
+    int q = p, cnt = 0;
+    while (q < len) {
+        uint32_t c; int n = u8_dec(s + q, len - q, &c);
+        if (cp_ws(c) || cp_let(c) || cp_dig(c)) break;
+        q += n; cnt++;
+    }
+    if (cnt == 0) return 0;
+    while (q < len) {
+        uint32_t c; int n = u8_dec(s + q, len - q, &c);
+        if (!cp_nl(c)) break;
+        q += n;
+    }
+    return q;
+}
+static int m_g5(const unsigned char *s, int len) {
+    int q = 0, last_nl = -1;
+    while (q < len) {
+        uint32_t c; int n = u8_dec(s + q, len - q, &c);
+        if (!cp_ws(c)) break;
+        if (cp_nl(c)) last_nl = q;
+        q += n;
+    }
+    return (last_nl >= 0) ? last_nl + 1 : 0;
+}
+static int m_g6(const unsigned char *s, int len) {
+    /* \s+(?!\S)：空白段**后接非空白**时回溯到 R-1（把最后一个空白留给下一段
+     * 作为 'Ġ' 前缀），段尾到底才全取。否则 "a    b" 会整段成 'ĠĠĠĠ'，与 HF
+     * 的 ['ĠĠĠ','Ġb'] 不一致。 */
+    int q = 0;
+    while (q < len) {
+        uint32_t c; int n = u8_dec(s + q, len - q, &c);
+        if (!cp_ws(c)) break;
+        q += n;
+    }
+    if (q <= 0) return 0;
+    if (q == len) return q;
+    return (q - 1 >= 1) ? (q - 1) : 0;
+}
+static int m_g7(const unsigned char *s, int len) {
+    int q = 0;
+    while (q < len) {
+        uint32_t c; int n = u8_dec(s + q, len - q, &c);
+        if (!cp_ws(c)) break;
+        q += n;
+    }
+    return q;
+}
+static int pretoken_span(const unsigned char *s, int len) {
+    int r;
+    if ((r = m_g1(s, len))) return r;
+    if ((r = m_g2(s, len))) return r;
+    if ((r = m_g3(s, len))) return r;
+    if ((r = m_g4(s, len))) return r;
+    if ((r = m_g5(s, len))) return r;
+    if ((r = m_g6(s, len))) return r;
+    if ((r = m_g7(s, len))) return r;
+    return 1;   /* 兜底：单字节 */
+}
+
+/* 预分词：tokenizers ByteLevel(use_regex=true) = GPT-2 正则（K-LAYA-001）：
+ *   (?i:'s|'t|'re|'ve|'m|'ll|'d)
+ *   | ?\p{L}+ | ?\p{N}+ | ?[^\s\p{L}\p{N}]+ | \s+(?!\S) | \s+
+ * 与 Qwen 版的差异：前缀仅「可选一个空格」（非任意非字母数字字符）、数字成组、
+ * 标点段不带尾随换行、无 \s*[\r\n]+ 组。 */
+static int pretoken_span_gpt2(const unsigned char *s, int len) {
+    int r;
+    if ((r = m_g1(s, len))) return r;
+    {   /* ' ?\p{L}+' */
+        int p = (s[0] == ' ') ? 1 : 0, q = p;
+        while (q < len) { uint32_t c; int n = u8_dec(s + q, len - q, &c); if (!cp_let(c)) break; q += n; }
+        if (q > p) return q;
+    }
+    {   /* ' ?\p{N}+' */
+        int p = (s[0] == ' ') ? 1 : 0, q = p;
+        while (q < len) { uint32_t c; int n = u8_dec(s + q, len - q, &c); if (!cp_dig(c)) break; q += n; }
+        if (q > p) return q;
+    }
+    {   /* ' ?[^\s\p{L}\p{N}]+' */
+        int p = (s[0] == ' ') ? 1 : 0, q = p, cnt = 0;
+        while (q < len) {
+            uint32_t c; int n = u8_dec(s + q, len - q, &c);
+            if (cp_ws(c) || cp_let(c) || cp_dig(c)) break;
+            q += n; cnt++;
+        }
+        if (cnt > 0) return q;
+    }
+    if ((r = m_g6(s, len))) return r;   /* \s+(?!\S) */
+    if ((r = m_g7(s, len))) return r;   /* \s+ */
+    return 1;
+}
+
+/* 载入 merges.bin（见 tools/gen_merges_bin.py 的二进制布局）。 */
+static int tok_bpe_load_bin(QwenTokenizer *tok, const char *model_dir) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/merges.bin", model_dir);
+    FILE *f = st_fopen(path, "rb");
+    if (!f) {
+        snprintf(path, sizeof(path), "%s/build/merges.bin", model_dir);
+        f = st_fopen(path, "rb");
+    }
+    if (!f) {
+#ifdef __linux__
+        char exe_path[1024];
+        ssize_t rl = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+        if (rl > 0) {
+            exe_path[rl] = '\0';
+            char *slash = strrchr(exe_path, '/');
+            if (slash) {
+                *slash = '\0';
+                snprintf(path, sizeof(path), "%s/merges.bin", exe_path);
+                f = st_fopen(path, "rb");
+            }
+        }
+#endif
+    }
+    if (!f) return -1;
+
+    uint32_t hdr[4];
+    if (fread(hdr, 4, 4, f) != 4 || hdr[0] != 0x314D4251u) { fclose(f); return -1; }
+    int nm = (int)hdr[2], na = (int)hdr[3];
+    if (nm <= 0 || nm > 4000000 || na < 0 || na > 200000) { fclose(f); return -1; }
+
+    uint32_t *off = malloc(sizeof(uint32_t) * (size_t)nm);
+    uint16_t *ll  = malloc(sizeof(uint16_t) * (size_t)nm);
+    uint16_t *lr  = malloc(sizeof(uint16_t) * (size_t)nm);
+    size_t cap = 1u << 20, len = 0;
+    char *str = malloc(cap);
+    if (!off || !ll || !lr || !str) {
+        free(off); free(ll); free(lr); free(str); fclose(f); return -1;
+    }
+    int ok = 1;
+    for (int i = 0; i < nm && ok; i++) {
+        uint16_t a, b;
+        if (fread(&a, 2, 1, f) != 1 || fread(&b, 2, 1, f) != 1) { ok = 0; break; }
+        if (len + (size_t)a + b > cap) {
+            while (len + (size_t)a + b > cap) cap <<= 1;
+            char *ns = realloc(str, cap);
+            if (!ns) { ok = 0; break; }
+            str = ns;
+        }
+        off[i] = (uint32_t)len; ll[i] = a; lr[i] = b;
+        if (a && fread(str + len, 1, a, f) != a) { ok = 0; break; }
+        len += a;
+        if (b && fread(str + len, 1, b, f) != b) { ok = 0; break; }
+        len += b;
+    }
+    int tcap = 1;
+    while (tcap < nm * 2) tcap <<= 1;
+    int *tab = ok ? calloc((size_t)tcap, sizeof(int)) : NULL;
+    if (ok && !tab) ok = 0;
+    if (ok) {
+        uint32_t mask = (uint32_t)(tcap - 1);
+        for (int i = 0; i < nm; i++) {
+            uint32_t h = bpe_pair_hash(str + off[i], ll[i],
+                                       str + off[i] + ll[i], lr[i]) & mask;
+            while (tab[h]) h = (h + 1) & mask;
+            tab[h] = i + 1;
+        }
+    }
+    uint32_t *aid = NULL; uint32_t *aoff = NULL; uint16_t *alen = NULL;
+    if (ok && na > 0) {
+        aid  = malloc(sizeof(uint32_t) * (size_t)na);
+        aoff = malloc(sizeof(uint32_t) * (size_t)na);
+        alen = malloc(sizeof(uint16_t) * (size_t)na);
+        if (!aid || !aoff || !alen) ok = 0;
+    }
+    for (int i = 0; i < na && ok; i++) {
+        uint32_t id; uint16_t cl;
+        if (fread(&id, 4, 1, f) != 1 || fread(&cl, 2, 1, f) != 1) { ok = 0; break; }
+        if (len + cl > cap) {
+            while (len + cl > cap) cap <<= 1;
+            char *ns = realloc(str, cap);
+            if (!ns) { ok = 0; break; }
+            str = ns;
+        }
+        aoff[i] = (uint32_t)len; alen[i] = cl; aid[i] = id;
+        if (cl && fread(str + len, 1, cl, f) != cl) { ok = 0; break; }
+        len += cl;
+    }
+    fclose(f);
+    if (!ok) {
+        free(off); free(ll); free(lr); free(str); free(tab);
+        free(aid); free(aoff); free(alen);
+        return -1;
+    }
+    tok->bpe_str = str; tok->bpe_str_len = len;
+    tok->bm_off = off; tok->bm_llen = ll; tok->bm_rlen = lr;
+    tok->bm_tab = tab; tok->bm_mask = tcap - 1; tok->n_merges = nm;
+    tok->at_id = aid; tok->at_off = aoff; tok->at_len = alen; tok->n_added = na;
+    tok->bpe_ready = 1;
+    printf("[TOK] BPE merges loaded: %d merges, %d added tokens (%zu KB)\n",
+           nm, na, len / 1024);
+    return 0;
+}
+
+/* 从 from 起找最近的 added-token 起始字节偏移（找不到返回 len）。
+ * added（<|im_*|>/<think> 等）都以 '<' 开头，只在 '<' 处比对。用作预分词
+ * piece 的硬边界：否则 "。" + "<|im_end|>" 会被 g4 当成一段 "。<" 合并，
+ * 把特殊 token 的首字节吞掉（模板尾错位）。 */
+static int next_added_start(const QwenTokenizer *tok, const char *s, int len,
+                            int from) {
+    for (int k = from; k < len; k++) {
+        /* K-LAYA-001：added token 首字节不一定 '<'（ModernBERT 有 '|'/'['/空格），
+         * 故在所有位置试匹配；对 Qwen（全 '<' 前缀）结果不变。 */
+        for (int i = 0; i < tok->n_added; i++) {
+            int l = tok->at_len[i];
+            if (l <= 0 || k + l > len) continue;
+            if (memcmp(s + k, tok->bpe_str + tok->at_off[i], (size_t)l) == 0)
+                return k;
+        }
+    }
+    return len;
+}
+
+static int tok_bpe_encode(QwenTokenizer *tok, const char *text, int text_len,
+                          int *token_ids, int max_tokens, int gpt2_span) {
+    b2u_init();
+    const unsigned char *s = (const unsigned char *)text;
+    int pos = 0, num = 0;
+    while (pos < text_len && num < max_tokens) {
+        /* 1. added/special 整串最长匹配 */
+        int best = -1, best_len = 0;
+        for (int i = 0; i < tok->n_added; i++) {
+            int l = tok->at_len[i];
+            if (l <= best_len || l > text_len - pos) continue;
+            if (memcmp(text + pos, tok->bpe_str + tok->at_off[i], (size_t)l) == 0) {
+                best = i; best_len = l;
+            }
+        }
+        if (best >= 0) {
+            token_ids[num++] = (int)tok->at_id[best];
+            pos += best_len;
+            continue;
+        }
+        /* 2. 预分词切 piece；超长 piece 切分处理（避免栈内固定缓冲溢出） */
+        int wlen = gpt2_span ? pretoken_span_gpt2(s + pos, text_len - pos)
+                             : pretoken_span(s + pos, text_len - pos);
+        if (wlen <= 0) wlen = 1;
+        if (wlen > text_len - pos) wlen = text_len - pos;
+        if (wlen > TK_BPE_MAXSYM) wlen = TK_BPE_MAXSYM;
+        /* added-token 硬边界：piece 不得跨过后面出现的特殊 token 起始位置。 */
+        int cap = next_added_start(tok, text + pos, text_len - pos, 1);
+        if (wlen > cap) wlen = cap;
+
+        /* 3. raw → repr */
+        char rb[TK_BPE_RBUF];
+        int rl = 0;
+        for (int i = 0; i < wlen; i++) {
+            int L = s_b2u_len[s[pos + i]];
+            memcpy(rb + rl, s_b2u[s[pos + i]], (size_t)L);
+            rl += L;
+        }
+        /* 4. BPE 最小合并（左优先） */
+        int bnd[TK_BPE_MAXSYM + 1];
+        int ns = 0, o = 0;
+        for (int i = 0; i < wlen; i++) { bnd[ns++] = o; o += s_b2u_len[s[pos + i]]; }
+        bnd[ns] = o;
+        for (;;) {
+            int bi = -1, brank = 0x7FFFFFFF;
+            for (int i = 0; i + 1 < ns; i++) {
+                int r = bpe_rank(tok, rb + bnd[i], bnd[i + 1] - bnd[i],
+                                      rb + bnd[i + 1], bnd[i + 2] - bnd[i + 1]);
+                if (r >= 0 && r < brank) { brank = r; bi = i; }
+            }
+            if (bi < 0) break;
+            for (int j = bi + 1; j < ns; j++) bnd[j] = bnd[j + 1];
+            ns--;
+        }
+        if (getenv("VLLM_TOK_DBG")) {
+            fprintf(stderr, "[TOK-DBG] piece=");
+            for (int i = 0; i < wlen; i++) fprintf(stderr, "%02x", s[pos + i]);
+            fprintf(stderr, " syms=");
+            for (int i = 0; i < ns; i++) {
+                fprintf(stderr, "[");
+                for (int k = bnd[i]; k < bnd[i + 1]; k++)
+                    fprintf(stderr, "%02x", (unsigned char)rb[k]);
+                fprintf(stderr, "]");
+            }
+            fprintf(stderr, "\n");
+        }
+        /* 5. 逐符号查词表 */
+        for (int i = 0; i < ns && num < max_tokens; i++) {
+            int id = find_exact_token(tok, rb + bnd[i], bnd[i + 1] - bnd[i]);
+            token_ids[num++] = (id >= 0) ? id : 0;
+        }
+        pos += wlen;
+    }
+    return num;
+}
+
+/* K-LAYA-001：GPT-2/ByteLevel 预分词版编码（供 ModernBERT/Laya 使用）。
+ * 复用同一 QwenTokenizer（vocab.bin + merges.bin 均为「引擎域」），仅换预分词正则。 */
+int qwen_tokenizer_encode_gpt2(QwenTokenizer *tok, const char *text,
+                               int *token_ids, int max_tokens) {
+    if (!tok->is_loaded || !tok->bpe_ready) return 0;
+    return tok_bpe_encode(tok, text, (int)strlen(text), token_ids, max_tokens, 1);
+}
+
 int qwen_tokenizer_encode(QwenTokenizer *tok, const char *text,
                            int *token_ids, int max_tokens) {
     if (!tok->is_loaded) return 0;
+
+    const char *legacy = getenv("VLLM_TOK_LEGACY");
+    if (tok->bpe_ready && !(legacy && legacy[0] == '1'))
+        return tok_bpe_encode(tok, text, (int)strlen(text), token_ids, max_tokens, 0);
 
     int text_len = (int)strlen(text);
     int pos = 0;

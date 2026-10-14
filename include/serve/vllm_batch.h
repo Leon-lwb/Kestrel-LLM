@@ -53,6 +53,9 @@ typedef struct {
     int   *out_len;
     /* 方案 2：原始请求体 SM3 的 64-hex（vllm_attest 出证用；NULL=不出证）。 */
     const char *body_sha;
+    /* 自定义 SSE 扩展事件（metrics/attest）opt-in 开关；0（默认）= 仅发标准
+     * chat.completion.chunk 事件，保证标准 OpenAI 客户端可逐 chunk 解析。 */
+    int emit_meta;
     /* result */
     int rc;                     /* 0 ok; -1 engine/prefill failure; -2 prompt
                                  * exceeds context; -3 no batch slot (timeout) */

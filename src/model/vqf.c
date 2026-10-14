@@ -235,8 +235,14 @@ int vqf_load(STModelWeights *w, const char *path) {
     const VQFHeader *raw = (const VQFHeader *)m.data;
     if (raw->magic != VQF_MAGIC) { st_mmap_close(&m); return -1; }
     if (raw->version != VQF_VERSION && raw->version != VQF_VERSION_MOE) {
-        fprintf(stderr, "[VQF] version %u unsupported (need %u/%u)\n",
-                raw->version, VQF_VERSION, VQF_VERSION_MOE);
+        if (raw->version == VQF_VERSION_DET) {
+            fprintf(stderr, "[VQF] v%u is a DETECTION model (YOLO) - "
+                            "load it via the YOLO path, not the LLM loader\n",
+                    raw->version);
+        } else {
+            fprintf(stderr, "[VQF] version %u unsupported (need %u/%u)\n",
+                    raw->version, VQF_VERSION, VQF_VERSION_MOE);
+        }
         st_mmap_close(&m); return -1;
     }
     /* 兼容旧版 41 字段 VQFArch 头：判定布局并归一化为新头（新头原样拷贝） */

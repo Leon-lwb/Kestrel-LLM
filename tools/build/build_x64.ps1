@@ -1,4 +1,4 @@
-﻿# build_x64.ps1 - Windows x64 (MinGW-w64) 构建脚本（x86「可验证」副产物）
+# build_x64.ps1 - Windows x64 (MinGW-w64) 构建脚本（x86「可验证」副产物）
 #
 # 定位：主树为双架构（aarch64-Linux 一级目标 + x86-64/MinGW 副分支）。x86 构建
 #       只用于「可编译 + 自检与 ARM 同口径」的回归，**不作性能基准**
@@ -50,21 +50,26 @@ $src = @(
   'src/core/vllm_transformer.c','src/core/vllm_tokenizer.c','src/core/vllm_matmul.c',
   'src/core/vllm_tp.c','src/core/vllm_ep.c','src/core/vllm_l3.c','src/core/vllm_fhe.c','src/core/vllm_ckks.c',
   'src/core/vllm_ntt.c',
+  'src/core/vllm_kvstore.c',
   'src/common/vllm_device.c','src/common/vllm_crypto.c',
   'src/serve/vllm_http.c','src/serve/vllm_server.c','src/serve/vllm_batch.c',
   'src/serve/vllm_admin.c','src/serve/vllm_attest.c','src/serve/embedded_web.c',
   'src/serve/vllm_rulebook.c','src/serve/vllm_session.c','src/serve/vllm_audit.c',
   'src/model/vllm_safetensors.c','src/model/vqf.c',
   'src/model/vllm_tokenizer_qwen.c','src/model/vllm_vision.c','src/model/vllm_media.c',
+  'src/model/vllm_laya.c',
+  'src/model/vllm_yolo.c',
+  'src/media/vllm_vsrc.c','src/media/vllm_rtsp.c',
+  'src/media/h264_dec.c','src/media/vllm_mp4.c',
   'src/npu/vllm_npu.c'
 )
-$incs = @('-Iinclude/common','-Iinclude/core','-Iinclude/serve','-Iinclude/model',
+$incs = @('-Iinclude','-Iinclude/common','-Iinclude/core','-Iinclude/serve','-Iinclude/model',
           '-Iinclude/media','-Iinclude/npu','-Iinclude/npu/rk3588','-Isrc')
 # 编译前先删旧产物：否则「产物存在」不等于「本次构建成功」——
 # check_x64.ps1 只判 Test-Path，链接失败时会静默沿用上一次的旧二进制
 # （2026-09-28 实测：非 ASCII 路径下 ld 报 cannot open output file，脚本仍报 PASS）。
 Remove-Item $out -Force -ErrorAction SilentlyContinue
-& $Gcc -std=gnu11 -O2 -D_GNU_SOURCE -mavx2 -mfma -ffp-contract=off `
+& $Gcc -std=gnu11 -O2 -D_GNU_SOURCE -mavx2 -mfma -mf16c -fopenmp -ffp-contract=off `
   -Wno-error=incompatible-pointer-types -Wno-error=int-conversion `
   -Wno-error=implicit-function-declaration `
   @incs @src -o $out -lm -lws2_32 -lbcrypt 2>&1 | Tee-Object -Variable errs

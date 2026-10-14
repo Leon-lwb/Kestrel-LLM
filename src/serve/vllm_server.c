@@ -20,6 +20,11 @@
 #include "embedded_web.h"
 #include "vllm_rulebook.h"   /* 规则包注册中心：预置命名上下文（--rulebook-dir） */
 #include "vllm_session.h"    /* 服务端会话存储：会话分区 + 历史审查（--session-dir） */
+#include "vllm_laya.h"       /* K-LAYA-001：Laya 决策模型独立路径（POST /v1/systemone） */
+#include "vllm_yolo.h"       /* K-YOLO-001：YOLO 检测独立路径（POST /v1/detect） */
+#include "media/vllm_vsrc.h" /* K-E2E-005：视频源抽象（MP4/目录/MJPEG/RTSP） */
+#include "vllm_media.h"      /* 图像解码（media_load_image_memory / base64） */
+#include "vllm_kvstore.h"    /* K-COLLAB-001 P0：向量库（/v1/rag 检索） */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -272,6 +277,18 @@ static char *build_completion_prompt(VLLMServerCtx *ctx, const char *prompt,
 /* ---------- response helpers ---------- */
 
 static long unix_now(void) { return (long)time(NULL); }
+
+/* 标准 OpenAI usage 对象（prompt/completion/total tokens），供非流式响应
+ * 的 "usage" 字段使用（此前为空对象，标准客户端拿不到 token 计数）。 */
+static VJson *usage_json(const VLLMMetrics *met) {
+    VJson *u = vjson_new_object();
+    int pt = met ? met->prompt_tokens : 0;
+    int ct = met ? met->n_tokens : 0;
+    vjson_obj_set(u, "prompt_tokens", vjson_new_number((double)pt));
+    vjson_obj_set(u, "completion_tokens", vjson_new_number((double)ct));
+    vjson_obj_set(u, "total_tokens", vjson_new_number((double)(pt + ct)));
+    return u;
+}
 
 /* Fill resp with a heap-allocated JSON error (thread-safe; the server
  * frees resp->body_owned after sending). */
@@ -1130,7 +1147,7 @@ static int emit_token(VLLMServerCtx *ctx, QwenTokenizer *tok, Utf8Incr *dec,
 static int decode_loop(VLLMServerCtx *ctx, double temperature, double top_p,
                        double min_p, int top_k, int thinking, int max_tokens,
                        int stream,
-                       VHttpConn *conn, StrBuf *out,
+                       VHttpConn *conn, int emit_meta, StrBuf *out,
                        VLLMMetrics *met, int **gen_ids_out, int *gen_n_out,
                        const int *prompt_ids, int n_prompt,
                        const char *att_user, const char *att_bodyhex) {
@@ -1499,8 +1516,10 @@ static int decode_loop(VLLMServerCtx *ctx, double temperature, double top_p,
         char line[4300];
         int ln = snprintf(line, sizeof(line), "data: %s\n\n", dbuf);
         if (ln > 0) vhttp_stream_write(conn, line, (size_t)ln);
-        /* Final event: per-request metrics for the chat client. */
-        if (met) {
+        /* Final event: per-request metrics for the chat client.
+         * 标准 OpenAI 客户端只认 choices 事件，故自定义事件仅在客户端显式
+         * opt-in（请求头 X-Kestrel-Meta）时下发，默认流严格标准。 */
+        if (emit_meta && met) {
             char mline[768];
             double tok_s = met->total_ms > 0.0
                            ? (double)met->n_tokens * 1000.0 / met->total_ms : 0.0;
@@ -1521,7 +1540,7 @@ static int decode_loop(VLLMServerCtx *ctx, double temperature, double top_p,
         }
         /* history_tokens 事件：完整 token 序列（prompt + generated），客户端
          * 保存供下轮 context_tokens 精确复用。 */
-        {
+        if (emit_meta) {
             int total = n_prompt + gn;
             size_t cap = (size_t)total * 8 + 128;
             char *tbuf = (char *)malloc(cap);
@@ -1549,7 +1568,7 @@ static int decode_loop(VLLMServerCtx *ctx, double temperature, double top_p,
         }
         /* 方案 2：流式出证。对所有文本已累计（out）的流式响应附一个
          * chat.completion.attest 事件（含 SM2 签名凭证）。 */
-        if (vatt_active() && out && out->s) {
+        if (emit_meta && vatt_active() && out && out->s) {
             VAttestReq ar;
             memset(&ar, 0, sizeof(ar));
             ar.user = att_user;
@@ -1600,6 +1619,7 @@ static int run_completion(VLLMServerCtx *ctx, const char *prompt,
                           double temperature, double top_p, double min_p,
                           int top_k, int thinking,
                           int max_tokens, int stream, VHttpConn *conn,
+                          int emit_meta,
                           StrBuf *out, VLLMMetrics *met,
                           int **hist_ids, int *hist_n,
                           const char *att_user, const char *att_bodyhex) {
@@ -1741,7 +1761,7 @@ static int run_completion(VLLMServerCtx *ctx, const char *prompt,
     int *gids = NULL; int gn = 0;
     int rc = decode_loop(ctx, temperature, top_p, min_p, top_k, thinking,
                          max_tokens, stream,
-                         conn, out, met, &gids, &gn, ids, n_ids,
+                         conn, emit_meta, out, met, &gids, &gn, ids, n_ids,
                          att_user, att_bodyhex);
     if (rc == 0) {
         /* Remember this request's full KV token sequence (prompt + generated)
@@ -1801,6 +1821,7 @@ static int run_completion_mm(VLLMServerCtx *ctx,
                              double temperature, double top_p, double min_p,
                              int top_k, int thinking,
                              int max_tokens, int stream, VHttpConn *conn,
+                             int emit_meta,
                              StrBuf *out, VLLMMetrics *met,
                              const unsigned long long *mm_marks,
                              const char *att_user, const char *att_bodyhex) {
@@ -1851,7 +1872,7 @@ static int run_completion_mm(VLLMServerCtx *ctx,
     int *gids = NULL; int gn = 0;
     int rc = decode_loop(ctx, temperature, top_p, min_p, top_k, thinking,
                          max_tokens, stream,
-                         conn, out, met, &gids, &gn,
+                         conn, emit_meta, out, met, &gids, &gn,
                          prompt_tokens, n_prompt,
                          att_user, att_bodyhex);
     if (rc == 0 && ctx->prefix_kv && mm_marks) {
@@ -2476,6 +2497,103 @@ static int ensure_model_ready(VLLMServerCtx *ctx, VHttpResponse *resp) {
     return 0;
 }
 
+/* ---------- 云边协同：云端上游回退（--cloud-endpoint） ----------
+ * 触发由 ctx->cloud_fallback 决定：0=never（默认，零回归）/ 1=on-unready / 2=always。
+ * 命中时把请求转发到云端上游，并**显式**标记 `x-kestrel-source: cloud` + 记 [UPLINK]
+ * 日志；转发失败返回**显式 502**，绝不静默退回本地（公理 silent_fallback_false_pass）。
+ * 标准 OpenAI 契约：客户端 stream=true 时透传上游 SSE（vhttp_stream_*），
+ * 非流式则回 JSON；上游错误码一律回 JSON 错误体（与 OpenAI 一致）。
+ * 返回 0 = 已应答（resp 填好，调用方立即 return）；-1 = 未触发（调用方走本地路径）。
+ * 边界：仅明文 http://（https 显式 502，前置 TLS 网关）。 */
+static int cloud_fallback_serve(VLLMServerCtx *ctx, const VHttpRequest *req,
+                                VHttpResponse *resp, VHttpConn *conn) {
+    if (!ctx->cloud_endpoint || ctx->cloud_endpoint[0] == 0) return -1;
+    if (ctx->cloud_fallback == 0) return -1;                         /* never */
+    if (ctx->cloud_fallback == 1 && ctx->load_state == 2) return -1; /* on-unready: 本地就绪则本地服务 */
+
+    char url[1200];
+    snprintf(url, sizeof(url), "%s%s", ctx->cloud_endpoint, req->path);
+
+    /* 请求体：解析后可选覆盖 model；stream 由客户端原样透传（标准契约）。
+     * 解析失败则原样转发。 */
+    char *fwd = NULL;
+    size_t fwd_len = 0;
+    int want_stream = 0;
+    VJson *b = req->body ? vjson_parse(req->body) : NULL;
+    if (b && b->type == VJ_OBJECT) {
+        VJson *sv = vjson_obj_get(b, "stream");
+        if (sv && sv->type == VJ_BOOL) want_stream = sv->u.boolean;
+        if (ctx->cloud_model && ctx->cloud_model[0])
+            vjson_obj_set(b, "model", vjson_new_string(ctx->cloud_model));
+        size_t cap = req->body_len + 4096;
+        fwd = (char *)malloc(cap);
+        if (fwd) {
+            fwd_len = vjson_serialize(b, fwd, cap);
+            if (fwd_len == 0) { free(fwd); fwd = NULL; }
+        }
+    }
+    vjson_free(b);
+    if (!fwd) {
+        fwd = (char *)malloc(req->body_len + 1);
+        if (fwd) {
+            memcpy(fwd, req->body ? req->body : "", req->body_len);
+            fwd[req->body_len] = '\0';
+            fwd_len = req->body_len;
+        }
+    }
+
+    char auth[512];
+    auth[0] = '\0';
+    if (ctx->cloud_key && ctx->cloud_key[0])
+        snprintf(auth, sizeof(auth), "Authorization: Bearer %s\r\n", ctx->cloud_key);
+
+    char *out = NULL;
+    int st = 0;
+    char ctype[128] = "";
+    int rc = vhttp_post_json(url, auth, fwd ? fwd : "", fwd_len,
+                             &out, &st, ctype, sizeof(ctype));
+    free(fwd);
+
+    if (rc != 0 || !out) {
+        free(out);
+        fprintf(stderr, "[UPLINK] forward FAILED rc=%d url=%s (explicit 502, no silent local fallback)\n",
+                rc, url);
+        resp->extra_header = "x-kestrel-source: cloud\r\n";
+        json_error(resp, 502, rc == -2
+                   ? "cloud uplink https unsupported (front a TLS-terminating gateway)"
+                   : "cloud uplink failed");
+        return 0;
+    }
+    fprintf(stderr, "[UPLINK] forwarded -> %s status=%d bytes=%zu stream=%d\n",
+            url, st, strlen(out), want_stream);
+
+    /* 流式透传：客户端 stream=true 且上游 2xx → 原样回放上游 SSE。
+     * 上游 SSE 以 "data: [DONE]\n\n" 收尾；统一由 vhttp_stream_done 追加尾标，
+     * 故先截掉上游自带尾标避免重复。 */
+    if (want_stream && st >= 200 && st < 300) {
+        const char *done = strstr(out, "data: [DONE]");
+        size_t cplen = done ? (size_t)(done - out) : strlen(out);
+        if (vhttp_stream_begin_ex(conn, st,
+                                  ctype[0] ? ctype : "text/event-stream",
+                                  "x-kestrel-source: cloud\r\n") == 0 && cplen > 0)
+            vhttp_stream_write(conn, out, cplen);
+        free(out);
+        resp->stream = 1;                 /* handler owns the connection */
+        resp->content_type = "text/event-stream";
+        vhttp_stream_done(conn);          /* 发送 data: [DONE] + close */
+        return 0;
+    }
+
+    /* 非流式（或流式请求命中上游错误码 → 按 OpenAI 惯例回 JSON 错误体）。 */
+    resp->extra_header = "x-kestrel-source: cloud\r\n";
+    resp->status = st > 0 ? st : 502;
+    resp->content_type = "application/json";
+    resp->body = out;
+    resp->body_len = 0;        /* 0 = strlen(body) */
+    resp->body_owned = out;
+    return 0;
+}
+
 /* 方案 2：给非流式响应对象附加 "attest" 出证字段。
  * body_sha = SM3(原始请求体) 的 64-hex（schema=3，绑定"收到什么证明什么"）；
  * text 为输出文本（绑定进摘要）。params 为本次请求实际采样参数。 */
@@ -2573,6 +2691,10 @@ static void met_fill_ids(VLLMMetrics *met, const char *trace, const char *rbid,
 
 static void handle_chat(VLLMServerCtx *ctx, const VHttpRequest *req,
                         VHttpResponse *resp, VHttpConn *conn) {
+    /* 云边协同：仅在配置了云端点时标记来源（未配置 = 响应逐字节不变，零回归）。 */
+    if (ctx->cloud_endpoint && ctx->cloud_endpoint[0])
+        resp->extra_header = "x-kestrel-source: edge\r\n";
+    if (cloud_fallback_serve(ctx, req, resp, conn) == 0) return;
     /* Inference endpoints are unavailable until the model is loaded
      * (manual-load mode; see /admin/api/model/load). */
     if (ensure_model_ready(ctx, resp) != 0) return;
@@ -2628,6 +2750,11 @@ static void handle_chat(VLLMServerCtx *ctx, const VHttpRequest *req,
     }
     if ((jv = vjson_obj_get(body, "stream")) && jv->type == VJ_BOOL)
         stream = jv->u.boolean;
+    /* 自定义 SSE 事件（metrics/tokens/attest）为 Kestrel 扩展，会破坏标准
+     * OpenAI 客户端的逐 chunk 解析；仅在客户端显式 opt-in（请求头
+     * X-Kestrel-Meta 非 "0"/空）时下发，默认流严格标准。 */
+    const char *kmeta = vhttp_req_header(req, "X-Kestrel-Meta");
+    int emit_meta = (kmeta && kmeta[0] && kmeta[0] != '0') ? 1 : 0;
     const char *user = vjson_str(vjson_obj_get(body, "user"));
 
     /* ---- 工业边缘：预置命名上下文 + 会话分区（可选，缺省不改行为） ----
@@ -2959,6 +3086,7 @@ static void handle_chat(VLLMServerCtx *ctx, const VHttpRequest *req,
             r.out_text = &out_txt;
             r.out_len = &out_len;
             r.body_sha = bodyhash;
+            r.emit_meta = emit_meta;
             int brc = 0;
             if (rc != 0 || pn > max_ids) {
                 brc = rc == -2 ? -2 : -1;
@@ -2998,7 +3126,7 @@ static void handle_chat(VLLMServerCtx *ctx, const VHttpRequest *req,
                         vjson_obj_set(ch, "finish_reason", vjson_new_string("stop"));
                         vjson_array_push(choices, ch);
                         vjson_obj_set(root, "choices", choices);
-                        vjson_obj_set(root, "usage", vjson_new_object());
+                        vjson_obj_set(root, "usage", usage_json(&met));
                         VJson *mj = vjson_new_object();
                         vjson_obj_set(mj, "prompt_tokens", vjson_new_number((double)met.prompt_tokens));
                         vjson_obj_set(mj, "last_user_tokens", vjson_new_number((double)met.last_user_tokens));
@@ -3063,7 +3191,7 @@ static void handle_chat(VLLMServerCtx *ctx, const VHttpRequest *req,
                 met.last_user_tokens = last_user_tokens;
                 run_completion_mm(ctx, pt, pn, vis_all, vis_total, grids, n_regions,
                                   ds_arg, n_ds, temperature, top_p, min_p, top_k,
-                                  thinking, max_tokens, 1, conn, &sink, &met,
+                                  thinking, max_tokens, 1, conn, emit_meta, &sink, &met,
                                   mm_marks, user, bodyhash);
                 sb_free(&sink);
                 ds_accum_free(&dsa);
@@ -3075,7 +3203,7 @@ static void handle_chat(VLLMServerCtx *ctx, const VHttpRequest *req,
                 int rc2 = run_completion_mm(ctx, pt, pn, vis_all, vis_total, grids,
                                             n_regions, ds_arg, n_ds, temperature,
                                             top_p, min_p, top_k, thinking,
-                                            max_tokens, 0, NULL, &out, &met,
+                                            max_tokens, 0, NULL, 0, &out, &met,
                                             mm_marks, user, bodyhash);
                 ds_accum_free(&dsa);
                 infer_done(ctx);
@@ -3101,7 +3229,7 @@ static void handle_chat(VLLMServerCtx *ctx, const VHttpRequest *req,
                         vjson_obj_set(ch, "finish_reason", vjson_new_string("stop"));
                         vjson_array_push(choices, ch);
                         vjson_obj_set(root, "choices", choices);
-                        vjson_obj_set(root, "usage", vjson_new_object());
+                        vjson_obj_set(root, "usage", usage_json(&met));
                         /* Per-request inference metrics. */
                         VJson *mj = vjson_new_object();
                         vjson_obj_set(mj, "prompt_tokens", vjson_new_number((double)met.prompt_tokens));
@@ -3225,6 +3353,7 @@ static void handle_chat(VLLMServerCtx *ctx, const VHttpRequest *req,
         r.out_text = &out_txt;
         r.out_len = &out_len;
         r.body_sha = bodyhash;
+        r.emit_meta = emit_meta;
         if (stream) {
             resp->status = 200;
             resp->content_type = "text/event-stream";
@@ -3261,7 +3390,7 @@ static void handle_chat(VLLMServerCtx *ctx, const VHttpRequest *req,
                     vjson_obj_set(ch, "finish_reason", vjson_new_string("stop"));
                     vjson_array_push(choices, ch);
                     vjson_obj_set(root, "choices", choices);
-                    vjson_obj_set(root, "usage", vjson_new_object());
+                    vjson_obj_set(root, "usage", usage_json(&met));
                     VJson *mj = vjson_new_object();
                     vjson_obj_set(mj, "prompt_tokens", vjson_new_number((double)met.prompt_tokens));
                     vjson_obj_set(mj, "last_user_tokens", vjson_new_number((double)met.last_user_tokens));
@@ -3346,7 +3475,7 @@ static void handle_chat(VLLMServerCtx *ctx, const VHttpRequest *req,
         int rc = run_completion(ctx, prompt, tail_prompt, ctx_tokens, n_ctx,
                                 rb_ids, n_rb, rb_kv_path,
                                 temperature, top_p, min_p, top_k, thinking,
-                                max_tokens, 1, conn, &sink, &met, NULL, NULL,
+                                max_tokens, 1, conn, emit_meta, &sink, &met, NULL, NULL,
                                 user, bodyhash);
         if (rc == 0) {
             sess_commit(ctx, body, session_id, tenant_id, part_user,
@@ -3366,7 +3495,7 @@ static void handle_chat(VLLMServerCtx *ctx, const VHttpRequest *req,
         int rc = run_completion(ctx, prompt, tail_prompt, ctx_tokens, n_ctx,
                                 rb_ids, n_rb, rb_kv_path,
                                 temperature, top_p, min_p, top_k, thinking,
-                                max_tokens, 0, NULL, &out, &met,
+                                max_tokens, 0, NULL, 0, &out, &met,
                                 &hist_ids, &hist_n, user, bodyhash);
         infer_done(ctx);
         if (rc == 0) {
@@ -3399,7 +3528,7 @@ static void handle_chat(VLLMServerCtx *ctx, const VHttpRequest *req,
                 vjson_obj_set(ch, "finish_reason", vjson_new_string("stop"));
                 vjson_array_push(choices, ch);
                 vjson_obj_set(root, "choices", choices);
-                vjson_obj_set(root, "usage", vjson_new_object());
+                vjson_obj_set(root, "usage", usage_json(&met));
                 if (hist_ids && hist_n) {
                     VJson *ht = vjson_new_array();
                     for (int i = 0; i < hist_n; i++)
@@ -3451,11 +3580,219 @@ static void handle_chat(VLLMServerCtx *ctx, const VHttpRequest *req,
     vjson_free(body);
 }
 
+/* ---- K-COLLAB-001 P2：专用 embedding 模型懒加载（独立 tok/ist/w/cfg 槽位）----
+ * 仅加载 causal-LM 文本塔（无 vision）。调用方须已持 inf_lock（与 chat 串行），
+ * 本函数内部用 embed_lock 保护加载互斥。返回 0 成功，-1 失败（embed_error 记因）。 */
+static int vllm_embed_load(VLLMServerCtx *ctx) {
+    const char *dir = ctx->embed_model_dir;
+    if (!dir || !dir[0]) {
+        snprintf(ctx->embed_error, sizeof(ctx->embed_error), "embed_model_dir is empty");
+        return -1;
+    }
+    char vqf_path[768];
+    snprintf(vqf_path, sizeof(vqf_path), "%s/model.vqf", dir);
+    if (!vqf_is_file(vqf_path)) {
+        snprintf(ctx->embed_error, sizeof(ctx->embed_error), "no model.vqf in %s", dir);
+        return -1;
+    }
+    STModelWeights *w = (STModelWeights *)calloc(1, sizeof(STModelWeights));
+    if (!w) { snprintf(ctx->embed_error, sizeof(ctx->embed_error), "OOM (weights)"); return -1; }
+    if (vqf_load(w, vqf_path) != 0) {
+        snprintf(ctx->embed_error, sizeof(ctx->embed_error), "vqf_load failed: %s", vqf_path);
+        free(w); return -1;
+    }
+    QwenTokenizer *tok = (QwenTokenizer *)calloc(1, sizeof(QwenTokenizer));
+    if (!tok) { snprintf(ctx->embed_error, sizeof(ctx->embed_error), "OOM (tokenizer)"); st_weights_free(w); free(w); return -1; }
+    if (qwen_tokenizer_load(tok, dir) != 0) {
+        snprintf(ctx->embed_error, sizeof(ctx->embed_error), "tokenizer load failed: %s", dir);
+        qwen_tokenizer_free(tok); free(tok); st_weights_free(w); free(w); return -1;
+    }
+    qwen_tokenizer_load_special(tok, dir);
+    STQwenInferenceState *ist = (STQwenInferenceState *)calloc(1, sizeof(STQwenInferenceState));
+    if (!ist) {
+        snprintf(ctx->embed_error, sizeof(ctx->embed_error), "OOM (inference state)");
+        qwen_tokenizer_free(tok); free(tok); st_weights_free(w); free(w); return -1;
+    }
+    if (st_qwen_inference_init(ist, w) != 0) {
+        snprintf(ctx->embed_error, sizeof(ctx->embed_error), "inference init failed: %s", dir);
+        st_qwen_inference_free(ist); free(ist);
+        qwen_tokenizer_free(tok); free(tok); st_weights_free(w); free(w); return -1;
+    }
+    ctx->embed_w = w;
+    ctx->embed_cfg = &w->cfg;
+    ctx->embed_tok = tok;
+    ctx->embed_ist = ist;
+    ctx->embed_loaded = 1;
+    fprintf(stderr, "[EMB-MODEL] dedicated embedding model ready: %s (dim=%d layers=%d)\n",
+            dir, ctx->embed_cfg->dim, ctx->embed_cfg->n_layers);
+    fflush(stderr);
+    return 0;
+}
+
+static void vllm_embed_free(VLLMServerCtx *ctx) {
+    if (ctx->embed_ist) { st_qwen_inference_free(ctx->embed_ist); free(ctx->embed_ist); ctx->embed_ist = NULL; }
+    if (ctx->embed_tok) { qwen_tokenizer_free(ctx->embed_tok); free(ctx->embed_tok); ctx->embed_tok = NULL; }
+    if (ctx->embed_w)   { st_weights_free(ctx->embed_w); free(ctx->embed_w); ctx->embed_w = NULL; }
+    ctx->embed_cfg = NULL;
+    ctx->embed_loaded = 0;
+}
+
+/* ---------- /v1/embeddings (OpenAI-compatible) ----------
+ * K-EMB-001：Qwen3-Embedding 系（last-token pooling + L2 normalize）。
+ * 输入按**裸文本**编码（不套 chat 模板），逐条全量复位后单次 prefill，
+ * 取末位 final-norm 隐状态（引擎 prefill 收尾的 g_embed_out 钩子，已 L2
+ * 归一化）。仅串行路径；--batch-max 调度器持独立 engine 锁且无 pooling
+ * 分支，故批处理开启时显式拒绝以免与调度器并发抢引擎。 */
+static void handle_embeddings(VLLMServerCtx *ctx, const VHttpRequest *req,
+                              VHttpResponse *resp) {
+    if (ensure_model_ready(ctx, resp) != 0) return;
+    VJson *body = vjson_parse(req->body);
+    if (!body) { json_error(resp, 400, "Invalid JSON body"); return; }
+    VJson *jin = vjson_obj_get(body, "input");
+    if (!jin || (jin->type != VJ_STRING && jin->type != VJ_ARRAY)) {
+        json_error(resp, 400, "'input' must be a string or an array of strings");
+        vjson_free(body);
+        return;
+    }
+    int n_in = (jin->type == VJ_ARRAY) ? (int)vjson_array_len(jin) : 1;
+    if (n_in <= 0) {
+        json_error(resp, 400, "'input' is empty");
+        vjson_free(body);
+        return;
+    }
+    if (ctx->batch) {
+        json_error(resp, 400, "Embeddings are unavailable when --batch-max is on");
+        vjson_free(body);
+        return;
+    }
+    int g = infer_gate(ctx);
+    if (g == -1) { json_error(resp, 429, "Too many queued requests, retry later"); vjson_free(body); return; }
+    if (g == -2) { json_error(resp, 503, "Insufficient memory, retry later"); vjson_free(body); return; }
+    if (g == -3) { json_error(resp, 503, "Model is unloading, retry later"); vjson_free(body); return; }
+
+    /* K-COLLAB-001 P2：embedding 用主模型（默认）或专用 --embed-model（独立槽位）。
+     * 二者共用 inf_lock 串行；专用模型在首次请求时懒加载（embed_lock 保护）。 */
+    STQwenInferenceState *st;
+    STModelConfig *cfg;
+    QwenTokenizer *tok;
+    int nl;
+    if (ctx->embed_model_dir) {
+        pthread_mutex_lock(&ctx->embed_lock);
+        if (ctx->embed_loaded == 0 && vllm_embed_load(ctx) != 0) {
+            pthread_mutex_unlock(&ctx->embed_lock);
+            infer_done(ctx);
+            json_error(resp, 503, ctx->embed_error);
+            vjson_free(body);
+            return;
+        }
+        pthread_mutex_unlock(&ctx->embed_lock);
+        st = ctx->embed_ist;
+        cfg = ctx->embed_cfg;
+        tok = ctx->embed_tok;
+        nl = ctx->embed_w->n_layers_allocated;
+    } else {
+        st = ctx->ist;
+        cfg = ctx->cfg;
+        tok = ctx->tok;
+        nl = ctx->w->n_layers_allocated;
+    }
+    int dim = cfg->dim;
+    int max_seq = cfg->max_seq_len;
+    float *vec = (float *)malloc((size_t)dim * sizeof(float));
+    int   *ids = (int *)malloc(((size_t)max_seq + 16) * sizeof(int));
+
+    VJson *root = NULL;
+    if (!vec || !ids) {
+        json_error(resp, 500, "Out of memory");
+    } else {
+        root = vjson_new_object();
+        vjson_obj_set(root, "object", vjson_new_string("list"));
+        vjson_obj_set(root, "model",
+                      vjson_new_string(ctx->model_id ? ctx->model_id : "qwen3-embedding-0.6b"));
+        VJson *data = vjson_new_array();
+        int total_tokens = 0;
+        for (int i = 0; i < n_in; i++) {
+            const char *txt = (jin->type == VJ_ARRAY)
+                ? vjson_str(vjson_array_get(jin, (size_t)i)) : vjson_str(jin);
+            if (!txt) {
+                json_error(resp, 400, "each 'input' element must be a string");
+                vjson_free(data); vjson_free(root); root = NULL;
+                break;
+            }
+            /* 每条输入 = 全新序列：复刻 ist_reset 全量复位分支（无前缀复用）。 */
+            for (int l = 0; l < nl; l++) st->cache_len[l] = 0;
+            st->seq_len = 0; st->mrope_pos = 0;
+            st_qwen_kv_rebuild_freed(st);
+            int n = qwen_tokenizer_encode(tok, txt, ids, max_seq - 1);
+            if (n <= 0) {
+                json_error(resp, 400, "input tokenization failed");
+                vjson_free(data); vjson_free(root); root = NULL;
+                break;
+            }
+            if (n > max_seq - 8) n = max_seq - 8;
+            /* 官方 recipe：追加 EOS（add_special_tokens=True），last-token pooling
+             * 取 EOS 位置（见 main.c run_embed 同段注释）。 */
+            if (n < max_seq && ids[n-1] != tok->eos_id) ids[n++] = tok->eos_id;
+            st_embed_request(vec, dim);              /* 登记钩子（一次性） */
+            if (st_qwen_model_prefill_batch(st, ids, n) != 0) {
+                json_error(resp, 500, "Inference failed");
+                vjson_free(data); vjson_free(root); root = NULL;
+                break;
+            }
+            total_tokens += n;
+            VJson *item = vjson_new_object();
+            vjson_obj_set(item, "object", vjson_new_string("embedding"));
+            vjson_obj_set(item, "index", vjson_new_number((double)i));
+            VJson *arr = vjson_new_array();
+            for (int k = 0; k < dim; k++)
+                vjson_array_push(arr, vjson_new_number((double)vec[k]));
+            vjson_obj_set(item, "embedding", arr);
+            vjson_array_push(data, item);
+        }
+        if (root) {
+            vjson_obj_set(root, "data", data);
+            VJson *usage = vjson_new_object();
+            vjson_obj_set(usage, "prompt_tokens", vjson_new_number((double)total_tokens));
+            vjson_obj_set(usage, "total_tokens", vjson_new_number((double)total_tokens));
+            vjson_obj_set(root, "usage", usage);
+        }
+    }
+
+    infer_done(ctx);
+    free(vec);
+    free(ids);
+    vjson_free(body);
+
+    if (root) {
+        size_t cap = (size_t)dim * 24 * (size_t)n_in + 4096;
+        char *buf = (char *)malloc(cap);
+        if (!buf) {
+            json_error(resp, 500, "Out of memory");
+        } else {
+            size_t n = vjson_serialize(root, buf, cap);
+            if (n > 0) {
+                resp->status = 200;
+                resp->content_type = "application/json";
+                resp->body = buf;
+                resp->body_len = n;
+                resp->body_owned = buf;
+            } else {
+                free(buf);
+                json_error(resp, 500, "Response too large");
+            }
+        }
+        vjson_free(root);
+    }
+}
+
 /* ---------- /v1/completions (legacy) ---------- */
 
 static void handle_completions(VLLMServerCtx *ctx, const VHttpRequest *req,
                                VHttpResponse *resp, VHttpConn *conn) {
-    (void)conn;
+    /* 云边协同：仅在配置了云端点时标记来源（未配置 = 响应逐字节不变，零回归）。 */
+    if (ctx->cloud_endpoint && ctx->cloud_endpoint[0])
+        resp->extra_header = "x-kestrel-source: edge\r\n";
+    if (cloud_fallback_serve(ctx, req, resp, conn) == 0) return;
     if (ensure_model_ready(ctx, resp) != 0) return;
     VJson *body = vjson_parse(req->body);
     if (!body) {
@@ -3554,14 +3891,11 @@ static void handle_completions(VLLMServerCtx *ctx, const VHttpRequest *req,
                 VJson *choices = vjson_new_array();
                 VJson *ch = vjson_new_object();
                 vjson_obj_set(ch, "index", vjson_new_number(0));
-                VJson *msg = vjson_new_object();
-                vjson_obj_set(msg, "role", vjson_new_string("assistant"));
-                vjson_obj_set(msg, "content", vjson_new_string(out_txt ? out_txt : ""));
-                vjson_obj_set(ch, "message", msg);
+                vjson_obj_set(ch, "text", vjson_new_string(out_txt ? out_txt : ""));
                 vjson_obj_set(ch, "finish_reason", vjson_new_string("stop"));
                 vjson_array_push(choices, ch);
                 vjson_obj_set(root, "choices", choices);
-                vjson_obj_set(root, "usage", vjson_new_object());
+                vjson_obj_set(root, "usage", usage_json(&met));
                 VJson *mj = vjson_new_object();
                 vjson_obj_set(mj, "prompt_tokens", vjson_new_number((double)met.prompt_tokens));
                 vjson_obj_set(mj, "n_tokens", vjson_new_number((double)met.n_tokens));
@@ -3598,7 +3932,7 @@ static void handle_completions(VLLMServerCtx *ctx, const VHttpRequest *req,
     VLLMMetrics met; memset(&met, 0, sizeof(met));
     int rc = run_completion(ctx, full, NULL, NULL, 0, NULL, 0, NULL,
                             temperature, top_p, min_p,
-                            top_k, thinking, max_tokens, 0, NULL, &out, &met, NULL,
+                            top_k, thinking, max_tokens, 0, NULL, 0, &out, &met, NULL,
                             NULL, user, bodyhash);
     infer_done(ctx);
     if (rc == -2) {
@@ -3622,6 +3956,7 @@ static void handle_completions(VLLMServerCtx *ctx, const VHttpRequest *req,
             vjson_obj_set(ch, "finish_reason", vjson_new_string("stop"));
             vjson_array_push(choices, ch);
             vjson_obj_set(root, "choices", choices);
+            vjson_obj_set(root, "usage", usage_json(&met));
             /* 方案 2：legacy 串行非流式出证。 */
             attest_attach(root, user, bodyhash, out.s ? out.s : "",
                           met.prompt_tokens, met.n_tokens, "stop",
@@ -3943,6 +4278,1595 @@ static void handle_chat_page(VHttpResponse *resp) {
     resp->body_len = rd;
 }
 
+/* ---------- POST /v1/systemone (K-LAYA-001) ----------
+ * Independent System-1 decision path (ModernBERT encoder + decision head),
+ * decoupled from the causal-LM engine. The ~1.7 GB F32 arena is loaded once
+ * from ctx->laya_pack on the first request and reused; requests are serialized
+ * on a dedicated lock (the runner holds a single reusable state).
+ * Body  : {"state":..., "questions":{qid:{type,instructions,criteria}}}
+ * Reply : {"model":"laya","answers":{...}}
+ * Disabled (404) when the server was started without --laya-pack. */
+static LayaRunner *g_laya_runner = NULL;
+static pthread_mutex_t g_laya_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void handle_systemone(VLLMServerCtx *ctx, const VHttpRequest *req,
+                             VHttpResponse *resp) {
+    if (!ctx->laya_pack) {
+        static const char e[] =
+            "{\"error\":{\"message\":\"systemone disabled: start with --laya-pack\","
+            "\"type\":\"invalid_request_error\",\"code\":404}}";
+        resp->status = 404; resp->body = e; resp->body_len = sizeof(e) - 1;
+        return;
+    }
+    if (!req->body || req->body_len == 0) {
+        static const char e[] =
+            "{\"error\":{\"message\":\"empty body\",\"type\":\"invalid_request_error\",\"code\":400}}";
+        resp->status = 400; resp->body = e; resp->body_len = sizeof(e) - 1;
+        return;
+    }
+    const size_t cap = 1 << 20;
+    char *out = (char *)malloc(cap);
+    if (!out) {
+        static const char e[] =
+            "{\"error\":{\"message\":\"out of memory\",\"type\":\"server_error\",\"code\":500}}";
+        resp->status = 500; resp->body = e; resp->body_len = sizeof(e) - 1;
+        return;
+    }
+    pthread_mutex_lock(&g_laya_lock);
+    if (!g_laya_runner) {
+        g_laya_runner = laya_runner_new(ctx->laya_pack);
+        if (g_laya_runner)
+            fprintf(stderr, "[LAYA] systemone runner ready (%s)\n", ctx->laya_pack);
+    }
+    int rc = g_laya_runner
+                 ? laya_runner_decide(g_laya_runner, req->body, out, cap)
+                 : -1;
+    pthread_mutex_unlock(&g_laya_lock);
+    if (rc != 0) {
+        free(out);
+        static const char e[] =
+            "{\"error\":{\"message\":\"decide failed (bad request or load error)\","
+            "\"type\":\"invalid_request_error\",\"code\":400}}";
+        resp->status = 400; resp->body = e; resp->body_len = sizeof(e) - 1;
+        return;
+    }
+    resp->status = 200;
+    resp->content_type = "application/json";
+    resp->body_owned = out;
+    resp->body = out;
+    resp->body_len = 0;   /* 0 = strlen(body) */
+}
+
+/* ---------- POST /v1/detect (K-YOLO-001) ----------
+ * Independent detection path (own-format VQF v4 + CPU/NPU graph executor),
+ * decoupled from the causal-LM engine. Body: image bytes (Content-Type
+ * image/*) OR JSON with a base64 data URL ("...base64,<payload>...").
+ * Reply : {"model":"yolo","detections":[{cls,name,score,box:[x1,y1,x2,y2]}]}
+ * Disabled (404) when the server was started without --yolo-model. */
+static StYoloModel *g_yolo = NULL;
+static pthread_mutex_t g_yolo_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* K-YOLO-003：按 --yolo-backend 选择加载器（0=VQF v4 默认，1=官方 .rknn opt-in）。
+ * 返回值 NULL = 未启用/加载失败（各 handler 自行显式报错，绝不静默降级）。 */
+static StYoloModel *yolo_open_model(VLLMServerCtx *ctx) {
+    if (!ctx->yolo_model) return NULL;
+    if (ctx->yolo_backend == 1)
+        return st_yolo_load_rknn(ctx->yolo_model, ctx->yolo_npu, ctx->yolo_core_mask);
+    return st_yolo_load(ctx->yolo_model);
+}
+
+static void handle_detect(VLLMServerCtx *ctx, const VHttpRequest *req,
+                          VHttpResponse *resp) {
+    if (!ctx->yolo_model) {
+        static const char e[] =
+            "{\"error\":{\"message\":\"detect disabled: start with --yolo-model\","
+            "\"type\":\"invalid_request_error\",\"code\":404}}";
+        resp->status = 404; resp->body = e; resp->body_len = sizeof(e) - 1;
+        return;
+    }
+    if (!req->body || req->body_len == 0) {
+        static const char e[] =
+            "{\"error\":{\"message\":\"empty body\",\"type\":\"invalid_request_error\",\"code\":400}}";
+        resp->status = 400; resp->body = e; resp->body_len = sizeof(e) - 1;
+        return;
+    }
+    /* 取编码图像：JSON data URL 的 base64 段，或整体二进制（image/*） */
+    uint8_t *enc = NULL; size_t enc_len = 0;
+    const char *mark = (req->body[0] == '{' || req->body[0] == '\n')
+                       ? strstr(req->body, "base64,") : NULL;
+    if (mark) {
+        const char *b = mark + 7;
+        const char *q = strchr(b, '"');
+        size_t n = q ? (size_t)(q - b) : strlen(b);
+        char *s = (char *)malloc(n + 1);
+        if (!s) goto oom;
+        memcpy(s, b, n); s[n] = 0;
+        enc = media_base64_decode(s, &enc_len);
+        free(s);
+    } else {
+        enc = (uint8_t *)malloc(req->body_len);
+        if (!enc) goto oom;
+        memcpy(enc, req->body, req->body_len);
+        enc_len = req->body_len;
+    }
+    if (!enc || enc_len == 0) {
+        free(enc);
+        static const char e[] =
+            "{\"error\":{\"message\":\"no image payload (send image bytes or base64 data URL)\","
+            "\"type\":\"invalid_request_error\",\"code\":400}}";
+        resp->status = 400; resp->body = e; resp->body_len = sizeof(e) - 1;
+        return;
+    }
+    int w = 0, h = 0;
+    uint8_t *rgb = media_load_image_memory(enc, enc_len, &w, &h);
+    free(enc);
+    if (!rgb) {
+        static const char e[] =
+            "{\"error\":{\"message\":\"image decode failed\",\"type\":\"invalid_request_error\",\"code\":400}}";
+        resp->status = 400; resp->body = e; resp->body_len = sizeof(e) - 1;
+        return;
+    }
+
+    pthread_mutex_lock(&g_yolo_lock);
+    if (!g_yolo) {
+        g_yolo = yolo_open_model(ctx);
+        if (g_yolo) fprintf(stderr, "[YOLO] detect route ready (%s)\n", ctx->yolo_model);
+    }
+    int n = -1;
+    YoloDet dets[300];
+    if (g_yolo) n = st_yolo_detect(g_yolo, rgb, w, h, 0.f, 0.f, dets, 300);
+    pthread_mutex_unlock(&g_yolo_lock);
+    media_free_image(rgb);
+    if (n < 0) {
+        static const char e[] =
+            "{\"error\":{\"message\":\"detect failed\",\"type\":\"server_error\",\"code\":500}}";
+        resp->status = 500; resp->body = e; resp->body_len = sizeof(e) - 1;
+        return;
+    }
+    size_t cap = 256 + (size_t)n * 160;
+    char *out = (char *)malloc(cap);
+    if (!out) goto oom;
+    size_t o = (size_t)snprintf(out, cap,
+        "{\"model\":\"yolo\",\"width\":%d,\"height\":%d,\"detections\":[", w, h);
+    for (int i = 0; i < n; i++) {
+        char cn[64];
+        if (st_yolo_class_name(g_yolo, dets[i].cls, cn, sizeof(cn)) != 0) snprintf(cn, sizeof(cn), "?");
+        o += (size_t)snprintf(out + o, cap - o,
+            "%s{\"cls\":%d,\"name\":\"%s\",\"score\":%.4f,\"box\":[%.1f,%.1f,%.1f,%.1f]}",
+            i ? "," : "", dets[i].cls, cn, dets[i].score,
+            dets[i].x1, dets[i].y1, dets[i].x2, dets[i].y2);
+    }
+    o += (size_t)snprintf(out + o, cap - o, "]}");
+    resp->status = 200;
+    resp->content_type = "application/json";
+    resp->body_owned = out;
+    resp->body = out;
+    resp->body_len = 0;
+    return;
+oom:
+    {
+        static const char e[] =
+            "{\"error\":{\"message\":\"out of memory\",\"type\":\"server_error\",\"code\":500}}";
+        resp->status = 500; resp->body = e; resp->body_len = sizeof(e) - 1;
+    }
+}
+
+/* ---------- 场景叙事：YOLO 检测框 → 结构化文本（§2.1 组件2，文本级协作） ----------
+ * 格式：`<class> at [x1,y1,x2,y2] conf <s>; ...`（无检测 → 明确占位）。
+ * 返回堆分配 NUL 结尾串；失败 NULL。 */
+static char *scene_narrative(StYoloModel *yolo, const YoloDet *dets, int n) {
+    size_t cap = 128 + (size_t)(n > 0 ? n : 1) * 160;
+    char *out = (char *)malloc(cap);
+    if (!out) return NULL;
+    if (n <= 0) {
+        snprintf(out, cap, "（图中未检测到物体）");
+        return out;
+    }
+    size_t o = 0;
+    for (int i = 0; i < n; i++) {
+        char cn[64];
+        if (st_yolo_class_name(yolo, dets[i].cls, cn, sizeof(cn)) != 0)
+            snprintf(cn, sizeof(cn), "class_%d", dets[i].cls);
+        o += (size_t)snprintf(out + o, cap - o,
+            "%s%s at [%.0f,%.0f,%.0f,%.0f] conf %.2f",
+            i ? "; " : "", cn,
+            dets[i].x1, dets[i].y1, dets[i].x2, dets[i].y2, dets[i].score);
+    }
+    return out;
+}
+
+/* ---------- POST /v1/scene (K-COLLAB-001 P3 感知接入) ----------
+ * 场景理解链：图 → YOLO 检测 → 场景叙事 → 主 LLM 综合回答。
+ * Body  : {"image":"<base64 或 data URL>", "query":"...", "max_tokens":M}
+ *         （非 JSON 体按原始图像字节处理，query 缺省"请描述图中场景"）
+ * Reply : {"model":...,"detections":[{cls,name,score,box}], "scene":"...", "answer":"..."}
+ * 依赖  : --yolo-model（感知）+ 主 chat 模型（深度思考）；任一未启用/失败显式报错。 */
+static void handle_scene(VLLMServerCtx *ctx, const VHttpRequest *req,
+                         VHttpResponse *resp) {
+    if (!ctx->yolo_model) {
+        static const char e[] =
+            "{\"error\":{\"message\":\"scene disabled: start with --yolo-model\","
+            "\"type\":\"invalid_request_error\",\"code\":404}}";
+        resp->status = 404; resp->body = e; resp->body_len = sizeof(e) - 1;
+        return;
+    }
+    if (!req->body || req->body_len == 0) {
+        static const char e[] =
+            "{\"error\":{\"message\":\"empty body\",\"type\":\"invalid_request_error\",\"code\":400}}";
+        resp->status = 400; resp->body = e; resp->body_len = sizeof(e) - 1;
+        return;
+    }
+
+    /* 解析请求体：JSON（image + query）或原始图像字节 */
+    const char *query = NULL;
+    const char *img_b64 = NULL;
+    VJson *body = NULL;
+    if (req->body[0] == '{') {
+        body = vjson_parse(req->body);
+        if (!body) { json_error(resp, 400, "Invalid JSON body"); return; }
+        img_b64 = vjson_str(vjson_obj_get(body, "image"));
+        query = vjson_str(vjson_obj_get(body, "query"));
+        if (!img_b64 || !img_b64[0]) {
+            json_error(resp, 400, "'image' is required (base64 or data URL)");
+            vjson_free(body); return;
+        }
+    }
+    if (!query || !query[0]) query = "请描述图中场景";
+
+    /* 提取 base64 段（可选 data URL 前缀 "base64,"） */
+    uint8_t *enc = NULL; size_t enc_len = 0;
+    if (img_b64) {
+        const char *mark = strstr(img_b64, "base64,");
+        const char *b = mark ? mark + 7 : img_b64;
+        size_t bn = strlen(b);
+        char *s = (char *)malloc(bn + 1);
+        if (!s) { vjson_free(body); json_error(resp, 500, "Out of memory"); return; }
+        memcpy(s, b, bn); s[bn] = 0;
+        enc = media_base64_decode(s, &enc_len);
+        free(s);
+    } else {
+        enc = (uint8_t *)malloc(req->body_len);
+        if (!enc) { json_error(resp, 500, "Out of memory"); return; }
+        memcpy(enc, req->body, req->body_len);
+        enc_len = req->body_len;
+    }
+    if (!enc || enc_len == 0) {
+        free(enc); vjson_free(body);
+        json_error(resp, 400, "no image payload");
+        return;
+    }
+
+    int w = 0, h = 0;
+    uint8_t *rgb = media_load_image_memory(enc, enc_len, &w, &h);
+    free(enc);
+    if (!rgb) {
+        vjson_free(body);
+        json_error(resp, 400, "image decode failed");
+        return;
+    }
+
+    /* YOLO 检测 + 场景叙事（独立感知路径，g_yolo_lock 串行） */
+    pthread_mutex_lock(&g_yolo_lock);
+    if (!g_yolo) {
+        g_yolo = yolo_open_model(ctx);
+        if (g_yolo) fprintf(stderr, "[YOLO] scene route ready (%s)\n", ctx->yolo_model);
+    }
+    int n = -1;
+    YoloDet dets[300];
+    if (g_yolo) n = st_yolo_detect(g_yolo, rgb, w, h, 0.f, 0.f, dets, 300);
+    char *scene = (n >= 0) ? scene_narrative(g_yolo, dets, n) : NULL;
+    pthread_mutex_unlock(&g_yolo_lock);
+    media_free_image(rgb);
+    if (n < 0 || !scene) {
+        free(scene); vjson_free(body);
+        json_error(resp, 500, "detect failed");
+        return;
+    }
+
+    /* 拼 prompt：场景叙事作为上下文，query 作为问题 */
+    size_t plen = strlen(scene) + strlen(query) + 128;
+    char *prompt = (char *)malloc(plen);
+    if (!prompt) {
+        free(scene); vjson_free(body); json_error(resp, 500, "Out of memory"); return;
+    }
+    snprintf(prompt, plen,
+        "场景检测结果：%s\n\n问题：%s\n请仅根据检测结果回答问题。", scene, query);
+
+    int max_tokens = 256;
+    VJson *jv;
+    if (body && (jv = vjson_obj_get(body, "max_tokens")) && jv->type == VJ_NUMBER) {
+        max_tokens = (int)jv->u.number;
+        if (max_tokens <= 0) max_tokens = 1; if (max_tokens > 4096) max_tokens = 4096;
+    }
+
+    if (ensure_model_ready(ctx, resp) != 0) {
+        free(scene); free(prompt); vjson_free(body); return;
+    }
+    int g = infer_gate(ctx);
+    if (g != 0) {
+        free(scene); free(prompt); vjson_free(body);
+        if (g == -1) json_error(resp, 429, "Too many queued requests, retry later");
+        else if (g == -2) json_error(resp, 503, "Insufficient memory, retry later");
+        else json_error(resp, 503, "Model is unloading, retry later");
+        return;
+    }
+
+    char *chat_prompt = build_completion_prompt(ctx, prompt, 0);
+    free(prompt);
+    StrBuf out; sb_init(&out);
+    VLLMMetrics met; memset(&met, 0, sizeof(met));
+    int rc = chat_prompt
+                 ? run_completion(ctx, chat_prompt, NULL, NULL, 0, NULL, 0, NULL,
+                                  0.0, 1.0, 0.0, 0, 0, max_tokens,
+                                  0, NULL, 0, &out, &met, NULL, NULL, NULL, NULL)
+                 : -1;
+    free(chat_prompt);
+    infer_done(ctx);
+    if (rc != 0) {
+        sb_free(&out); free(scene); vjson_free(body);
+        json_error(resp, 500, rc == -2 ? "Prompt exceeds the context limit" : "Inference failed");
+        return;
+    }
+
+    /* 构造响应 JSON */
+    VJson *root = vjson_new_object();
+    vjson_obj_set(root, "model", vjson_new_string(ctx->model_id ? ctx->model_id : "scene"));
+    VJson *arr = vjson_new_array();
+    for (int i = 0; i < n; i++) {
+        char cn[64];
+        if (st_yolo_class_name(g_yolo, dets[i].cls, cn, sizeof(cn)) != 0)
+            snprintf(cn, sizeof(cn), "class_%d", dets[i].cls);
+        VJson *it = vjson_new_object();
+        vjson_obj_set(it, "cls", vjson_new_number((double)dets[i].cls));
+        vjson_obj_set(it, "name", vjson_new_string(cn));
+        vjson_obj_set(it, "score", vjson_new_number((double)dets[i].score));
+        VJson *box = vjson_new_array();
+        vjson_array_push(box, vjson_new_number((double)dets[i].x1));
+        vjson_array_push(box, vjson_new_number((double)dets[i].y1));
+        vjson_array_push(box, vjson_new_number((double)dets[i].x2));
+        vjson_array_push(box, vjson_new_number((double)dets[i].y2));
+        vjson_obj_set(it, "box", box);
+        vjson_array_push(arr, it);
+    }
+    vjson_obj_set(root, "detections", arr);
+    vjson_obj_set(root, "scene", vjson_new_string(scene));
+    vjson_obj_set(root, "answer", vjson_new_string(out.s ? out.s : ""));
+
+    size_t cap = 4096 + strlen(out.s ? out.s : "") * 2 + strlen(scene) * 2
+                 + (size_t)n * 160;
+    char *rbody = (char *)malloc(cap);
+    if (!rbody) {
+        sb_free(&out); free(scene); vjson_free(root); vjson_free(body);
+        json_error(resp, 500, "Out of memory"); return;
+    }
+    size_t rn = vjson_serialize(root, rbody, cap);
+    vjson_free(root);
+    sb_free(&out); free(scene); vjson_free(body);
+    if (rn > 0) {
+        resp->status = 200;
+        resp->content_type = "application/json";
+        resp->body = rbody; resp->body_len = rn; resp->body_owned = rbody;
+    } else {
+        free(rbody);
+        json_error(resp, 500, "Response too large");
+    }
+}
+
+/* ================================================================
+ * 视频源检测（K-E2E-005）：MP4 文件 / 图像序列目录 / MJPEG·快照 URL / RTSP
+ *
+ * 两种形态：
+ *   1) 单次抽帧 POST /v1/detect_video  —— 请求内抽 N 帧逐帧检测，返回逐帧框 + 汇总；
+ *   2) 常驻拉流 POST /v1/stream/start|stop + GET /v1/stream/status
+ *                                     —— 后台线程持续抽帧检测，只保留最近一帧结果。
+ *
+ * 边界（显式回报，不静默）：引擎自带 H.264 软解只支持 I 片 ⇒ MP4/RTSP 只能抽
+ * **IDR 帧**，被跳过的非 IDR 在 summary.skipped_non_idr 与日志中回报。
+ * ================================================================ */
+
+typedef struct { int cls; char name[64]; float max_score; int frames; } VClsAgg;
+
+/* 一帧 YOLO（复用全局 g_yolo + g_yolo_lock；与 /v1/detect 同一模型实例）。 */
+static int yolo_detect_frame(VLLMServerCtx *ctx, const uint8_t *rgb, int w, int h,
+                             YoloDet *dets, int max_out) {
+    pthread_mutex_lock(&g_yolo_lock);
+    if (!g_yolo) {
+        g_yolo = yolo_open_model(ctx);
+        if (g_yolo) fprintf(stderr, "[YOLO] video route ready (%s)\n", ctx->yolo_model);
+    }
+    int n = g_yolo ? st_yolo_detect(g_yolo, rgb, w, h, 0.f, 0.f, dets, max_out) : -1;
+    pthread_mutex_unlock(&g_yolo_lock);
+    return n;
+}
+
+static void agg_add(VClsAgg *agg, int *nagg, int cls, const char *name, float score) {
+    for (int i = 0; i < *nagg; i++) {
+        if (agg[i].cls == cls) {
+            if (score > agg[i].max_score) agg[i].max_score = score;
+            agg[i].frames++;
+            return;
+        }
+    }
+    if (*nagg >= 256) return;
+    agg[*nagg].cls = cls;
+    snprintf(agg[*nagg].name, sizeof(agg[*nagg].name), "%s", name);
+    agg[*nagg].max_score = score;
+    agg[*nagg].frames = 1;
+    (*nagg)++;
+}
+
+static void vsrc_sleep_ms(int ms) {
+    if (ms <= 0) return;
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+}
+
+/* ---------- POST /v1/detect_video ----------
+ * Body : {"source":"<file|dir|http://|rtsp://>", "max_frames":N, "timeout_ms":T,
+ *         "interval_ms":I, "include_frames":true}
+ *   source 缺省回落 --yolo-video-src（管理页配置的默认视频源）。
+ * Reply: {source,kind,mode,live,width,height,frames:[{i,detections:[...]}],
+ *         summary:{frames,detected_frames,skipped_non_idr,classes:[...],ms}} */
+static void handle_detect_video(VLLMServerCtx *ctx, const VHttpRequest *req,
+                                VHttpResponse *resp) {
+    if (!ctx->yolo_model) {
+        json_error(resp, 404, "video detect disabled: start with --yolo-model");
+        return;
+    }
+    VJson *body = vjson_parse(req->body);
+    if (!body) { json_error(resp, 400, "Invalid JSON body"); return; }
+    const char *source = vjson_str(vjson_obj_get(body, "source"));
+    if (!source || !source[0]) source = ctx->yolo_video_src;
+    if (!source || !source[0]) {
+        vjson_free(body);
+        json_error(resp, 400, "'source' is required (or configure --yolo-video-src)");
+        return;
+    }
+    /* 先拷一份：下面会 vjson_free(body)，source 可能指向 body 内部（UAF 防护）。 */
+    char src_copy[600];
+    snprintf(src_copy, sizeof(src_copy), "%s", source);
+    source = src_copy;
+    int max_frames = (ctx->yolo_video_frames > 0) ? ctx->yolo_video_frames : 8;
+    int timeout_ms = 20000;
+    int interval_ms = 0;
+    int include_frames = 1;
+    VJson *jv;
+    if ((jv = vjson_obj_get(body, "max_frames")) && jv->type == VJ_NUMBER) {
+        max_frames = (int)jv->u.number;
+        if (max_frames <= 0) max_frames = 1;
+        if (max_frames > 300) max_frames = 300;
+    }
+    if ((jv = vjson_obj_get(body, "timeout_ms")) && jv->type == VJ_NUMBER) {
+        timeout_ms = (int)jv->u.number;
+        if (timeout_ms < 1000) timeout_ms = 1000;
+        if (timeout_ms > 120000) timeout_ms = 120000;
+    }
+    if ((jv = vjson_obj_get(body, "interval_ms")) && jv->type == VJ_NUMBER) {
+        interval_ms = (int)jv->u.number;
+        if (interval_ms < 0) interval_ms = 0;
+        if (interval_ms > 10000) interval_ms = 10000;
+    }
+    if ((jv = vjson_obj_get(body, "include_frames")) && jv->type == VJ_BOOL)
+        include_frames = jv->u.boolean ? 1 : 0;
+
+    char err[256] = "";
+    VVideoSrc *vs = vsrc_open(source, err, sizeof(err));
+    if (!vs) {
+        char msg[320];
+        snprintf(msg, sizeof(msg), "video source open failed: %s", err);
+        fprintf(stderr, "[VDETECT] open failed source=%s err=%s\n", source, err);
+        fflush(stderr);
+        vjson_free(body);
+        json_error(resp, 400, msg);
+        return;
+    }
+    const int live = vsrc_live(vs);
+    fprintf(stderr, "[VDETECT] open source=%s kind=%s mode=%s live=%d\n",
+            source, vsrc_kind_name(vs), vsrc_mode(vs), live);
+    fflush(stderr);
+
+    double t0 = st_now_sec();
+    VJson *frames = vjson_new_array();
+    VClsAgg agg[256]; int nagg = 0;
+    int produced = 0, det_frames = 0, first_w = 0, first_h = 0;
+    int stop_reason = 0;   /* 0=达到帧数上限 1=源结束/超时 2=总超时 */
+    while (produced < max_frames) {
+        if ((st_now_sec() - t0) * 1000.0 > (double)timeout_ms) { stop_reason = 2; break; }
+        uint8_t *rgb = NULL; int w = 0, h = 0;
+        int rc = vsrc_next(vs, &rgb, &w, &h);
+        if (rc < 0) {
+            fprintf(stderr, "[VDETECT] decode error (produced=%d)\n", produced);
+            fflush(stderr);
+            break;
+        }
+        if (rc == 0) {
+            /* live 每轮重读：HTTP 源首帧后才知道是不是 MJPEG（见 vsrc_live 注释） */
+            if (vsrc_live(vs) && (st_now_sec() - t0) * 1000.0 < (double)timeout_ms) {
+                vsrc_sleep_ms(interval_ms > 0 ? interval_ms : 100);
+                continue;                       /* 直播源：等下一帧 */
+            }
+            stop_reason = 1;                    /* 有限源结束（或直播超时） */
+            break;
+        }
+        if (first_w == 0) { first_w = w; first_h = h; }
+        YoloDet dets[300];
+        int n = yolo_detect_frame(ctx, rgb, w, h, dets, 300);
+        media_free_image(rgb);
+        if (n < 0) {
+            fprintf(stderr, "[VDETECT] detect failed at frame %d\n", produced);
+            fflush(stderr);
+            break;
+        }
+        if (n > 0) det_frames++;
+        for (int i = 0; i < n; i++) {
+            char cn[64];
+            if (st_yolo_class_name(g_yolo, dets[i].cls, cn, sizeof(cn)) != 0)
+                snprintf(cn, sizeof(cn), "class_%d", dets[i].cls);
+            agg_add(agg, &nagg, dets[i].cls, cn, dets[i].score);
+        }
+        if (include_frames) {
+            VJson *fr = vjson_new_object();
+            vjson_obj_set(fr, "i", vjson_new_number((double)produced));
+            VJson *da = vjson_new_array();
+            for (int i = 0; i < n; i++) {
+                char cn[64];
+                if (st_yolo_class_name(g_yolo, dets[i].cls, cn, sizeof(cn)) != 0)
+                    snprintf(cn, sizeof(cn), "class_%d", dets[i].cls);
+                VJson *it = vjson_new_object();
+                vjson_obj_set(it, "cls", vjson_new_number((double)dets[i].cls));
+                vjson_obj_set(it, "name", vjson_new_string(cn));
+                vjson_obj_set(it, "score", vjson_new_number((double)dets[i].score));
+                VJson *box = vjson_new_array();
+                vjson_array_push(box, vjson_new_number((double)dets[i].x1));
+                vjson_array_push(box, vjson_new_number((double)dets[i].y1));
+                vjson_array_push(box, vjson_new_number((double)dets[i].x2));
+                vjson_array_push(box, vjson_new_number((double)dets[i].y2));
+                vjson_obj_set(it, "box", box);
+                vjson_array_push(da, it);
+            }
+            vjson_obj_set(fr, "detections", da);
+            vjson_array_push(frames, fr);
+        }
+        produced++;
+        if (interval_ms > 0 && produced < max_frames) vsrc_sleep_ms(interval_ms);
+    }
+    double ms = (st_now_sec() - t0) * 1000.0;
+    int skipped = vsrc_skipped(vs);
+    int dec_failed = vsrc_decode_failed(vs);
+    char kind[16], mode[48];
+    snprintf(kind, sizeof(kind), "%s", vsrc_kind_name(vs));
+    snprintf(mode, sizeof(mode), "%s", vsrc_mode(vs));
+    int total_hint = vsrc_total_hint(vs);
+    int live_final = vsrc_live(vs);     /* 首帧后重读（HTTP 源此时才知是否 MJPEG） */
+    vsrc_close(vs);
+    vjson_free(body);
+
+    VJson *root = vjson_new_object();
+    vjson_obj_set(root, "model", vjson_new_string("yolo"));
+    vjson_obj_set(root, "source", vjson_new_string(source));
+    vjson_obj_set(root, "kind", vjson_new_string(kind));
+    vjson_obj_set(root, "mode", vjson_new_string(mode));
+    vjson_obj_set(root, "live", vjson_new_bool(live_final));
+    vjson_obj_set(root, "width", vjson_new_number((double)first_w));
+    vjson_obj_set(root, "height", vjson_new_number((double)first_h));
+    vjson_obj_set(root, "frames", frames);
+    VJson *sum = vjson_new_object();
+    vjson_obj_set(sum, "frames", vjson_new_number((double)produced));
+    vjson_obj_set(sum, "detected_frames", vjson_new_number((double)det_frames));
+    vjson_obj_set(sum, "skipped_non_idr", vjson_new_number((double)skipped));
+    vjson_obj_set(sum, "decoded_failed", vjson_new_number((double)dec_failed));
+    if (total_hint >= 0) vjson_obj_set(sum, "total_hint", vjson_new_number((double)total_hint));
+    vjson_obj_set(sum, "stop", vjson_new_string(
+        stop_reason == 2 ? "timeout" : stop_reason == 1 ? "source_end" : "frame_budget"));
+    vjson_obj_set(sum, "ms", vjson_new_number(ms));
+    VJson *cls = vjson_new_array();
+    for (int i = 0; i < nagg; i++) {
+        VJson *c = vjson_new_object();
+        vjson_obj_set(c, "cls", vjson_new_number((double)agg[i].cls));
+        vjson_obj_set(c, "name", vjson_new_string(agg[i].name));
+        vjson_obj_set(c, "max_score", vjson_new_number((double)agg[i].max_score));
+        vjson_obj_set(c, "frames", vjson_new_number((double)agg[i].frames));
+        vjson_array_push(cls, c);
+    }
+    vjson_obj_set(sum, "classes", cls);
+    vjson_obj_set(root, "summary", sum);
+    fprintf(stderr, "[VDETECT] done source=%s frames=%d detected=%d skipped_non_idr=%d decoded_failed=%d stop=%d %.1fms\n",
+            source, produced, det_frames, skipped, dec_failed, stop_reason, ms);
+    fflush(stderr);
+
+    size_t cap = 65536 + (size_t)produced * 8192 + strlen(source) * 2;
+    char *rb = (char *)malloc(cap);
+    if (!rb) { vjson_free(root); json_error(resp, 500, "Out of memory"); return; }
+    size_t rn = vjson_serialize(root, rb, cap);
+    vjson_free(root);
+    if (rn > 0) {
+        resp->status = 200;
+        resp->content_type = "application/json";
+        resp->body = rb; resp->body_len = rn; resp->body_owned = rb;
+    } else {
+        free(rb);
+        json_error(resp, 500, "Response too large");
+    }
+}
+
+/* ---------- 常驻拉流：后台线程持续抽帧检测 ---------- */
+typedef struct {
+    int             running;
+    volatile int    stop;
+    pthread_t       thr;
+    pthread_mutex_t lock;
+    VLLMServerCtx  *ctx;
+    char            source[600];
+    char            kind[16];
+    char            mode[48];
+    int             interval_ms;
+    int             max_frames;     /* 0 = 不限 */
+    int             frames, det_frames, skipped, dec_failed;
+    int             width, height;
+    double          started;
+    char            err[256];
+    char            last[8192];     /* 最近一帧的 detections JSON 片段 */
+    int             last_n;
+    int             last_i;
+} VVideoStream;
+
+static VVideoStream g_vstream;
+static pthread_mutex_t g_vstream_spawn_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void *vstream_thread(void *arg) {
+    VVideoStream *v = (VVideoStream *)arg;
+    char err[256] = "";
+    VVideoSrc *vs = vsrc_open(v->source, err, sizeof(err));
+    if (!vs) {
+        pthread_mutex_lock(&v->lock);
+        snprintf(v->err, sizeof(v->err), "open failed: %s", err);
+        v->running = 0;
+        pthread_mutex_unlock(&v->lock);
+        fprintf(stderr, "[VSTREAM] open failed source=%s err=%s\n", v->source, err);
+        fflush(stderr);
+        return NULL;
+    }
+    pthread_mutex_lock(&v->lock);
+    snprintf(v->kind, sizeof(v->kind), "%s", vsrc_kind_name(vs));
+    snprintf(v->mode, sizeof(v->mode), "%s", vsrc_mode(vs));
+    pthread_mutex_unlock(&v->lock);
+    fprintf(stderr, "[VSTREAM] started source=%s kind=%s mode=%s interval=%dms\n",
+            v->source, vsrc_kind_name(vs), vsrc_mode(vs), v->interval_ms);
+    fflush(stderr);
+
+    YoloDet dets[300];
+    while (!v->stop) {
+        uint8_t *rgb = NULL; int w = 0, h = 0;
+        int rc = vsrc_next(vs, &rgb, &w, &h);
+        if (rc < 0) {
+            pthread_mutex_lock(&v->lock);
+            snprintf(v->err, sizeof(v->err), "decode/transport error after %d frames", v->frames);
+            v->running = 0;
+            pthread_mutex_unlock(&v->lock);
+            break;
+        }
+        if (rc == 0) {
+            /* live 每轮重读（HTTP 源首帧后才知道是不是 MJPEG） */
+            if (vsrc_live(vs)) { vsrc_sleep_ms(v->interval_ms > 0 ? v->interval_ms : 200); continue; }
+            pthread_mutex_lock(&v->lock);
+            snprintf(v->err, sizeof(v->err), "source end (finite source)");
+            v->running = 0;
+            pthread_mutex_unlock(&v->lock);
+            break;
+        }
+        int n = yolo_detect_frame(v->ctx, rgb, w, h, dets, 300);
+        media_free_image(rgb);
+        if (n < 0) {
+            pthread_mutex_lock(&v->lock);
+            snprintf(v->err, sizeof(v->err), "detect failed at frame %d", v->frames);
+            v->running = 0;
+            pthread_mutex_unlock(&v->lock);
+            break;
+        }
+        char frag[8192];
+        size_t o = (size_t)snprintf(frag, sizeof(frag), "[");
+        for (int i = 0; i < n && o + 200 < sizeof(frag); i++) {
+            char cn[64];
+            if (st_yolo_class_name(g_yolo, dets[i].cls, cn, sizeof(cn)) != 0)
+                snprintf(cn, sizeof(cn), "class_%d", dets[i].cls);
+            o += (size_t)snprintf(frag + o, sizeof(frag) - o,
+                "%s{\"cls\":%d,\"name\":\"%s\",\"score\":%.4f,\"box\":[%.1f,%.1f,%.1f,%.1f]}",
+                i ? "," : "", dets[i].cls, cn, dets[i].score,
+                dets[i].x1, dets[i].y1, dets[i].x2, dets[i].y2);
+        }
+        snprintf(frag + o, sizeof(frag) - o, "]");
+        pthread_mutex_lock(&v->lock);
+        v->frames++;
+        if (n > 0) v->det_frames++;
+        v->width = w; v->height = h;
+        v->last_n = n;
+        v->last_i = v->frames - 1;
+        /* 刷新 kind/mode：HTTP 源首帧后才确定是 MJPEG 还是单帧快照 */
+        snprintf(v->kind, sizeof(v->kind), "%s", vsrc_kind_name(vs));
+        snprintf(v->mode, sizeof(v->mode), "%s", vsrc_mode(vs));
+        snprintf(v->last, sizeof(v->last), "%s", frag);
+        if (v->max_frames > 0 && v->frames >= v->max_frames) {
+            snprintf(v->err, sizeof(v->err), "frame budget reached (%d)", v->max_frames);
+            v->running = 0;
+            pthread_mutex_unlock(&v->lock);
+            break;
+        }
+        pthread_mutex_unlock(&v->lock);
+        vsrc_sleep_ms(v->interval_ms > 0 ? v->interval_ms : 200);
+    }
+    pthread_mutex_lock(&v->lock);
+    v->skipped = vsrc_skipped(vs);
+    v->dec_failed = vsrc_decode_failed(vs);
+    pthread_mutex_unlock(&v->lock);
+    vsrc_close(vs);
+    fprintf(stderr, "[VSTREAM] stopped source=%s frames=%d det_frames=%d skipped_non_idr=%d decoded_failed=%d\n",
+            v->source, v->frames, v->det_frames, v->skipped, v->dec_failed);
+    fflush(stderr);
+    return NULL;
+}
+
+/* POST /v1/stream/start  {source?, interval_ms?, max_frames?} */
+static void handle_stream_start(VLLMServerCtx *ctx, const VHttpRequest *req,
+                                VHttpResponse *resp) {
+    if (!ctx->yolo_model) { json_error(resp, 404, "disabled: start with --yolo-model"); return; }
+    VJson *body = vjson_parse(req->body);
+    if (!body) { json_error(resp, 400, "Invalid JSON body"); return; }
+    const char *source = vjson_str(vjson_obj_get(body, "source"));
+    if (!source || !source[0]) source = ctx->yolo_video_src;
+    if (!source || !source[0]) {
+        vjson_free(body);
+        json_error(resp, 400, "'source' is required (or configure --yolo-video-src)");
+        return;
+    }
+    int interval_ms = (ctx->yolo_video_interval_ms > 0) ? ctx->yolo_video_interval_ms : 500;
+    int max_frames = 0;
+    VJson *jv;
+    if ((jv = vjson_obj_get(body, "interval_ms")) && jv->type == VJ_NUMBER) {
+        interval_ms = (int)jv->u.number;
+        if (interval_ms < 0) interval_ms = 0;
+        if (interval_ms > 60000) interval_ms = 60000;
+    }
+    if ((jv = vjson_obj_get(body, "max_frames")) && jv->type == VJ_NUMBER) {
+        max_frames = (int)jv->u.number;
+        if (max_frames < 0) max_frames = 0;
+        if (max_frames > 1000000) max_frames = 1000000;
+    }
+
+    pthread_mutex_lock(&g_vstream_spawn_lock);
+    if (g_vstream.running) {
+        pthread_mutex_unlock(&g_vstream_spawn_lock);
+        vjson_free(body);
+        json_error(resp, 409, "a video stream is already running (POST /v1/stream/stop first)");
+        return;
+    }
+    memset(&g_vstream, 0, sizeof(g_vstream));
+    pthread_mutex_init(&g_vstream.lock, NULL);
+    snprintf(g_vstream.source, sizeof(g_vstream.source), "%s", source);
+    g_vstream.ctx = ctx;
+    g_vstream.interval_ms = interval_ms;
+    g_vstream.max_frames = max_frames;
+    g_vstream.started = st_now_sec();
+    g_vstream.running = 1;
+    g_vstream.stop = 0;
+    int prc = pthread_create(&g_vstream.thr, NULL, vstream_thread, &g_vstream);
+    if (prc != 0) {
+        g_vstream.running = 0;
+        pthread_mutex_unlock(&g_vstream_spawn_lock);
+        vjson_free(body);
+        json_error(resp, 500, "failed to start stream thread");
+        return;
+    }
+    pthread_mutex_unlock(&g_vstream_spawn_lock);
+    vjson_free(body);
+
+    char rb[512];
+    int n = snprintf(rb, sizeof(rb),
+        "{\"started\":true,\"source\":\"%s\",\"interval_ms\":%d,\"max_frames\":%d}",
+        g_vstream.source, interval_ms, max_frames);
+    char *out = (char *)malloc((size_t)n + 1);
+    if (!out) { json_error(resp, 500, "Out of memory"); return; }
+    memcpy(out, rb, (size_t)n + 1);
+    resp->status = 200; resp->content_type = "application/json";
+    resp->body = out; resp->body_len = (size_t)n; resp->body_owned = out;
+}
+
+/* POST /v1/stream/stop */
+static void handle_stream_stop(VLLMServerCtx *ctx, const VHttpRequest *req,
+                               VHttpResponse *resp) {
+    (void)ctx; (void)req;
+    pthread_mutex_lock(&g_vstream_spawn_lock);
+    if (!g_vstream.running) {
+        pthread_mutex_unlock(&g_vstream_spawn_lock);
+        json_error(resp, 409, "no video stream is running");
+        return;
+    }
+    g_vstream.stop = 1;
+    pthread_join(g_vstream.thr, NULL);
+    g_vstream.running = 0;
+    char rb[256];
+    int n = snprintf(rb, sizeof(rb), "{\"stopped\":true,\"frames\":%d}", g_vstream.frames);
+    pthread_mutex_unlock(&g_vstream_spawn_lock);
+    char *out = (char *)malloc((size_t)n + 1);
+    if (!out) { json_error(resp, 500, "Out of memory"); return; }
+    memcpy(out, rb, (size_t)n + 1);
+    resp->status = 200; resp->content_type = "application/json";
+    resp->body = out; resp->body_len = (size_t)n; resp->body_owned = out;
+}
+
+/* GET /v1/stream/status */
+static void handle_stream_status(VLLMServerCtx *ctx, const VHttpRequest *req,
+                                 VHttpResponse *resp) {
+    (void)ctx; (void)req;
+    pthread_mutex_lock(&g_vstream.lock);
+    int running = g_vstream.running;
+    char rb[12288];
+    int n = snprintf(rb, sizeof(rb),
+        "{\"running\":%s,\"source\":\"%s\",\"kind\":\"%s\",\"mode\":\"%s\","
+        "\"interval_ms\":%d,\"frames\":%d,\"detected_frames\":%d,\"skipped_non_idr\":%d,"
+        "\"decoded_failed\":%d,"
+        "\"width\":%d,\"height\":%d,\"uptime_s\":%.1f,\"last_index\":%d,\"last_count\":%d,"
+        "\"error\":\"%s\",\"last\":%s}",
+        running ? "true" : "false", g_vstream.source, g_vstream.kind, g_vstream.mode,
+        g_vstream.interval_ms, g_vstream.frames, g_vstream.det_frames, g_vstream.skipped,
+        g_vstream.dec_failed,
+        g_vstream.width, g_vstream.height,
+        g_vstream.started > 0 ? st_now_sec() - g_vstream.started : 0.0,
+        g_vstream.last_i, g_vstream.last_n,
+        g_vstream.err, g_vstream.last[0] ? g_vstream.last : "[]");
+    pthread_mutex_unlock(&g_vstream.lock);
+    if (n <= 0 || n >= (int)sizeof(rb)) { json_error(resp, 500, "status too large"); return; }
+    char *out = (char *)malloc((size_t)n + 1);
+    if (!out) { json_error(resp, 500, "Out of memory"); return; }
+    memcpy(out, rb, (size_t)n + 1);
+    resp->status = 200; resp->content_type = "application/json";
+    resp->body = out; resp->body_len = (size_t)n; resp->body_owned = out;
+}
+
+/* K-COLLAB-001 J5：协作链分段计时开关（env 门控，默认关）。 */
+static int collab_timing_on(void) {
+    const char *e = getenv("VLLM_COLLAB_TIMING");
+    return e && e[0] && e[0] != '0';
+}
+
+/* ---- K-COLLAB-001 P1：单条文本 → last-token pooling 向量（复刻 handle_embeddings
+ * 的裸文本编码路径）。st/cfg/tok/nl 由调用方选定（专用 embed 槽位或主模型）。
+ * 返回 0 成功，-1 失败。调用方须已持 inf_lock（与推理串行）。 */
+static int rag_embed_text(VLLMServerCtx *ctx, STQwenInferenceState *st,
+                          STModelConfig *cfg, QwenTokenizer *tok, int nl,
+                          const char *txt, float *vec) {
+    (void)ctx;
+    int dim = cfg->dim;
+    int max_seq = cfg->max_seq_len;
+    int *ids = (int *)malloc(((size_t)max_seq + 16) * sizeof(int));
+    if (!ids) return -1;
+    for (int l = 0; l < nl; l++) st->cache_len[l] = 0;
+    st->seq_len = 0; st->mrope_pos = 0;
+    st_qwen_kv_rebuild_freed(st);
+    int n = qwen_tokenizer_encode(tok, txt, ids, max_seq - 1);
+    if (n <= 0) { free(ids); return -1; }
+    if (n > max_seq - 8) n = max_seq - 8;
+    if (n < max_seq && ids[n-1] != tok->eos_id) ids[n++] = tok->eos_id;
+    st_embed_request(vec, dim);
+    int rc = st_qwen_model_prefill_batch(st, ids, n);
+    free(ids);
+    return rc;
+}
+
+/* K-ADMIN-001：管理面复用的「单条文本 → 向量」入口（与 /v1/rag 同路径）。
+ * 不涉及 HTTP 响应对象；失败以负值返回，由管理面转成 JSON 错误。
+ * 注意：不调用 ensure_model_ready(ctx, NULL)（其失败分支会写 resp）。 */
+int vllm_serve_embed_text(VLLMServerCtx *ctx, const char *txt, float *out) {
+    if (!ctx || !txt || !out) return -1;
+    if (ctx->load_state != 2) {
+        if (ctx->auto_load && ctx->load_state != 1) {
+            if (vllm_serve_load_on_use(ctx) != 0) return -2;
+        }
+        if (ctx->load_state != 2) return -2;
+    }
+    int g = infer_gate(ctx);
+    if (g != 0) return -3;
+
+    STQwenInferenceState *st; STModelConfig *cfg; QwenTokenizer *tok; int nl;
+    if (ctx->embed_model_dir) {
+        pthread_mutex_lock(&ctx->embed_lock);
+        if (ctx->embed_loaded == 0 && vllm_embed_load(ctx) != 0) {
+            pthread_mutex_unlock(&ctx->embed_lock);
+            infer_done(ctx);
+            return -4;
+        }
+        pthread_mutex_unlock(&ctx->embed_lock);
+        st = ctx->embed_ist; cfg = ctx->embed_cfg; tok = ctx->embed_tok;
+        nl = ctx->embed_w->n_layers_allocated;
+    } else {
+        st = ctx->ist; cfg = ctx->cfg; tok = ctx->tok; nl = ctx->w->n_layers_allocated;
+    }
+    int rc = rag_embed_text(ctx, st, cfg, tok, nl, txt, out);
+    infer_done(ctx);
+    if (rc != 0) return -5;
+    return cfg->dim;
+}
+
+/* ---------- 转人工回调（K-E2E-004） ----------
+ * 拒答（证据不足）与路由 escalate 时，POST 一条 JSON 到 ctx->handoff_url。
+ * 契约：① 绝不改变主响应（只做旁路通知）；② 成功/失败都打 [HANDOFF] 日志——
+ * 失败不静默（对齐公理 silent_fallback_false_pass）；③ 未配置 = 完全不触发（零回归）。
+ * 复用 vhttp_post_json（仅明文 http://，https 需前置 TLS 网关）。 */
+static size_t json_escape_into(const char *s, char *out, size_t cap);
+
+static void handoff_notify(VLLMServerCtx *ctx, const char *cause, const char *query,
+                           double evidence, double threshold) {
+    if (!ctx || !ctx->handoff_url || !ctx->handoff_url[0]) return;
+    const char *q = query ? query : "";
+    size_t ql = strlen(q) * 6 + 16;
+    char *esc = (char *)malloc(ql);
+    if (!esc) { fprintf(stderr, "[HANDOFF] skip: out of memory\n"); fflush(stderr); return; }
+    json_escape_into(q, esc, ql);
+    size_t blen = ql + 256;
+    char *jb = (char *)malloc(blen);
+    if (!jb) { free(esc); fprintf(stderr, "[HANDOFF] skip: out of memory\n"); fflush(stderr); return; }
+    snprintf(jb, blen,
+             "{\"cause\":\"%s\",\"query\":\"%s\",\"evidence\":%.4f,\"threshold\":%.4f,"
+             "\"model\":\"%s\",\"route\":\"handoff_to_human\"}",
+             cause ? cause : "unknown", esc, evidence, threshold,
+             ctx->model_id ? ctx->model_id : "");
+    free(esc);
+    char *rb = NULL; int status = 0;
+    int rc = vhttp_post_json(ctx->handoff_url, NULL, jb, strlen(jb), &rb, &status, NULL, 0);
+    fprintf(stderr, "[HANDOFF] cause=%s url=%s rc=%d status=%d\n",
+            cause ? cause : "unknown", ctx->handoff_url, rc, status);
+    fflush(stderr);
+    free(rb); free(jb);
+}
+
+/* ---------- POST /v1/rag (K-COLLAB-001 P1) ----------
+ * 知识库检索增强问答：embed(query) → 向量库 top-k → 拼 prompt → 主模型回答。
+ * Body  : {"query":"...","kb_dir":"<.vkb path>","top_k":N,"max_tokens":M}
+ * Reply : {"retrieved":[{"index":i,"meta":...,"score":...}],"answer":"..."}
+ * 依赖  : --embed-model（专用 embedding；缺省复用主模型）+ 主 chat 模型。 */
+static void handle_rag(VLLMServerCtx *ctx, const VHttpRequest *req,
+                       VHttpResponse *resp) {
+    if (ensure_model_ready(ctx, resp) != 0) return;
+    VJson *body = vjson_parse(req->body);
+    if (!body) { json_error(resp, 400, "Invalid JSON body"); return; }
+    const char *query = vjson_str(vjson_obj_get(body, "query"));
+    const char *kb_dir = vjson_str(vjson_obj_get(body, "kb_dir"));
+    if (!query || !query[0] || !kb_dir || !kb_dir[0]) {
+        json_error(resp, 400, "'query' and 'kb_dir' are required");
+        vjson_free(body); return;
+    }
+    int top_k = 5, max_tokens = 128;
+    VJson *jv;
+    if ((jv = vjson_obj_get(body, "top_k")) && jv->type == VJ_NUMBER) {
+        top_k = (int)jv->u.number; if (top_k <= 0) top_k = 1; if (top_k > 16) top_k = 16;
+    }
+    if ((jv = vjson_obj_get(body, "max_tokens")) && jv->type == VJ_NUMBER) {
+        max_tokens = (int)jv->u.number; if (max_tokens <= 0) max_tokens = 1;
+        if (max_tokens > 4096) max_tokens = 4096;
+    }
+
+    int g = infer_gate(ctx);
+    if (g == -1) { json_error(resp, 429, "Too many queued requests, retry later"); vjson_free(body); return; }
+    if (g == -2) { json_error(resp, 503, "Insufficient memory, retry later"); vjson_free(body); return; }
+    if (g == -3) { json_error(resp, 503, "Model is unloading, retry later"); vjson_free(body); return; }
+
+    /* 回退透明（J4 + silent_fallback_false_pass）：RAG 检索依赖 embedding 质量，
+     * 缺省 --embed-model 时复用主模型（4B 非 embedding 训练）会静默降级检索质量。
+     * 显式回退纯 LLM（不拼检索上下文）+ 打日志。 */
+    const int plain_fallback = (ctx->embed_model_dir == NULL);
+    if (plain_fallback) {
+        fprintf(stderr, "[RAG] no --embed-model, plain-LLM fallback (no retrieval)\n");
+        fflush(stderr);
+    }
+
+    double t_c0 = st_now_sec(), t_embed = 0.0, t_search = 0.0;
+    float *qvec = NULL;
+    VLLMKVStore kb; vllm_kv_init(&kb, 0);
+    int k = 0; int *idx = NULL; float *sc = NULL;
+
+    if (!plain_fallback) {
+        /* 1) 专用 embedding 模型出 query 向量 */
+        pthread_mutex_lock(&ctx->embed_lock);
+        if (ctx->embed_loaded == 0 && vllm_embed_load(ctx) != 0) {
+            pthread_mutex_unlock(&ctx->embed_lock);
+            infer_done(ctx); json_error(resp, 503, ctx->embed_error); vjson_free(body); return;
+        }
+        pthread_mutex_unlock(&ctx->embed_lock);
+        STQwenInferenceState *st = ctx->embed_ist;
+        STModelConfig *cfg = ctx->embed_cfg;
+        QwenTokenizer *tok = ctx->embed_tok;
+        int nl = ctx->embed_w->n_layers_allocated;
+        int dim = cfg->dim;
+        qvec = (float *)malloc((size_t)dim * sizeof(float));
+        if (!qvec) { infer_done(ctx); json_error(resp, 500, "Out of memory"); vjson_free(body); return; }
+        if (rag_embed_text(ctx, st, cfg, tok, nl, query, qvec) != 0) {
+            infer_done(ctx); free(qvec); json_error(resp, 500, "Embedding failed"); vjson_free(body); return;
+        }
+        t_embed = st_now_sec();
+
+        /* 2) 加载向量库 + 检索 */
+        if (vllm_kv_load(&kb, kb_dir) != 0) {
+            infer_done(ctx); free(qvec); json_error(resp, 404, "vector store load failed"); vjson_free(body); return;
+        }
+        if (kb.dim != dim) {
+            infer_done(ctx); free(qvec); vllm_kv_free(&kb);
+            json_error(resp, 400, "vector store dim mismatch"); vjson_free(body); return;
+        }
+        k = top_k < kb.n ? top_k : kb.n;
+        if (k <= 0) { infer_done(ctx); free(qvec); vllm_kv_free(&kb); json_error(resp, 400, "empty vector store"); vjson_free(body); return; }
+        int kc = k;                                  /* 候选数（重排开时放大） */
+        {
+            int rn = vllm_kb_rerank_candidates();
+            if (rn > kc) kc = (rn < kb.n) ? rn : kb.n;
+        }
+        idx = (int *)malloc((size_t)kc * sizeof(int));
+        sc = (float *)malloc((size_t)kc * sizeof(float));
+        if (!idx || !sc) {
+            infer_done(ctx); free(qvec); vllm_kv_free(&kb); free(idx); free(sc);
+            json_error(resp, 500, "Out of memory"); vjson_free(body); return;
+        }
+        vllm_kv_search(&kb, qvec, kc, idx, sc);
+        if (kc > k) {                                /* 词面混合重排（显式打日志，不静默） */
+            vllm_kb_rerank(query, &kb, idx, sc, kc);
+            fprintf(stderr, "[RAG] rerank on: candidates=%d -> top%d\n", kc, k);
+            fflush(stderr);
+        }
+        t_search = st_now_sec();
+    }
+
+    /* 3) 拒答门（K-E2E-003/004，--kb-abstain 阈值 才开，默认关=零回归）。
+     * 只判「知识库里有没有这条依据」，不判答案内容；证据不足则跳过生成、显式拒答
+     * 并标 action=handoff_to_human。阈值由板端正/负样本标定（先冻结判据后采数）。 */
+    int abstained = 0;
+    double ev_value = 0.0, ev_thr = 0.0, ev_cover = 0.0;
+    float ev_top1 = 0.0f;
+    if (!plain_fallback && k > 0) {
+        ev_thr = (ctx->kb_abstain > 0.f) ? (double)ctx->kb_abstain : 0.0;
+        ev_top1 = sc[0];
+        ev_cover = vllm_kb_coverage(query, kb.meta[idx[0]]);
+        ev_value = vllm_kb_evidence(query, kb.meta[idx[0]], sc[0]);
+        if (ev_thr > 0.0 && ev_value < ev_thr) abstained = 1;
+        fprintf(stderr, "[RAG] evidence=%.3f (top1cos=%.3f cover=%.3f) gate=%s\n",
+                ev_value, (double)ev_top1, ev_cover,
+                ev_thr > 0.0 ? (abstained ? "ABSTAIN" : "pass") : "off");
+        fflush(stderr);
+    }
+
+    /* 4) 拼 prompt（回退：不拼检索上下文；拒答：不生成） */
+    char *prompt = NULL;
+    if (abstained) {
+        /* 跳过 prompt 构建与生成 */
+    } else if (plain_fallback) {
+        size_t plen = strlen(query) + 64;
+        char *rag_prompt = (char *)malloc(plen);
+        if (!rag_prompt) {
+            infer_done(ctx); json_error(resp, 500, "Out of memory"); vjson_free(body); return;
+        }
+        snprintf(rag_prompt, plen, "问题：%s\n回答：", query);
+        prompt = build_completion_prompt(ctx, rag_prompt, 0 /* 直接回答，不思考 */);
+        free(rag_prompt);
+    } else {
+        size_t plen = 128;
+        for (int i = 0; i < k; i++) plen += strlen(kb.meta[idx[i]]) + 1;
+        plen += strlen(query) + 64;
+        char *rag_prompt = (char *)malloc(plen);
+        if (!rag_prompt) {
+            infer_done(ctx); free(qvec); vllm_kv_free(&kb); free(idx); free(sc);
+            json_error(resp, 500, "Out of memory"); vjson_free(body); return;
+        }
+        size_t po = 0;
+        po += (size_t)snprintf(rag_prompt + po, plen - po, "参考资料：\n");
+        for (int i = 0; i < k; i++)
+            po += (size_t)snprintf(rag_prompt + po, plen - po, "%s\n", kb.meta[idx[i]]);
+        po += (size_t)snprintf(rag_prompt + po, plen - po, "\n问题：%s\n回答：", query);
+        prompt = build_completion_prompt(ctx, rag_prompt, 0 /* 直接回答，不思考 */);
+        free(rag_prompt);
+    }
+
+    /* 5) chat 生成（贪心，确定性）；拒答时已无 prompt，跳过 */
+    StrBuf out; sb_init(&out);
+    VLLMMetrics met; memset(&met, 0, sizeof(met));
+    int rc = 0;
+    if (!abstained) {
+        rc = prompt ? run_completion(ctx, prompt, NULL, NULL, 0, NULL, 0, NULL,
+                                     0.0, 1.0, 0.0, 0, 0, max_tokens,
+                                     0, NULL, 0, &out, &met, NULL, NULL, NULL, NULL)
+                    : -1;
+    }
+    free(prompt);
+    infer_done(ctx);
+    double t_llm = st_now_sec();
+    if (collab_timing_on()) {
+        if (plain_fallback) {
+            fprintf(stderr, "[COLLAB-T] rag plain-fallback llm=%.1fms total=%.1fms\n",
+                    (t_llm - t_c0) * 1000.0, (t_llm - t_c0) * 1000.0);
+        } else {
+            fprintf(stderr, "[COLLAB-T] rag embed=%.1fms search=%.1fms llm=%.1fms total=%.1fms\n",
+                    (t_embed - t_c0) * 1000.0, (t_search - t_embed) * 1000.0,
+                    (t_llm - t_search) * 1000.0, (t_llm - t_c0) * 1000.0);
+        }
+        fflush(stderr);
+    }
+
+    if (rc != 0) {
+        sb_free(&out); free(qvec); vllm_kv_free(&kb); free(idx); free(sc);
+        json_error(resp, 500, rc == -2 ? "Prompt exceeds the context limit" : "Inference failed");
+        vjson_free(body); return;
+    }
+
+    /* 6) 构造响应 JSON */
+    VJson *root = vjson_new_object();
+    vjson_obj_set(root, "model", vjson_new_string(ctx->model_id ? ctx->model_id : "rag"));
+    if (plain_fallback) vjson_obj_set(root, "fallback", vjson_new_string("plain_llm"));
+    if (abstained) {
+        handoff_notify(ctx, "low_evidence", query, ev_value, ev_thr);
+        vjson_obj_set(root, "abstained", vjson_new_bool(1));
+        vjson_obj_set(root, "cause", vjson_new_string("low_evidence"));
+        vjson_obj_set(root, "action", vjson_new_string("handoff_to_human"));
+        VJson *ej = vjson_new_object();
+        vjson_obj_set(ej, "evidence", vjson_new_number(ev_value));
+        vjson_obj_set(ej, "threshold", vjson_new_number(ev_thr));
+        vjson_obj_set(ej, "top1_cos", vjson_new_number((double)ev_top1));
+        vjson_obj_set(ej, "coverage", vjson_new_number(ev_cover));
+        vjson_obj_set(root, "evidence", ej);
+    }
+    VJson *arr = vjson_new_array();
+    for (int i = 0; i < k; i++) {
+        VJson *it = vjson_new_object();
+        vjson_obj_set(it, "index", vjson_new_number((double)idx[i]));
+        vjson_obj_set(it, "meta", vjson_new_string(kb.meta[idx[i]]));
+        vjson_obj_set(it, "score", vjson_new_number((double)sc[i]));
+        vjson_array_push(arr, it);
+    }
+    vjson_obj_set(root, "retrieved", arr);
+    vjson_obj_set(root, "answer", vjson_new_string(abstained
+        ? "知识库中未找到足以支撑回答的依据，已拒绝作答（建议转人工处理）。"
+        : (out.s ? out.s : "")));
+    size_t cap = 4096 + (size_t)strlen(out.s ? out.s : "") * 2;
+    for (int i = 0; i < k; i++) cap += strlen(kb.meta[idx[i]]) * 2 + 64;
+    char *rbody = (char *)malloc(cap);
+    if (!rbody) {
+        sb_free(&out); free(qvec); vllm_kv_free(&kb); free(idx); free(sc);
+        vjson_free(root); json_error(resp, 500, "Out of memory"); vjson_free(body); return;
+    }
+    size_t n = vjson_serialize(root, rbody, cap);
+    vjson_free(root);
+    sb_free(&out); free(qvec); vllm_kv_free(&kb); free(idx); free(sc);
+    if (n > 0) {
+        resp->status = 200;
+        resp->content_type = "application/json";
+        resp->body = rbody;
+        resp->body_len = n;
+        resp->body_owned = rbody;
+    } else {
+        free(rbody);
+        json_error(resp, 500, "Response too large");
+    }
+    vjson_free(body);
+}
+
+/* ---------- POST /v1/ask (K-COLLAB-001 P4 统一入口，轻量规则路由) ----------
+ * 四链统一入口：按显式请求字段做**轻量规则**路由（§6 决策 2）。
+ * Body : {query, image?, kb_dir?, top_k?, max_tokens?, questions?, state?}
+ *   有 image     → scene  场景理解链（YOLO 感知 → 场景叙事 → LLM）
+ *   有 kb_dir    → rag    检索增强链（embedding → 向量库 top-k → LLM）
+ *   有 questions → decide 决策链（Laya /v1/systemone）
+ *   否则         → chat   深度推理（纯 LLM）
+ * Reply: 子链响应 + "route" 字段（自描述：本次由哪条链作答）。
+ * 说明 : 路由默认只依据显式字段，不做语义猜测（避免 silent mis-route）；子链失败
+ *        显式透传其错误码（J4）；不支持流式（本端点用于非流式编排验证）。
+ *        —— K-E2E-002：若配置了 env VLLM_ROUTE_POLICY（策略文件），则对**仅带
+ *        query** 的请求先做一次 Laya 决策，再按映射层分派（kb / local / escalate），
+ *        响应带 route_source=policy + department/confidence/churn_risk/low_conf，
+ *        使 /v1/ask 成为单入口语义路由；未配置时行为与以往完全一致。 */
+static void ask_tag_route(VHttpResponse *resp, const char *route) {
+    if (resp->status != 200 || !resp->body || resp->body[0] != '{') return;
+    size_t blen = resp->body_len ? resp->body_len : strlen(resp->body);
+    if (blen < 2) return;
+    char ins[48];
+    int il = snprintf(ins, sizeof(ins), "\"route\":\"%s\",", route);
+    char *nb = (char *)malloc(blen + (size_t)il + 1);
+    if (!nb) return;
+    memcpy(nb, resp->body, 1);                       /* '{' */
+    memcpy(nb + 1, ins, (size_t)il);
+    memcpy(nb + 1 + il, resp->body + 1, blen - 1);   /* 余下 + '\0' */
+    nb[blen + il] = '\0';
+    if (resp->body_owned) free(resp->body_owned);
+    resp->body = nb;
+    resp->body_owned = nb;
+    resp->body_len = blen + (size_t)il;
+}
+
+/* 在 JSON 响应体开头注入一段原文字段（frag 需自带结尾逗号）。 */
+static void ask_inject_raw(VHttpResponse *resp, const char *frag) {
+    if (!frag || !frag[0]) return;
+    if (resp->status != 200 || !resp->body || resp->body[0] != '{') return;
+    size_t blen = resp->body_len ? resp->body_len : strlen(resp->body);
+    size_t il = strlen(frag);
+    if (blen < 2) return;
+    char *nb = (char *)malloc(blen + il + 1);
+    if (!nb) return;
+    memcpy(nb, resp->body, 1);
+    memcpy(nb + 1, frag, il);
+    memcpy(nb + 1 + il, resp->body + 1, blen - 1);
+    nb[blen + il] = '\0';
+    if (resp->body_owned) free(resp->body_owned);
+    resp->body = nb;
+    resp->body_owned = nb;
+    resp->body_len = blen + il;
+}
+
+/* ---------- K-E2E-002：/v1/ask 语义路由（可选，默认关） ----------
+ * env VLLM_ROUTE_POLICY=<policy.json> 时，对**仅带 query** 的请求先跑一次 Laya
+ * 决策（原生三问），再按映射层把「决策 → 执行链」分派，使 /v1/ask 成为单入口的
+ * **语义**路由（不配置时行为与以往完全一致：只按显式字段路由）。
+ * policy.json = { "kb_dir":"<.vkb>", "top_k":3, "conf_min":0.5, "churn_max":0.5,
+ *                 "questions": { <与 /v1/systemone 同构的 questions 对象> } }
+ * 映射层（与离线验证一致，见 K-E2E-001）：
+ *   churn_risk >= churn_max            → escalate（转人工，不做生成）
+ *   department != "other"              → kb（policy.kb_dir 检索增强链）
+ *   其余                                → local（本地生成链）
+ * 显式降级（不静默）：confidence < conf_min 时不走 kb，改 local 并标 "low_conf":true。 */
+typedef struct {
+    int   on;
+    char  kb_dir[512];
+    int   top_k;
+    float conf_min;
+    float churn_max;
+    char *qbody;        /* "questions" 对象的原文（拼 decide 请求用） */
+} AskRoutePolicy;
+static AskRoutePolicy g_askrp;
+
+/* 定位文本中 "key" 之后的值区间（跟踪字符串/转义，{} [] 配对）。 */
+static int json_value_span(const char *t, const char *key,
+                           const char **out, size_t *outlen) {
+    const char *k = strstr(t, key);
+    if (!k) return -1;
+    const char *p = strchr(k + strlen(key), ':');
+    if (!p) return -1;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    const char *s = p;
+    if (*p == '{' || *p == '[') {
+        char open = *p;
+        char close = (open == '{') ? '}' : ']';
+        int depth = 0, instr = 0, esc = 0;
+        for (; *p; p++) {
+            char c = *p;
+            if (instr) {
+                if (esc) esc = 0;
+                else if (c == '\\') esc = 1;
+                else if (c == '"') instr = 0;
+            } else if (c == '"') instr = 1;
+            else if (c == open) depth++;
+            else if (c == close) { depth--; if (depth == 0) { p++; break; } }
+        }
+    } else {
+        while (*p && *p != ',' && *p != '}' && *p != ']' && *p != '\n') p++;
+    }
+    *out = s;
+    *outlen = (size_t)(p - s);
+    return 0;
+}
+
+static void askrp_load(void) {
+    static int tried = 0;
+    if (tried) return;
+    tried = 1;
+    const char *p = getenv("VLLM_ROUTE_POLICY");
+    if (!p || !p[0]) return;                       /* 默认关 */
+    FILE *f = fopen(p, "rb");
+    if (!f) { fprintf(stderr, "[ASK] route policy not readable: %s\n", p); fflush(stderr); return; }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > (1 << 20)) { fclose(f); fprintf(stderr, "[ASK] route policy size out of range\n"); fflush(stderr); return; }
+    char *txt = (char *)malloc((size_t)sz + 1);
+    if (!txt) { fclose(f); return; }
+    size_t rd = fread(txt, 1, (size_t)sz, f);
+    fclose(f);
+    txt[rd] = '\0';
+    VJson *root = vjson_parse(txt);
+    if (!root || root->type != VJ_OBJECT) {
+        fprintf(stderr, "[ASK] route policy: invalid JSON object\n"); fflush(stderr);
+        free(txt); vjson_free(root); return;
+    }
+    VJson *v;
+    const char *kd = vjson_str(vjson_obj_get(root, "kb_dir"));
+    if (kd && kd[0]) snprintf(g_askrp.kb_dir, sizeof(g_askrp.kb_dir), "%s", kd);
+    g_askrp.top_k = 3;
+    if ((v = vjson_obj_get(root, "top_k")) && v->type == VJ_NUMBER) g_askrp.top_k = (int)vjson_num(v);
+    g_askrp.conf_min = 0.5f;
+    if ((v = vjson_obj_get(root, "conf_min")) && v->type == VJ_NUMBER) g_askrp.conf_min = (float)vjson_num(v);
+    g_askrp.churn_max = 0.5f;
+    if ((v = vjson_obj_get(root, "churn_max")) && v->type == VJ_NUMBER) g_askrp.churn_max = (float)vjson_num(v);
+    const char *qs = NULL; size_t ql = 0;
+    if (json_value_span(txt, "\"questions\"", &qs, &ql) == 0 && ql > 2) {
+        g_askrp.qbody = (char *)malloc(ql + 1);
+        if (g_askrp.qbody) { memcpy(g_askrp.qbody, qs, ql); g_askrp.qbody[ql] = '\0'; }
+    }
+    vjson_free(root);
+    free(txt);
+    if (g_askrp.qbody && g_askrp.kb_dir[0]) {
+        g_askrp.on = 1;
+        fprintf(stderr, "[ASK] semantic route policy ON: kb_dir=%s top_k=%d conf_min=%.2f churn_max=%.2f\n",
+                g_askrp.kb_dir, g_askrp.top_k, g_askrp.conf_min, g_askrp.churn_max);
+    } else {
+        fprintf(stderr, "[ASK] route policy ignored (need both 'questions' and 'kb_dir')\n");
+    }
+    fflush(stderr);
+}
+
+/* JSON 字符串转义（仅用于把 query 拼进 decide 请求）。返回写入长度。 */
+static size_t json_escape_into(const char *s, char *out, size_t cap) {
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p && o + 8 < cap; p++) {
+        unsigned char c = *p;
+        if (c == '"' || c == '\\') { out[o++] = '\\'; out[o++] = (char)c; }
+        else if (c == '\n') { out[o++] = '\\'; out[o++] = 'n'; }
+        else if (c == '\r') { out[o++] = '\\'; out[o++] = 'r'; }
+        else if (c == '\t') { out[o++] = '\\'; out[o++] = 't'; }
+        else if (c < 0x20) { o += (size_t)snprintf(out + o, cap - o, "\\u%04x", c); }
+        else out[o++] = (char)c;
+    }
+    out[o] = '\0';
+    return o;
+}
+
+/* 语义决策：返回 0 成功（route_out 填 kb/local/escalate；extra 填决策字段片段）。 */
+static int askrp_decide(VLLMServerCtx *ctx, const char *query,
+                        char *route_out, size_t rcap,
+                        char *extra, size_t ecap) {
+    if (!g_askrp.on || !g_askrp.qbody) return -1;
+    size_t ql = strlen(query) * 6 + 32;
+    char *esc = (char *)malloc(ql);
+    if (!esc) return -1;
+    json_escape_into(query, esc, ql);
+    size_t blen = strlen(esc) + strlen(g_askrp.qbody) + 64;
+    char *body = (char *)malloc(blen);
+    if (!body) { free(esc); return -1; }
+    snprintf(body, blen, "{\"state\":\"%s\",\"questions\":%s}", esc, g_askrp.qbody);
+    free(esc);
+
+    pthread_mutex_lock(&g_laya_lock);
+    if (!g_laya_runner) {
+        g_laya_runner = laya_runner_new(ctx->laya_pack);
+        if (g_laya_runner)
+            fprintf(stderr, "[ASK] laya runner ready for semantic routing (%s)\n", ctx->laya_pack);
+    }
+    char out[8192];
+    out[0] = '\0';
+    int rc = g_laya_runner ? laya_runner_decide(g_laya_runner, body, out, sizeof(out)) : -1;
+    pthread_mutex_unlock(&g_laya_lock);
+    free(body);
+    if (rc != 0 || !out[0]) return -1;
+
+    VJson *root = vjson_parse(out);
+    if (!root) return -1;
+    VJson *ans = vjson_obj_get(root, "answers");
+    char dept[64] = "";                     /* ⚠ 必须在 vjson_free(root) 前拷出，
+                                             * choice 指向 root 内部字符串（否则 UAF） */
+    double conf = 0.0, churn = 0.0, urg = 0.0;
+    if (ans && ans->type == VJ_OBJECT) {
+        VJson *d = vjson_obj_get(ans, "department");
+        if (d && d->type == VJ_OBJECT) {
+            const char *c = vjson_str(vjson_obj_get(d, "choice"));
+            if (c) snprintf(dept, sizeof(dept), "%s", c);
+            VJson *cf = vjson_obj_get(d, "confidence");
+            if (cf && cf->type == VJ_NUMBER) conf = vjson_num(cf);
+        }
+        VJson *ch = vjson_obj_get(ans, "churn_risk");
+        if (ch && ch->type == VJ_OBJECT) {
+            VJson *n = vjson_obj_get(ch, "noul");
+            if (n && n->type == VJ_NUMBER) churn = vjson_num(n);
+        }
+        VJson *u = vjson_obj_get(ans, "urgency");
+        if (u && u->type == VJ_OBJECT) {
+            VJson *s = vjson_obj_get(u, "score");
+            if (s && s->type == VJ_NUMBER) urg = vjson_num(s);
+        }
+    }
+    vjson_free(root);
+
+    const char *route;
+    int low_conf = 0;
+    if (churn >= (double)g_askrp.churn_max) {
+        route = "escalate";
+    } else if (strcmp(dept, "other") != 0 && dept[0]) {
+        if (conf < (double)g_askrp.conf_min) { route = "local"; low_conf = 1; }
+        else route = "kb";
+    } else {
+        route = "local";
+    }
+    snprintf(route_out, rcap, "%s", route);
+    char dept_esc[128];
+    json_escape_into(dept, dept_esc, sizeof(dept_esc));   /* 防御：字段原样进响应 JSON */
+    snprintf(extra, ecap,
+             "\"route_source\":\"policy\",\"department\":\"%s\",\"confidence\":%.4f,"
+             "\"churn_risk\":%.4f,\"urgency\":%.2f,\"low_conf\":%s,",
+             dept_esc, conf, churn, urg, low_conf ? "true" : "false");
+    fprintf(stderr, "[ASK] semantic route=%s dept=%s conf=%.3f churn=%.3f low_conf=%d\n",
+            route, dept, conf, churn, low_conf);
+    fflush(stderr);
+    return 0;
+}
+
+static void handle_ask(VLLMServerCtx *ctx, const VHttpRequest *req,
+                       VHttpResponse *resp) {
+    if (!req->body || req->body_len == 0) {
+        json_error(resp, 400, "empty body"); return;
+    }
+    if (req->body[0] != '{') {
+        json_error(resp, 400, "body must be a JSON object"); return;
+    }
+    VJson *body = vjson_parse(req->body);
+    if (!body) { json_error(resp, 400, "Invalid JSON body"); return; }
+
+    const char *image  = vjson_str(vjson_obj_get(body, "image"));
+    const char *kb_dir = vjson_str(vjson_obj_get(body, "kb_dir"));
+    const char *query  = vjson_str(vjson_obj_get(body, "query"));
+    VJson *questions   = vjson_obj_get(body, "questions");
+    int has_image = image && image[0];
+    int has_kb    = kb_dir && kb_dir[0];
+    int has_q     = questions && questions->type == VJ_OBJECT;
+    char *qdup    = query ? strdup(query) : NULL;
+    int thinking  = resolve_thinking(body);
+    int max_tokens = 256;
+    VJson *jmt = vjson_obj_get(body, "max_tokens");
+    if (jmt && jmt->type == VJ_NUMBER) {
+        max_tokens = (int)jmt->u.number;
+        if (max_tokens <= 0) max_tokens = 1;
+        if (max_tokens > 4096) max_tokens = 4096;
+    }
+
+    double t0 = st_now_sec();
+    const char *route = has_image ? "scene" : (has_kb ? "rag" : (has_q ? "decide" : "chat"));
+    /* K-E2E-002：仅带 query 且配置了路由策略时，先做 Laya 语义决策再分派（默认关）。 */
+    char rp_extra[256] = "";
+    char *rp_ragbody = NULL;
+    int rp_escalate = 0;
+    if (!has_image && !has_kb && !has_q && qdup && qdup[0]) {
+        askrp_load();
+        if (g_askrp.on) {
+            char sroute[24], extra[256];
+            if (askrp_decide(ctx, qdup, sroute, sizeof(sroute), extra, sizeof(extra)) == 0) {
+                snprintf(rp_extra, sizeof(rp_extra), "%s", extra);
+                if (strcmp(sroute, "escalate") == 0) {
+                    rp_escalate = 1;
+                    route = "escalate";
+                } else if (strcmp(sroute, "kb") == 0 && !strstr(extra, "\"low_conf\":true")) {
+                    size_t ql2 = strlen(qdup) * 6 + 32;
+                    char *esc2 = (char *)malloc(ql2);
+                    if (esc2) {
+                        json_escape_into(qdup, esc2, ql2);
+                        size_t bl = strlen(esc2) + strlen(g_askrp.kb_dir) + 96;
+                        rp_ragbody = (char *)malloc(bl);
+                        if (rp_ragbody)
+                            snprintf(rp_ragbody, bl,
+                                     "{\"query\":\"%s\",\"kb_dir\":\"%s\",\"top_k\":%d,\"max_tokens\":%d}",
+                                     esc2, g_askrp.kb_dir, g_askrp.top_k, max_tokens);
+                        free(esc2);
+                        if (rp_ragbody) route = "rag";
+                    }
+                } else {
+                    route = "local";       /* 低置信 / 域外 → 本地生成（low_conf 已显式标注） */
+                }
+            } else {
+                route = "local";
+                snprintf(rp_extra, sizeof(rp_extra),
+                         "\"route_source\":\"policy\",\"decision_failed\":true,");
+            }
+        }
+    }
+    fprintf(stderr, "[ASK] route=%s\n", route);
+    fflush(stderr);
+    /* 转人工旁路通知：必须在 vjson_free(body) 之前（query 指向 body 内字符串）。 */
+    if (rp_escalate) handoff_notify(ctx, "policy_escalate", query, 0.0, 0.0);
+    vjson_free(body);
+
+    if (rp_escalate) {
+        /* 转人工：不做生成，直接产出显式响应（§映射层） */
+        VJson *root = vjson_new_object();
+        vjson_obj_set(root, "model", vjson_new_string("policy-router"));
+        vjson_obj_set(root, "route", vjson_new_string("escalate"));
+        vjson_obj_set(root, "action", vjson_new_string("handoff_to_human"));
+        vjson_obj_set(root, "answer", vjson_new_string(""));
+        size_t cap = 512 + strlen(rp_extra) * 2;
+        char *rb = (char *)malloc(cap);
+        if (!rb) { vjson_free(root); free(qdup); json_error(resp, 500, "Out of memory"); return; }
+        size_t n2 = vjson_serialize(root, rb, cap);
+        vjson_free(root);
+        free(qdup);
+        if (n2 > 0) {
+            resp->status = 200; resp->content_type = "application/json";
+            resp->body = rb; resp->body_len = n2; resp->body_owned = rb;
+            ask_inject_raw(resp, rp_extra);
+        } else { free(rb); json_error(resp, 500, "Response too large"); }
+        return;
+    }
+    if (rp_ragbody) {
+        VHttpRequest tmp;
+        memset(&tmp, 0, sizeof(tmp));
+        tmp.method = "POST";
+        tmp.path = "/v1/rag";
+        tmp.body = rp_ragbody;
+        tmp.body_len = strlen(rp_ragbody);
+        handle_rag(ctx, &tmp, resp);
+        free(rp_ragbody);
+        free(qdup);
+        ask_tag_route(resp, "rag");
+        ask_inject_raw(resp, rp_extra);
+        return;
+    }
+
+    if (has_image) {
+        handle_scene(ctx, req, resp);
+        ask_tag_route(resp, route);
+    } else if (has_kb) {
+        handle_rag(ctx, req, resp);
+        ask_tag_route(resp, route);
+    } else if (has_q) {
+        handle_systemone(ctx, req, resp);
+        ask_tag_route(resp, route);
+    } else {
+        /* chat 深度推理（纯 LLM，贪心确定性） */
+        if (!qdup || !qdup[0]) {
+            free(qdup);
+            json_error(resp, 400,
+                "'query' is required (or image / kb_dir / questions for other chains)");
+            return;
+        }
+        if (ensure_model_ready(ctx, resp) != 0) { free(qdup); return; }
+        int g = infer_gate(ctx);
+        if (g != 0) {
+            free(qdup);
+            if (g == -1) json_error(resp, 429, "Too many queued requests, retry later");
+            else if (g == -2) json_error(resp, 503, "Insufficient memory, retry later");
+            else json_error(resp, 503, "Model is unloading, retry later");
+            return;
+        }
+        char *prompt = build_completion_prompt(ctx, qdup, thinking);
+        free(qdup);
+        StrBuf out; sb_init(&out);
+        VLLMMetrics met; memset(&met, 0, sizeof(met));
+        int rc = prompt ? run_completion(ctx, prompt, NULL, NULL, 0, NULL, 0, NULL,
+                                         0.0, 1.0, 0.0, 0, 0, max_tokens,
+                                         0, NULL, 0, &out, &met, NULL, NULL, NULL, NULL)
+                        : -1;
+        free(prompt);
+        infer_done(ctx);
+        if (rc != 0) {
+            sb_free(&out);
+            json_error(resp, 500, rc == -2 ? "Prompt exceeds the context limit"
+                                           : "Inference failed");
+            return;
+        }
+        VJson *root = vjson_new_object();
+        vjson_obj_set(root, "model", vjson_new_string(ctx->model_id ? ctx->model_id : "ask"));
+        vjson_obj_set(root, "route", vjson_new_string(route));
+        vjson_obj_set(root, "answer", vjson_new_string(out.s ? out.s : ""));
+        size_t cap = 1024 + (size_t)strlen(out.s ? out.s : "") * 2;
+        char *rbody = (char *)malloc(cap);
+        if (!rbody) { sb_free(&out); vjson_free(root); json_error(resp, 500, "Out of memory"); return; }
+        size_t n = vjson_serialize(root, rbody, cap);
+        vjson_free(root); sb_free(&out);
+        if (n > 0) {
+            resp->status = 200; resp->content_type = "application/json";
+            resp->body = rbody; resp->body_len = n; resp->body_owned = rbody;
+            ask_inject_raw(resp, rp_extra);   /* 语义路由回填：route_source/low_conf 等 */
+        } else {
+            free(rbody); json_error(resp, 500, "Response too large");
+        }
+    }
+
+    if (collab_timing_on() && resp->status == 200) {
+        fprintf(stderr, "[COLLAB-T] ask route=%s total=%.1fms\n",
+                route, (st_now_sec() - t0) * 1000.0);
+        fflush(stderr);
+    }
+}
+
 /* ---------- router ---------- */
 
 /* Defined in vllm_admin.c (web management surface under /admin). */
@@ -3970,7 +5894,11 @@ static void server_handler(const VHttpRequest *req, VHttpResponse *resp,
     const int is_infer_path =
         strcmp(req->path, "/v1/chat/completions") == 0 ||
         strcmp(req->path, "/v1/completions") == 0 ||
-        strcmp(req->path, "/v1/messages") == 0;
+        strcmp(req->path, "/v1/embeddings") == 0 ||
+        strcmp(req->path, "/v1/messages") == 0 ||
+        strcmp(req->path, "/v1/rag") == 0 ||
+        strcmp(req->path, "/v1/scene") == 0 ||
+        strcmp(req->path, "/v1/ask") == 0;
     vhttp_mutex_lock(ctx->stat_lock);
     ctx->inflight_handlers++;
     int reject_unload = is_infer_path && ctx->unload_pending;
@@ -4004,6 +5932,35 @@ static void server_handler(const VHttpRequest *req, VHttpResponse *resp,
     } else if (strcmp(req->method, "POST") == 0 &&
                strcmp(req->path, "/v1/completions") == 0) {
         handle_completions(ctx, req, resp, conn);
+    } else if (strcmp(req->method, "POST") == 0 &&
+               strcmp(req->path, "/v1/embeddings") == 0) {
+        handle_embeddings(ctx, req, resp);
+    } else if (strcmp(req->method, "POST") == 0 &&
+               strcmp(req->path, "/v1/systemone") == 0) {
+        handle_systemone(ctx, req, resp);
+    } else if (strcmp(req->method, "POST") == 0 &&
+               strcmp(req->path, "/v1/detect") == 0) {
+        handle_detect(ctx, req, resp);
+    } else if (strcmp(req->method, "POST") == 0 &&
+               strcmp(req->path, "/v1/detect_video") == 0) {
+        handle_detect_video(ctx, req, resp);
+    } else if (strcmp(req->method, "POST") == 0 &&
+               strcmp(req->path, "/v1/stream/start") == 0) {
+        handle_stream_start(ctx, req, resp);
+    } else if (strcmp(req->method, "POST") == 0 &&
+               strcmp(req->path, "/v1/stream/stop") == 0) {
+        handle_stream_stop(ctx, req, resp);
+    } else if (strcmp(req->path, "/v1/stream/status") == 0) {
+        handle_stream_status(ctx, req, resp);
+    } else if (strcmp(req->method, "POST") == 0 &&
+               strcmp(req->path, "/v1/rag") == 0) {
+        handle_rag(ctx, req, resp);
+    } else if (strcmp(req->method, "POST") == 0 &&
+               strcmp(req->path, "/v1/scene") == 0) {
+        handle_scene(ctx, req, resp);
+    } else if (strcmp(req->method, "POST") == 0 &&
+               strcmp(req->path, "/v1/ask") == 0) {
+        handle_ask(ctx, req, resp);
     } else if (strncmp(req->path, "/admin", 6) == 0) {
         vllm_admin_route(ctx, req, resp);
     } else if (strcmp(req->path, "/review") == 0 ||
@@ -4317,6 +6274,7 @@ int vllm_server_run(VLLMServerCtx *ctx, int port, int n_threads,
         fprintf(stderr, "[SRV] mutex init failed\n");
         return 1;
     }
+    pthread_mutex_init(&ctx->embed_lock, NULL);   /* K-COLLAB-001 P2：专用 embedding 槽位锁 */
     ctx->total_requests = 0;
     ctx->active_requests = 0;
     ctx->queued_requests = 0;
@@ -4341,6 +6299,8 @@ int vllm_server_run(VLLMServerCtx *ctx, int port, int n_threads,
         ctx->idle_thr_started = 0;
     }
     vllm_server_reset_session(ctx);
+    vllm_embed_free(ctx);                    /* K-COLLAB-001 P2：释放专用 embedding 槽位 */
+    pthread_mutex_destroy(&ctx->embed_lock);
     vhttp_mutex_free(ctx->inf_lock);
     vhttp_mutex_free(ctx->stat_lock);
     return rc;
