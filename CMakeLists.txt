@@ -127,14 +127,13 @@ add_executable(vllm_kestrel ${VLLM_SOURCES} ${VLLM_HEADERS})
 # Headers are included by flat names ("vllm_xxx.h") from every module, so
 # expose each functional include/ subdirectory on the search path.
 target_include_directories(vllm_kestrel PRIVATE
-    include
     include/common
     include/core
     include/serve
-    include/media
     include/model
     include/npu
     include/npu/rk3588
+    include
 )
 
 # Link math library (for expf, sqrtf)
