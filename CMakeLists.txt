@@ -76,6 +76,13 @@ set(VLLM_SOURCES
     src/model/vllm_tokenizer_qwen.c
     src/model/vllm_vision.c
     src/model/vllm_media.c
+    src/core/vllm_kvstore.c
+    src/media/h264_dec.c
+    src/media/vllm_mp4.c
+    src/media/vllm_rtsp.c
+    src/media/vllm_vsrc.c
+    src/model/vllm_laya.c
+    src/model/vllm_yolo.c
     src/npu/vllm_npu.c
     src/npu/rk3588/vllm_npu_direct.c
 )
@@ -120,9 +127,11 @@ add_executable(vllm_kestrel ${VLLM_SOURCES} ${VLLM_HEADERS})
 # Headers are included by flat names ("vllm_xxx.h") from every module, so
 # expose each functional include/ subdirectory on the search path.
 target_include_directories(vllm_kestrel PRIVATE
+    include
     include/common
     include/core
     include/serve
+    include/media
     include/model
     include/npu
     include/npu/rk3588
