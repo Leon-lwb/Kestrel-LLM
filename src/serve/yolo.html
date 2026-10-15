@@ -79,6 +79,35 @@ th{color:var(--tx2);font-weight:600;font-size:11px}
   </div>
 
   <div class="card wide">
+    <h2>三种推理模式 · 使用说明</h2>
+    <table>
+      <tr><th>模式</th><th>怎么选 / 怎么开</th><th>单图耗时（实测，yolov8n，cats）</th><th>特点 / 边界</th></tr>
+      <tr>
+        <td><b>官方 RKNN（性能路径）</b></td>
+        <td>后端下拉选 <code>rknn</code>；模型路径给 <code>.rknn</code>（如 <code>/root/_vfy/rknn_new/yolov8.rknn</code>）；填 <code>librknnrt.so</code>（--rknn-lib）。保存后重启生效。</td>
+        <td><code>rknn_run</code> ~16–32&nbsp;ms；端到端 ~0.04–0.08&nbsp;s</td>
+        <td><b>最快</b>。依赖官方 <code>.rknn</code>（需预转）+ <code>librknnrt</code>（dlopen 非侵入，不改系统库）。</td>
+      </tr>
+      <tr>
+        <td><b>自研 CPU（int8 dotprod）</b></td>
+        <td>后端下拉选 <code>vqf</code>，且引擎启动 <b>不带 --npu</b>。保存重启。</td>
+        <td>~144&nbsp;ms</td>
+        <td><b>零依赖、可离线</b>。板端实测通常比自研 NPU 直驱更快（无提交/回读开销）。</td>
+      </tr>
+      <tr>
+        <td><b>自研 NPU（VQF v4 DIRECT）</b></td>
+        <td>后端下拉选 <code>vqf</code>，且引擎启动 <b>带 --npu</b>。保存重启。</td>
+        <td>~230–240&nbsp;ms</td>
+        <td>零依赖；im2col→DIRECT 直驱，CPU 侧打包/提交开销较大（本板实测比自研 CPU 慢）。</td>
+      </tr>
+    </table>
+    <div class="small">
+      切换说明：本页「传图试检测」只用所选后端<b>临时测一张（不改常驻）</b>；要让某模式作为<b>常驻默认</b>，请在「配置」卡保存（后端 vqf/rknn 落库），并按上表用引擎启动参数 <code>--npu</code> 与否决定「自研」走 CPU 还是 NPU，再重启引擎生效。
+      <b>建议</b>：要性能 → 走 <b>rknn</b>；要零依赖 → 走 <b>vqf + 纯 CPU</b>（~144&nbsp;ms）。
+    </div>
+  </div>
+
+  <div class="card wide">
     <h2>传图试检测（POST /admin/api/yolo/test，临时加载不入驻）</h2>
     <div class="row" style="margin-top:0">
       <input type="file" id="imgFile" accept="image/*" style="max-width:320px">

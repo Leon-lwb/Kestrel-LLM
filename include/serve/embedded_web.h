@@ -19,7 +19,7 @@ const char *embedded_kb_html(size_t *len);
 /* embedded laya.html (6092 bytes) */
 const char *embedded_laya_html(size_t *len);
 
-/* embedded yolo.html (17797 bytes) */
+/* embedded yolo.html (20044 bytes) */
 const char *embedded_yolo_html(size_t *len);
 
 /* embedded cloud.html (7772 bytes) */
