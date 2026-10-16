@@ -63,12 +63,16 @@ Three real models (`--stream-test`, cold page cache, weight-only figures):
 
 | Model (single-file VQF) | Full: resident / peak | **Per-layer: resident / peak** | Resident-memory ratio |
 |---|---|---|---|
-| 2B Qwen3-VL (4.16 GB) | 1.81 GB / 2.76 GB | **0.39 GB / 0.63 GB** | **4.6×** |
+| 2B Qwen3-VL (4.16 GB*) | 1.81 GB / 2.76 GB | **0.39 GB / 0.63 GB** | **4.6×** |
 | 8B Qwen3-VL (6.60 GB) | 4.18 GB / 4.22 GB | **0.47 GB / 0.59 GB** | **8.9×** |
-| 30B-A3B MoE (17.66 GB) | 11.73 GB / 12.70 GB | **0.51 GB / 0.71 GB** | **23.2×** |
+| 30B-A3B MoE (17.67 GB) | 11.73 GB / 12.70 GB | **0.51 GB / 0.71 GB** | **23.2×** |
+
+> **Two different "resident" figures -- do not mix them**: the `0.51 GB` above is **weight residency** under `--stream-test` with a cold page cache; the **process RSS = 0.44 GB** is what a live 30B per-layer `serve` run reports (see the demo video, captured by `_video/rec/big.py`). Different sampling targets and instants; always cite the measurement point.
+>
+> **Note**: That row was measured on the **retired** `Qwen3-VL-2B-Instruct` dual weights (4.16 GB). The 2B in service now is q4 = **2.33 GB** (`/mnt/VQF/2b/model.vqf`, what the board actually runs), plus a q8fix variant at 3.19 GB; different quantization basis, so it must not be mixed with that row's figures.
 
 **The canonical example**: an RK3588 board has only 16 GB RAM (MemTotal 15.6 GiB), while the
-Qwen3-30B-A3B-q4 weight file alone is 17.66 GB — the full-residency tier does barely run, but
+Qwen3-30B-A3B-q4 weight file alone is 17.67 GB — the full-residency tier does barely run, but
 its serve peak reaches 14.2 GB, leaving almost no headroom for KV or the process itself.
 **Per-layer residency brings the same model down to a 1.11 GB serve peak, with ample headroom
 and stable serving.** The 2B case is even more direct: resident weights of just 0.39 GB, 4.6×
@@ -130,7 +134,7 @@ Numbers in this chapter come from two sources, and each subsection heading state
 
 | Model | Progress vs the previous release | Memory |
 |---|---|---|
-| **30B-A3B (MoE, q4, 17.66 GB)** | **decode 1.74-3.72x faster; prefill 1.21x (cold, better I/O overlap) to 5.44x (warm)** | unchanged (+0.1-1.0%) |
+| **30B-A3B (MoE, q4, 17.67 GB)** | **decode 1.74-3.72x faster; prefill 1.21x (cold, better I/O overlap) to 5.44x (warm)** | unchanged (+0.1-1.0%) |
 | **8B (dense, q4, 6.60 GB)** | **no change** -- 24 points agree point by point, max deviation 1.0% | unchanged |
 | **8B vs llama.cpp (long context, section 7)** | **prefill: 1.32x slower at 2K -> 1.15x slower at 4K -> 1.11x faster at 8K -> 1.60x faster at 16K; decode: full 1.07x faster at 2K -> 3.63x faster at 16K; multi-turn reuse turns: this release 1.33-3.4x faster across the board (lead grows with context)** | peak at 16K 6.71-10.15 GB vs llama.cpp 10.77 GB (at 2K: 1.46-4.90 GB vs 8.71 GB) |
 
@@ -138,9 +142,9 @@ Numbers in this chapter come from two sources, and each subsection heading state
 
 ### 1) Per-layer vs full residency (`--stream-test`, **controlled A/B**)
 
-`VLLM_VQF_STREAM=1` puts the engine into **tiered (per-layer) residency** mode: the VQF single file stays mmap-mounted, but each layer's weights establish file pages only while that layer computes and release them immediately with `MADV_DONTNEED`, keeping only the `keep` layers (1 by default) resident. Together with KV v2 lazy allocation, **resident memory is decoupled from model size and layer count**: a 17.66 GB Qwen3-30B-A3B-q4 can be served on a 16 GB board.
+`VLLM_VQF_STREAM=1` puts the engine into **tiered (per-layer) residency** mode: the VQF single file stays mmap-mounted, but each layer's weights establish file pages only while that layer computes and release them immediately with `MADV_DONTNEED`, keeping only the `keep` layers (1 by default) resident. Together with KV v2 lazy allocation, **resident memory is decoupled from model size and layer count**: a 17.67 GB Qwen3-30B-A3B-q4 can be served on a 16 GB board.
 
-**30B-A3B (MoE, q4, 17.66 GB; `/mnt/VQF/qwen3-30B-A3B-q4/model.vqf`, on the SanDisk microSD card)**
+**30B-A3B (MoE, q4, 17.67 GB; `/mnt/VQF/qwen3-30B-A3B-q4/model.vqf`, on the SanDisk microSD card)**
 
 | Residency | Threads / cache | Old prefill | New prefill | Ratio | Old decode | New decode | Ratio |
 |---|---|---|---|---|---|---|---|
@@ -151,9 +155,9 @@ Numbers in this chapter come from two sources, and each subsection heading state
 
 Peak VmHWM: full 12,705,354 -> **12,722,536 kB (+0.14%)**; per-layer 708,162 -> **715,054 kB (+0.97%)**. Memory is **unchanged** between the two builds; per-layer saves **17.8x** versus full (12,722,536 / 715,054).
 
-> **The 1.21-1.22x on cold prefill is an indirect gain**: that basis is dominated by reading 17.66 GB from the SD card, with an effective read rate of 68.0 MB/s (old) versus 82.6 MB/s (new). The file is identical and the only variable is the CPU -- the old build's slow unpacking stalled the read pipeline, while the new build overlaps computation with I/O far better. **Do not read this as "the kernel accelerated the disk read".**
+> **The 1.21-1.22x on cold prefill is an indirect gain**: that basis is dominated by reading 17.67 GB from the SD card, with an effective read rate of 68.0 MB/s (old) versus 82.6 MB/s (new). The file is identical and the only variable is the CPU -- the old build's slow unpacking stalled the read pipeline, while the new build overlaps computation with I/O far better. **Do not read this as "the kernel accelerated the disk read".**
 
-> **The 30B decode ratio depends on page-cache state -- read it as a range**: the model is 17.66 GB against 15.9 GB of RAM. The new build's decode was measured between **324 and 1,204 ms/tok**: about 324 ms/tok when the active experts are cached (full residency, the table above) and about **570-580 ms/tok** for per-layer residency (three interleaved runs: 571 / 576 / 581), but 1.6-2.5 s spikes once they are evicted (the same binary and the same config differed by 3.7x across two rounds; per-token detail 321 / 321 / 2511 / 1069 / ...). The old build's 1,205 ms/tok is, by contrast, **uniform** (compute-bound, with I/O fully hidden). So the 3.72x for decode is a **best-case-cache** figure; worst case it is roughly a wash.
+> **The 30B decode ratio depends on page-cache state -- read it as a range**: the model is 17.67 GB against 15.9 GB of RAM. The new build's decode was measured between **324 and 1,204 ms/tok**: about 324 ms/tok when the active experts are cached (full residency, the table above) and about **570-580 ms/tok** for per-layer residency (three interleaved runs: 571 / 576 / 581), but 1.6-2.5 s spikes once they are evicted (the same binary and the same config differed by 3.7x across two rounds; per-token detail 321 / 321 / 2511 / 1069 / ...). The old build's 1,205 ms/tok is, by contrast, **uniform** (compute-bound, with I/O fully hidden). So the 3.72x for decode is a **best-case-cache** figure; worst case it is roughly a wash.
 
 > **Caliber alignment (with the project docs)**: both sides of the table above run the **exact track** (no `VLLM_ACTQ`), which is what preserves bit-exactness. The 5.44x prefill here is the "exact-track GroupGEMM 6.55x" of the project document (Distributed Expert Extraction plan, section 9.12), and the 2.81x decode is its "down row-group parallelism 2.88x". **The separate "3-3.4 s / about 200 ms" figures in that document are the approximate track (`VLLM_ACTQ=1`, int8 SDOT activations, greedy divergence from about token 24 on long text) and must not be mixed with this table.** Reference magnitudes (board 30B, per-layer, t4, warm, 32-token prefill): exact track per-token about 37-60 s; exact track with batching about 7-9 s (the new build's 6.7 s is this tier); `ACTQ=1` with batching about 2.7-3.4 s. In other words this release takes the **exact** track from about 37 s to about 7 s (5.3x), making bit-exact inference genuinely usable; but it is still **2.3x** away from the approximate track (about 3.0 s) and has not caught up. **Note also that under the recommended configuration (`VLLM_ACTQ=1` plus batching, i.e. combo 5) the two builds are essentially level -- across 2 interleaved rounds: prefill old 3.022/3.027 s vs new 3.078/2.994 s (1.00x), decode old 442/446 ms vs new 430/433 ms (1.03x). The value of this release is that the exact track is 5.3x faster, not that the recommended configuration is faster.**
 
@@ -216,7 +220,7 @@ One request = 292-token context + 32 generated tokens (greedy, `--threads 8`). C
 | 30B-A3B | full | 14,208,808 kB | 272,175 ms | 76,673 ms | 76,674 ms | 554.3 ms |
 | 30B-A3B | **per-layer** | **1,116,948 kB** | 274,256 ms | 78,275 ms | 78,276 ms | 875.6 ms |
 
-> **The "warm" 30B row is only partially cached**: the model is 17.66 GB against 15.9 GB of board RAM, so it can never fill the page cache, and the figures depend on what ran before it. Measured within a single session, the 30B per-layer baseline showed t1/t2/t3 = 60.6 / 68.1 / 77.9 s, i.e. **monotonically slower** -- exactly this effect. Treat the 30B serve figures as **orders of magnitude only, not a precise baseline**. 8B fits in RAM and has no such problem.
+> **The "warm" 30B row is only partially cached**: the model is 17.67 GB against 15.9 GB of board RAM, so it can never fill the page cache, and the figures depend on what ran before it. Measured within a single session, the 30B per-layer baseline showed t1/t2/t3 = 60.6 / 68.1 / 77.9 s, i.e. **monotonically slower** -- exactly this effect. Treat the 30B serve figures as **orders of magnitude only, not a precise baseline**. 8B fits in RAM and has no such problem.
 
 ---
 
@@ -301,7 +305,7 @@ Config: per-layer `VLLM_VQF_STREAM=1` + combo 1 + combo 5, `OMP_NUM_THREADS=4 VL
 | thinking **on** (default) | 2.417 s | 134.45 s | **256 (budget exhausted)** | text still starts with `<think>`, **no answer** |
 | **thinking off** (`"enable_thinking": false`) | **2.437 s** | **20.82 s** | **40 (natural EOS)** | **complete answer** |
 
-**Conclusion: on this 16 GB board the usable 30B-A3B tier is thinking off + short context.** With thinking off a complete short answer arrives in 20.8 s at a 0.92 GB peak; with the default (thinking on) 256 tokens do not finish the reasoning block, so a single exchange must budget 300+ tokens. The 202 s cold figure is the one-off cost of reading all 17.66 GB of weights from the SD card.
+**Conclusion: on this 16 GB board the usable 30B-A3B tier is thinking off + short context.** With thinking off a complete short answer arrives in 20.8 s at a 0.92 GB peak; with the default (thinking on) 256 tokens do not finish the reasoning block, so a single exchange must budget 300+ tokens. The 202 s cold figure is the one-off cost of reading all 17.67 GB of weights from the SD card.
 
 ---
 
@@ -401,7 +405,7 @@ The time in "trade time for memory" scales with weight size divided by storage b
 
 - **8B is unchanged in this release, and that is expected**: 8B is a **dense** model, so every decode token reads all 6.15 GiB of weights and it is **bandwidth-bound**; this release optimizes **unpacking compute**, which does not help 8B. 30B-A3B is **MoE** and activates only the top-8 experts per token (about 1.6 GB), making it **compute-bound**, hence the large gain.
   > Caveat: 6.6 GB / 0.185 s implies 35.7 GB/s, above the 25.74 GB/s recorded earlier, so the "8B is bandwidth-bound" explanation **still needs a direct bandwidth measurement for confirmation**; treat it as the current best explanation.
-- **The 30B "warm" numbers are not a precise baseline**: the model is 17.66 GB against 15.9 GB of RAM, so it cannot fill the page cache and the figures depend on cache history (evidence in the note under section 2). Use the section 2 / 3 30B figures as orders of magnitude only.
+- **The 30B "warm" numbers are not a precise baseline**: the model is 17.67 GB against 15.9 GB of RAM, so it cannot fill the page cache and the figures depend on cache history (evidence in the note under section 2). Use the section 2 / 3 30B figures as orders of magnitude only.
 - **Per-layer residency is plaintext-only**: VQF-Enc / SM2-signed weights are explicitly rejected (they must stay fully resident).
 - It does not coexist with expert windows (`VLLM_EW*`; EW owns the layer entry hook).
 - Per-layer residency compresses **weight residency**; the KV base is constrained separately by KV v2 lazy allocation (with `VLLM_KV_NOF32=1` resident memory can be pushed lower -- see [docs/KV缓存v2-惰性分配与分层驻留方案.md](docs/KV缓存v2-惰性分配与分层驻留方案.md)).
@@ -785,7 +789,7 @@ third-party project runtime is ever shipped with the engine.
 
 - **Per-layer residency made deliverable** (`VLLM_VQF_STREAM=1` tiered residency + KV v2 lazy
   allocation) — measured resident weight RSS is **4.6× / 8.9× / 23.2×** smaller
-  (2B / 8B / 30B-A3B), letting a 17.66 GB 30B-A3B serve on a 16 GB board; TOKIDS stay
+  (2B / 8B / 30B-A3B), letting a 17.67 GB 30B-A3B serve on a 16 GB board; TOKIDS stay
   **bit-identical** to the full tier (semantics unchanged). Definitions and the full comparison
   are under "Performance".
 - **P3: L3 eviction × prefix reuse coexisting** (`--l3-evict` + `VLLM_L3_PREFIX_REUSE=1`) —

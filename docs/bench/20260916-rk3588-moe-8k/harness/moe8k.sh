@@ -1,7 +1,7 @@
 #!/bin/sh
 # moe8k.sh — 等 16K 收工后，跑 30B-A3B MoE + 组合⑤，验证能否吃下 8K 上下文
 #   组合⑤ = VLLM_ACTQ=1 VLLM_MOE_BATCH=1（专家激活量化 + 专家批量，仅对 q4 MoE 权重）
-#   30B-A3B 权重 17.66 GB > 15.9 GB RAM ⇒ 必须 VLLM_VQF_STREAM=1（逐层）
+#   30B-A3B 权重 17.67 GB > 15.9 GB RAM ⇒ 必须 VLLM_VQF_STREAM=1（逐层）
 #   用法（板端）：setsid nohup sh /mnt/emmc/kv2h2/moe8k.sh >/dev/null 2>&1 &
 set -u
 
