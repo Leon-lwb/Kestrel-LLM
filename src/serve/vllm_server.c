@@ -4346,6 +4346,40 @@ static void handle_systemone(VLLMServerCtx *ctx, const VHttpRequest *req,
 static StYoloModel *g_yolo = NULL;
 static pthread_mutex_t g_yolo_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* K-ADMIN-002：协作组件运行态只读查询（供 /admin/api/status 的 collab 字段）。
+ * 持锁读句柄后立即释放——无内存分配、不触发懒加载，不进入推理热路径。 */
+void vllm_collab_embed_state(const VLLMServerCtx *ctx,
+                             int *configured, int *loaded, int *failed) {
+    int c = (ctx && ctx->embed_model_dir && ctx->embed_model_dir[0]) ? 1 : 0;
+    int l = 0, f = 0;
+    if (ctx) {
+        pthread_mutex_t *lk = (pthread_mutex_t *)&ctx->embed_lock;
+        pthread_mutex_lock(lk);
+        l = (ctx->embed_loaded == 1);
+        f = (ctx->embed_loaded == -1);
+        pthread_mutex_unlock(lk);
+    }
+    if (configured) *configured = c;
+    if (loaded) *loaded = l;
+    if (failed) *failed = f;
+}
+
+int vllm_collab_laya_loaded(void) {
+    int r;
+    pthread_mutex_lock(&g_laya_lock);
+    r = (g_laya_runner != NULL);
+    pthread_mutex_unlock(&g_laya_lock);
+    return r;
+}
+
+int vllm_collab_yolo_loaded(void) {
+    int r;
+    pthread_mutex_lock(&g_yolo_lock);
+    r = (g_yolo != NULL);
+    pthread_mutex_unlock(&g_yolo_lock);
+    return r;
+}
+
 /* K-YOLO-003：按 --yolo-backend 选择加载器（0=VQF v4 默认，1=官方 .rknn opt-in）。
  * 返回值 NULL = 未启用/加载失败（各 handler 自行显式报错，绝不静默降级）。 */
 static StYoloModel *yolo_open_model(VLLMServerCtx *ctx) {

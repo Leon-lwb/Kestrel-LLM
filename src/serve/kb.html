@@ -5,60 +5,160 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>向量模型知识库配置 · vLLM-Kestrel</title>
 <style>
-:root{--bg:#0f1419;--panel:#1a212b;--panel2:#202a36;--bd:#2c3a4a;--tx:#d7e0ea;--tx2:#8ea0b4;--acc:#4da3ff;--ok:#3ecf8e;--bad:#ff6b6b;--warn:#ffb020}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 "SF Mono",Consolas,"Microsoft YaHei",monospace}
-header{display:flex;align-items:center;gap:14px;padding:12px 20px;background:var(--panel);border-bottom:1px solid var(--bd)}
-header h1{font-size:16px;margin:0;font-weight:600}
-.navlink{color:var(--tx2);font-size:12px;text-decoration:none;border:1px solid var(--bd);border-radius:6px;padding:3px 10px}
-.navlink:hover{color:var(--acc);border-color:var(--acc)}
-main{display:grid;grid-template-columns:1fr 1fr;gap:14px;padding:14px 20px;max-width:1400px;margin:0 auto}
+/* ============ 设计令牌（暗色控制台统一规范）============ */
+:root{
+  --bg:#0f1419;--panel:#1a212b;--panel2:#202a36;--panel3:#283442;--bd:#2c3a4a;--bd-hi:#3e5468;
+  --tx:#d7e0ea;--tx2:#8ea0b4;--tx3:#63758a;--acc:#4da3ff;--ok:#3ecf8e;--bad:#ff6b6b;--warn:#ffb020;
+  --acc-soft:rgba(77,163,255,.13);
+  --focus:0 0 0 3px rgba(77,163,255,.22);
+  --tr:.16s ease;
+  --m-check:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 6 9 17l-5-5'/%3E%3C/svg%3E");
+  --m-alert:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3'/%3E%3Cpath d='M12 9v4'/%3E%3Cpath d='M12 17h.01'/%3E%3C/svg%3E");
+  /* Lucide 图标（内联 data-URI mask，离线可用，不受 JS textContent 重写影响） */
+  --i-db:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cellipse cx='12' cy='5' rx='9' ry='3'/%3E%3Cpath d='M3 5V19A9 3 0 0 0 21 19V5'/%3E%3Cpath d='M3 12A9 3 0 0 0 21 12'/%3E%3C/svg%3E");
+  --i-back:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m12 19-7-7 7-7'/%3E%3Cpath d='M19 12H5'/%3E%3C/svg%3E");
+  --i-save:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z'/%3E%3Cpath d='M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7'/%3E%3Cpath d='M7 3v4a1 1 0 0 0 1 1h7'/%3E%3C/svg%3E");
+  --i-refresh:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8'/%3E%3Cpath d='M21 3v5h-5'/%3E%3Cpath d='M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16'/%3E%3Cpath d='M8 16H3v5'/%3E%3C/svg%3E");
+  --i-search:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='11' cy='11' r='8'/%3E%3Cpath d='m21 21-4.3-4.3'/%3E%3C/svg%3E");
+  --i-trash:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 6h18'/%3E%3Cpath d='M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6'/%3E%3Cpath d='M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2'/%3E%3Cpath d='M10 11v6'/%3E%3Cpath d='M14 11v6'/%3E%3C/svg%3E");
+  --i-plus:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M5 12h14'/%3E%3Cpath d='M12 5v14'/%3E%3C/svg%3E");
+  --i-list:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 6h13'/%3E%3Cpath d='M8 12h13'/%3E%3Cpath d='M8 18h13'/%3E%3Cpath d='M3 6h.01'/%3E%3Cpath d='M3 12h.01'/%3E%3Cpath d='M3 18h.01'/%3E%3C/svg%3E");
+  --i-book:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z'/%3E%3Cpath d='M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z'/%3E%3C/svg%3E");
+  --i-shield:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z'/%3E%3C/svg%3E");
+}
+*{box-sizing:border-box;scrollbar-width:thin;scrollbar-color:#2c3a4a transparent}
+::selection{background:rgba(77,163,255,.32)}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:#2c3a4a;border-radius:6px;border:2px solid var(--bg)}
+::-webkit-scrollbar-thumb:hover{background:#3e5468}
+::-webkit-scrollbar-track{background:transparent}
+body{margin:0;color:var(--tx);
+  background:
+    radial-gradient(1100px 480px at 85% -10%,rgba(77,163,255,.06),transparent 60%),
+    radial-gradient(900px 420px at -10% 110%,rgba(62,207,142,.04),transparent 60%),
+    var(--bg);
+  font:14px/1.6 ui-monospace,"SF Mono","Cascadia Code",Consolas,"Microsoft YaHei",monospace;
+  -webkit-font-smoothing:antialiased}
+/* ============ 顶栏 ============ */
+header{position:sticky;top:0;z-index:40;display:flex;align-items:center;gap:14px;padding:13px 24px;
+  background:rgba(26,33,43,.88);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  border-bottom:1px solid var(--bd)}
+.brand{display:inline-flex;align-items:center;gap:11px;min-width:0}
+.brand .mark{flex:none;width:32px;height:32px;border-radius:9px;display:grid;place-items:center;color:#e8f3ff;
+  background:linear-gradient(135deg,#2e7fe0,#1b4d8f);border:1px solid rgba(77,163,255,.5);
+  box-shadow:0 2px 12px rgba(46,127,224,.35)}
+.brand .mark::before{content:"";width:17px;height:17px;background-color:currentColor;
+  -webkit-mask:var(--i-db) center/contain no-repeat;mask:var(--i-db) center/contain no-repeat}
+.brand h1{font-size:16px;margin:0;font-weight:700;letter-spacing:.2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.brand .sub{display:block;font-size:10.5px;color:var(--tx2);letter-spacing:.6px;margin-top:1px}
+.navlink{display:inline-flex;align-items:center;gap:6px;color:var(--tx2);font-size:12px;text-decoration:none;
+  border:1px solid var(--bd);border-radius:8px;padding:5px 12px;transition:color var(--tr),border-color var(--tr),background var(--tr)}
+.navlink:hover{color:var(--acc);border-color:var(--acc);background:var(--acc-soft)}
+/* ============ 图标（Lucide mask）============ */
+[class^="ic-"]::before,[class*=" ic-"]::before{
+  content:"";display:inline-block;width:14px;height:14px;flex:none;
+  background-color:currentColor;
+  -webkit-mask:var(--icon) center/contain no-repeat;mask:var(--icon) center/contain no-repeat}
+.ic-db{--icon:var(--i-db)}
+.ic-back{--icon:var(--i-back)}
+.ic-save{--icon:var(--i-save)}
+.ic-refresh{--icon:var(--i-refresh)}
+.ic-search{--icon:var(--i-search)}
+.ic-trash{--icon:var(--i-trash)}
+.ic-plus{--icon:var(--i-plus)}
+.ic-list{--icon:var(--i-list)}
+.ic-book{--icon:var(--i-book)}
+.ic-shield{--icon:var(--i-shield)}
+/* ============ 布局与卡片 ============ */
+main{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:20px 24px 32px;max-width:1400px;margin:0 auto}
 @media(max-width:980px){main{grid-template-columns:1fr}}
-.card{background:var(--panel);border:1px solid var(--bd);border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:6px}
+.card{background:linear-gradient(180deg,rgba(255,255,255,.015),rgba(255,255,255,0) 46px),var(--panel);
+  border:1px solid var(--bd);border-radius:13px;padding:16px 18px;display:flex;flex-direction:column;gap:8px;
+  box-shadow:0 12px 32px -26px rgba(0,0,0,.95);min-width:0;transition:border-color var(--tr)}
+.card:hover{border-color:#35485e}
 .card.wide{grid-column:1/-1}
-.card h2{font-size:13px;margin:0 0 4px;color:var(--tx2);font-weight:600;text-transform:uppercase;letter-spacing:.5px}
-label.fld{display:block;margin:6px 0}
-label.fld .t{display:flex;justify-content:space-between;font-size:12px;color:var(--tx2);margin-bottom:3px}
-input[type=text],input[type=number],select,textarea{width:100%;background:var(--panel2);border:1px solid var(--bd);color:var(--tx);border-radius:6px;padding:6px 8px;font-size:13px;font-family:inherit}
-textarea{min-height:96px;resize:vertical}
-button{background:var(--panel2);color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:7px 14px;font-size:13px;cursor:pointer;font-family:inherit}
-button:hover{border-color:var(--acc);color:var(--acc)}
-button.primary{background:var(--acc);border-color:var(--acc);color:#08131f}
-button.primary:hover{filter:brightness(1.1);color:#08131f}
+.card h2{display:flex;align-items:center;gap:9px;font-size:12.5px;margin:0 0 10px;padding-bottom:10px;
+  border-bottom:1px solid rgba(44,58,74,.6);color:#c3d1e1;font-weight:700;text-transform:uppercase;letter-spacing:.8px;flex-wrap:wrap}
+/* ============ 表单 ============ */
+label.fld{display:block;margin:10px 0}
+label.fld .t{display:flex;justify-content:space-between;align-items:baseline;gap:10px;font-size:11.5px;color:var(--tx2);margin-bottom:5px;letter-spacing:.2px}
+input[type=text],input[type=number],select,textarea{width:100%;background:#141b24;border:1px solid var(--bd);color:var(--tx);border-radius:8px;
+  padding:8px 11px;font-size:13px;font-family:inherit;transition:border-color var(--tr),box-shadow var(--tr)}
+input[type=text]:hover,input[type=number]:hover,select:hover,textarea:hover{border-color:var(--bd-hi)}
+input[type=text]:focus,input[type=number]:focus,select:focus,textarea:focus{outline:none;border-color:var(--acc);box-shadow:var(--focus)}
+::placeholder{color:#5d7086}
+textarea{min-height:96px;resize:vertical;line-height:1.6}
+/* ============ 按钮 ============ */
+button{display:inline-flex;align-items:center;justify-content:center;gap:8px;background:var(--panel2);color:var(--tx);
+  border:1px solid var(--bd);border-radius:8px;padding:8px 16px;font-size:13px;cursor:pointer;font-family:inherit;
+  white-space:nowrap;transition:color var(--tr),border-color var(--tr),background-color var(--tr),box-shadow var(--tr),transform var(--tr)}
+button:hover{border-color:var(--bd-hi);background:var(--panel3);color:#cfe4ff}
+button:active{transform:translateY(1px)}
+button:focus-visible{outline:none;box-shadow:var(--focus)}
+button.primary{background:linear-gradient(180deg,#57a7ff,#3d8bee);border-color:#3d8bee;color:#07131f;font-weight:600}
+button.primary:hover{filter:brightness(1.09);color:#07131f;border-color:#5aa0f5}
 button.danger{background:#3a1f24;border-color:#6b3535;color:#ff9b9b}
-button.danger:hover{border-color:var(--bad);color:var(--bad)}
-.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px}
-.msg{padding:8px 10px;border-radius:6px;margin-top:8px;font-size:12px;display:none}
-.msg.show{display:block}
-.msg.ok{background:#14301f;color:var(--ok);border:1px solid #1f4a30}
+button.danger:hover{border-color:var(--bad);color:#ffc2c2;background:#47242b}
+/* ============ 行 / 消息 / 表格 ============ */
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:12px;padding-top:12px;border-top:1px dashed rgba(44,58,74,.55)}
+.msg{display:none;align-items:flex-start;gap:9px;padding:9px 13px;border-radius:8px;margin-top:10px;font-size:12px;line-height:1.55}
+.msg.show{display:flex}
+.msg.ok{background:#142c21;color:var(--ok);border:1px solid #1f4a30}
 .msg.err{background:#33191c;color:var(--bad);border:1px solid #5c2c30}
-table{width:100%;border-collapse:collapse;font-size:12px;margin-top:6px}
-th,td{border-bottom:1px solid var(--bd);padding:5px 6px;text-align:left;vertical-align:top}
-th{color:var(--tx2);font-weight:600;font-size:11px}
+.msg.show::before{content:"";flex:none;width:14px;height:14px;margin-top:2px;background-color:currentColor;
+  -webkit-mask:var(--m-alert) center/contain no-repeat;mask:var(--m-alert) center/contain no-repeat}
+.msg.ok.show::before{-webkit-mask-image:var(--m-check);mask-image:var(--m-check)}
+table{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px}
+th,td{border-bottom:1px solid rgba(44,58,74,.55);padding:7px 8px;text-align:left;vertical-align:top}
+th{color:var(--tx2);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.4px}
+tbody tr:hover td{background:rgba(44,58,74,.28)}
 td.act{white-space:nowrap}
-.small{font-size:11px;color:var(--tx2)}
-code{color:var(--acc);word-break:break-all}
-.res{margin-top:6px;font-size:12px}
-.res .it{background:var(--panel2);border:1px solid var(--bd);border-radius:6px;padding:6px 8px;margin:6px 0}
-.res .sc{color:var(--ok)}
+.small{font-size:11.5px;color:var(--tx2);line-height:1.65}
+code{color:var(--acc);word-break:break-all;background:rgba(77,163,255,.08);padding:1px 5px;border-radius:4px;font-size:11.5px}
+.res{margin-top:8px;font-size:12px}
+.res .it{background:var(--panel2);border:1px solid var(--bd);border-radius:8px;padding:8px 11px;margin:8px 0;line-height:1.6}
+.res .sc{color:var(--ok);letter-spacing:.3px}
+/* K-ADMIN-002：组件运行态状态条 */
+.cstat{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:12.5px}
+.cstat .dot{width:9px;height:9px;border-radius:50%;flex:none;background:#63758a;box-shadow:0 0 0 3px rgba(99,117,138,.18)}
+.cstat.on .dot{background:var(--ok);box-shadow:0 0 0 3px rgba(62,207,142,.18)}
+.cstat.half .dot{background:var(--warn);box-shadow:0 0 0 3px rgba(255,176,32,.18)}
+.cstat.err .dot{background:var(--bad);box-shadow:0 0 0 3px rgba(255,107,107,.18)}
+.cstat .txt{color:var(--tx2)}
+.cstat.warnbox{display:block;background:#33290f;border:1px solid #5c4a1f;color:var(--warn);border-radius:8px;padding:8px 12px;font-size:12px;line-height:1.5}
 </style>
 </head>
 <body>
 <header>
-  <h1>向量模型知识库配置</h1>
+  <div class="brand">
+    <span class="mark"></span>
+    <div><h1>向量模型知识库配置</h1><span class="sub">vLLM-KESTREL · EDGE CONSOLE</span></div>
+  </div>
   <span style="flex:1"></span>
-  <a class="navlink" href="/admin/">← 返回管理页 /admin/</a>
+  <a class="navlink ic-back" href="/admin/">返回管理页 /admin/</a>
 </header>
 <main>
+  <div class="card wide">
+    <h2>模型运行状态<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--tx2)">（运行时只读 · 需重启生效）</span></h2>
+    <div class="cstat" id="cstat"><span class="dot"></span><span class="txt" id="cstatTxt">读取中…</span></div>
+    <div class="cstat warnbox" id="cstatWarn" style="display:none"></div>
+    <div class="row">
+      <button class="primary" id="cbtn" onclick="collabToggle()">…</button>
+      <span class="small">启用/停用只改配置，需重启引擎生效（停用后该端点显式 404）</span>
+    </div>
+    <div class="msg" id="cstatMsg"></div>
+  </div>
   <!-- 配置 -->
   <div class="card wide">
-    <h2>配置（保存后重启引擎生效）</h2>
-    <label class="fld"><span class="t"><span>向量模型目录（--embed-model；留空 = 复用主模型）</span></span>
-      <input type="text" id="f_embed_model" placeholder="/root/emb_model"></label>
-    <label class="fld"><span class="t"><span>知识库根目录（--kb-root，管理页浏览 .vkb 的默认目录）</span></span>
-      <input type="text" id="f_kb_root" placeholder="/mnt/VQF/kb"></label>
+    <h2 class="ic-db">配置<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--tx2)">（保存后重启引擎生效）</span></h2>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:0 16px">
+      <label class="fld"><span class="t"><span>向量模型目录（--embed-model；留空 = 复用主模型）</span></span>
+        <input type="text" id="f_embed_model" placeholder="/root/emb_model"></label>
+      <label class="fld"><span class="t"><span>知识库根目录（--kb-root，管理页浏览 .vkb 的默认目录）</span></span>
+        <input type="text" id="f_kb_root" placeholder="/mnt/VQF/kb"></label>
+    </div>
     <div class="row">
-      <button class="primary" onclick="saveCfg()">保存配置（重启生效）</button>
+      <button class="primary ic-save" onclick="saveCfg()">保存配置（重启生效）</button>
       <span class="small" id="cfgPath"></span>
     </div>
     <div class="msg" id="cfgMsg"></div>
@@ -66,22 +166,24 @@ code{color:var(--acc);word-break:break-all}
 
   <!-- 拒答与转人工（K-E2E-004） -->
   <div class="card wide">
-    <h2>拒答与转人工</h2>
-    <label class="fld"><span class="t"><span>拒答阈值 --kb-abstain（0 = 关闭；证据分低于阈值时 /v1/rag 拒绝作答）</span></span>
-      <input type="number" id="f_kb_abstain" step="0.01" min="0" max="1" placeholder="0.35"></label>
+    <h2 class="ic-shield">拒答与转人工</h2>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:0 16px">
+      <label class="fld"><span class="t"><span>拒答阈值 --kb-abstain（0 = 关闭；证据分低于阈值时 /v1/rag 拒绝作答）</span></span>
+        <input type="number" id="f_kb_abstain" step="0.01" min="0" max="1" placeholder="0.35"></label>
+      <label class="fld"><span class="t"><span>转人工回调地址 --handoff-url（留空 = 不回调）</span></span>
+        <input type="text" id="f_handoff_url" placeholder="http://工单系统:8000/handoff"></label>
+    </div>
     <div class="small">
       证据分 = 0.5×top1 余弦 + 0.5×词面覆盖率。板端 18 正 / 10 负样本标定：<br>
       0.30 → 正样本 18/18 可答、负样本 9/10 拒答（零误拒，但放行 1 条无据）；<br>
       0.35 → 正样本 17/18、负样本 <b>10/10</b>（默认建议，以漏答代价 &gt; 误拒代价为准）；<br>
       0.40 及以上 → 误拒 ≥3，不达标。<b>换语料库需重标阈值。</b>
     </div>
-    <label class="fld"><span class="t"><span>转人工回调地址 --handoff-url（留空 = 不回调）</span></span>
-      <input type="text" id="f_handoff_url" placeholder="http://工单系统:8000/handoff"></label>
     <div class="small">拒答（cause=low_evidence）与路由 escalate（cause=policy_escalate）时，向该地址 POST
       <code>{"cause","query","evidence","threshold","model","route":"handoff_to_human"}</code>；仅明文 http://，
       通知失败只记日志、不影响主响应。</div>
     <div class="row">
-      <button class="primary" onclick="saveAbstain()">保存（重启生效）</button>
+      <button class="primary ic-save" onclick="saveAbstain()">保存（重启生效）</button>
       <span class="small" id="abMsg2"></span>
     </div>
     <div class="msg" id="abMsg"></div>
@@ -89,25 +191,25 @@ code{color:var(--acc);word-break:break-all}
 
   <!-- 知识库列表 -->
   <div class="card">
-    <h2>知识库列表（.vkb）</h2>
+    <h2 class="ic-list">知识库列表（.vkb）</h2>
     <label class="fld"><span class="t"><span>目录</span></span>
       <input type="text" id="kbDir" placeholder="留空 = 用 kb_root"></label>
-    <div class="row"><button onclick="listKb()">刷新列表</button></div>
+    <div class="row"><button class="ic-refresh" onclick="listKb()">刷新列表</button></div>
     <div id="kbList"></div>
     <div class="msg" id="kbListMsg"></div>
   </div>
 
   <!-- 文档管理 -->
   <div class="card">
-    <h2>文档管理</h2>
+    <h2 class="ic-book">文档管理</h2>
     <label class="fld"><span class="t"><span>目标库路径（.vkb；不存在则新建）</span></span>
       <input type="text" id="kbPath" placeholder="/mnt/VQF/kb/knowledge.vkb"></label>
     <label class="fld"><span class="t"><span>新增文档（每行一条）</span></span>
       <textarea id="kbDocs" placeholder="文档一&#10;文档二"></textarea></label>
     <div class="row">
-      <button class="primary" onclick="addDocs()">向量化并入</button>
-      <button onclick="loadDocs()">查看文档</button>
-      <button class="danger" onclick="dropKb()">删除整库</button>
+      <button class="primary ic-plus" onclick="addDocs()">向量化并入</button>
+      <button class="ic-list" onclick="loadDocs()">查看文档</button>
+      <button class="danger ic-trash" onclick="dropKb()">删除整库</button>
     </div>
     <div id="docList"></div>
     <div class="msg" id="docMsg"></div>
@@ -115,8 +217,8 @@ code{color:var(--acc);word-break:break-all}
 
   <!-- 检索试查 -->
   <div class="card wide">
-    <h2>检索试查</h2>
-    <div class="row" style="margin-top:0">
+    <h2 class="ic-search">检索试查</h2>
+    <div class="row" style="margin-top:4px">
       <label class="fld" style="flex:1;min-width:240px;margin:0"><span class="t"><span>库路径</span></span>
         <input type="text" id="qPath" placeholder="/mnt/VQF/kb/knowledge.vkb"></label>
       <label class="fld" style="flex:2;min-width:240px;margin:0"><span class="t"><span>查询文本</span></span>
@@ -124,7 +226,7 @@ code{color:var(--acc);word-break:break-all}
       <label class="fld" style="width:100px;margin:0"><span class="t"><span>top_k</span></span>
         <input type="number" id="qTopK" value="3" min="1" max="16"></label>
     </div>
-    <div class="row"><button class="primary" onclick="searchKb()">检索</button></div>
+    <div class="row"><button class="primary ic-search" onclick="searchKb()">检索</button></div>
     <div class="res" id="qRes"></div>
     <div class="msg" id="qMsg"></div>
   </div>
@@ -286,6 +388,49 @@ async function searchKb(){
 }
 
 loadCfg();
+
+/* ---------- K-ADMIN-002：组件运行态 + 加载/卸载（启用/停用） ---------- */
+const COLLAB_KEY = "embed_model";    /* 配置键 */
+const COLLAB_NAME = "embed";  /* collab 字段名 */
+async function collabRefresh(){
+  try{
+    const r = await fetch("/admin/api/status"); const j = await r.json();
+    const c = (j.collab || {})[COLLAB_NAME];
+    const box = $("cstat"), txt = $("cstatTxt"), warn = $("cstatWarn"), btn = $("cbtn");
+    if (!c){ box.className = "cstat"; txt.textContent = "该引擎未上报组件状态（需支持 collab 字段的版本）"; return; }
+    if (c.failed){ box.className = "cstat err"; txt.textContent = "状态：已配置，但加载失败"; }
+    else if (c.loaded){ box.className = "cstat on"; txt.textContent = "状态：已加载（运行态就绪）"; }
+    else if (c.enabled){ box.className = "cstat half"; txt.textContent = "状态：已启用 · 未加载（首次请求时懒加载）"; }
+    else { box.className = "cstat"; txt.textContent = "状态：未启用"; }
+    if (COLLAB_NAME === "embed" && c.mode === "fallback_main"){
+      warn.style.display = ""; warn.className = "cstat warnbox";
+      warn.textContent = "未配置专用向量模型：RAG 将复用主模型出向量，检索质量下降（这是回退，不是停用）。";
+    } else { warn.style.display = "none"; }
+    btn.textContent = c.enabled ? (COLLAB_NAME === "embed" ? "切回复用主模型" : "卸载（停用）") : "加载（启用）";
+  }catch(e){ $("cstatTxt").textContent = "状态读取失败: " + e; }
+}
+async function collabToggle(){
+  let c = {};
+  try{ const r = await fetch("/admin/api/status"); const j = await r.json(); c = (j.collab || {})[COLLAB_NAME] || {}; }catch(e){}
+  if (!c.enabled){
+    showMsg($("cstatMsg"), "启用：请在下方「配置」卡片填写路径并保存，然后重启引擎生效。", true);
+    return;
+  }
+  const isEmb = (COLLAB_NAME === "embed");
+  const q = isEmb
+    ? "切换回\u300c复用主模型\u300d？\n注意：这不是停用——RAG 将改用主模型出向量，检索质量会下降。\n保存后需重启引擎生效。"
+    : "卸载（停用）该组件？\n该端点将返回 404（显式报错，不静默降级）。\n保存后需重启引擎生效。";
+  if (!confirm(q)) return;
+  const body = {}; body[COLLAB_KEY] = "";
+  try{
+    const r = await fetch("/admin/api/config/patch", {method:"POST",
+      headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+    const j = await r.json();
+    showMsg($("cstatMsg"), j.error ? ("失败: " + j.error) : ("已保存到 " + j.path + "（重启引擎生效）"), !j.error);
+    loadCfg(); collabRefresh();
+  }catch(e){ showMsg($("cstatMsg"), "请求失败: " + e, false); }
+}
+collabRefresh();
 </script>
 </body>
 </html>

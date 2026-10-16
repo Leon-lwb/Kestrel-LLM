@@ -5,47 +5,144 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>YOLO 检测配置 · vLLM-Kestrel</title>
 <style>
-:root{--bg:#0f1419;--panel:#1a212b;--panel2:#202a36;--bd:#2c3a4a;--tx:#d7e0ea;--tx2:#8ea0b4;--acc:#4da3ff;--ok:#3ecf8e;--bad:#ff6b6b;--warn:#ffb020}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 "SF Mono",Consolas,"Microsoft YaHei",monospace}
-header{display:flex;align-items:center;gap:14px;padding:12px 20px;background:var(--panel);border-bottom:1px solid var(--bd)}
-header h1{font-size:16px;margin:0;font-weight:600}
-.navlink{color:var(--tx2);font-size:12px;text-decoration:none;border:1px solid var(--bd);border-radius:6px;padding:3px 10px}
-.navlink:hover{color:var(--acc);border-color:var(--acc)}
-main{display:grid;grid-template-columns:1fr 1fr;gap:14px;padding:14px 20px;max-width:1400px;margin:0 auto}
+/* ============ 设计令牌（暗色控制台统一规范）============ */
+:root{
+  --bg:#0f1419;--panel:#1a212b;--panel2:#202a36;--panel3:#283442;--bd:#2c3a4a;--bd-hi:#3e5468;
+  --tx:#d7e0ea;--tx2:#8ea0b4;--tx3:#63758a;--acc:#4da3ff;--ok:#3ecf8e;--bad:#ff6b6b;--warn:#ffb020;
+  --acc-soft:rgba(77,163,255,.13);
+  --focus:0 0 0 3px rgba(77,163,255,.22);
+  --tr:.16s ease;
+  --m-check:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 6 9 17l-5-5'/%3E%3C/svg%3E");
+  --m-alert:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3'/%3E%3Cpath d='M12 9v4'/%3E%3Cpath d='M12 17h.01'/%3E%3C/svg%3E");
+  /* Lucide 图标（内联 data-URI mask，离线可用，不受 JS textContent 重写影响） */
+  --i-scan:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 7V5a2 2 0 0 1 2-2h2'/%3E%3Cpath d='M17 3h2a2 2 0 0 1 2 2v2'/%3E%3Cpath d='M21 17v2a2 2 0 0 1-2 2h-2'/%3E%3Cpath d='M7 21H5a2 2 0 0 1-2-2v-2'/%3E%3Cpath d='M7 12h10'/%3E%3C/svg%3E");
+  --i-back:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m12 19-7-7 7-7'/%3E%3Cpath d='M19 12H5'/%3E%3C/svg%3E");
+  --i-save:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z'/%3E%3Cpath d='M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7'/%3E%3Cpath d='M7 3v4a1 1 0 0 0 1 1h7'/%3E%3C/svg%3E");
+  --i-play:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 3 14 9-14 9V3z'/%3E%3C/svg%3E");
+  --i-film:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect width='18' height='18' x='3' y='3' rx='2'/%3E%3Cpath d='M7 3v18'/%3E%3Cpath d='M3 7.5h4'/%3E%3Cpath d='M3 12h18'/%3E%3Cpath d='M3 16.5h4'/%3E%3Cpath d='M17 3v18'/%3E%3Cpath d='M17 7.5h4'/%3E%3Cpath d='M17 16.5h4'/%3E%3C/svg%3E");
+  --i-power:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 2v10'/%3E%3Cpath d='M18.4 6.6a9 9 0 1 1-12.77.04'/%3E%3C/svg%3E");
+  --i-activity:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M22 12h-4l-3 9L9 3l-3 9H2'/%3E%3C/svg%3E");
+  --i-list:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 6h13'/%3E%3Cpath d='M8 12h13'/%3E%3Cpath d='M8 18h13'/%3E%3Cpath d='M3 6h.01'/%3E%3Cpath d='M3 12h.01'/%3E%3Cpath d='M3 18h.01'/%3E%3C/svg%3E");
+  --i-upload:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4'/%3E%3Cpath d='m17 8-5-5-5 5'/%3E%3Cpath d='M12 3v12'/%3E%3C/svg%3E");
+}
+*{box-sizing:border-box;scrollbar-width:thin;scrollbar-color:#2c3a4a transparent}
+::selection{background:rgba(77,163,255,.32)}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:#2c3a4a;border-radius:6px;border:2px solid var(--bg)}
+::-webkit-scrollbar-thumb:hover{background:#3e5468}
+::-webkit-scrollbar-track{background:transparent}
+body{margin:0;color:var(--tx);
+  background:
+    radial-gradient(1100px 480px at 85% -10%,rgba(77,163,255,.06),transparent 60%),
+    radial-gradient(900px 420px at -10% 110%,rgba(62,207,142,.04),transparent 60%),
+    var(--bg);
+  font:14px/1.6 ui-monospace,"SF Mono","Cascadia Code",Consolas,"Microsoft YaHei",monospace;
+  -webkit-font-smoothing:antialiased}
+/* ============ 顶栏 ============ */
+header{position:sticky;top:0;z-index:40;display:flex;align-items:center;gap:14px;padding:13px 24px;
+  background:rgba(26,33,43,.88);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  border-bottom:1px solid var(--bd)}
+.brand{display:inline-flex;align-items:center;gap:11px;min-width:0}
+.brand .mark{flex:none;width:32px;height:32px;border-radius:9px;display:grid;place-items:center;color:#e8f3ff;
+  background:linear-gradient(135deg,#2e7fe0,#1b4d8f);border:1px solid rgba(77,163,255,.5);
+  box-shadow:0 2px 12px rgba(46,127,224,.35)}
+.brand .mark::before{content:"";width:17px;height:17px;background-color:currentColor;
+  -webkit-mask:var(--i-scan) center/contain no-repeat;mask:var(--i-scan) center/contain no-repeat}
+.brand h1{font-size:16px;margin:0;font-weight:700;letter-spacing:.2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.brand .sub{display:block;font-size:10.5px;color:var(--tx2);letter-spacing:.6px;margin-top:1px}
+.navlink{display:inline-flex;align-items:center;gap:6px;color:var(--tx2);font-size:12px;text-decoration:none;
+  border:1px solid var(--bd);border-radius:8px;padding:5px 12px;transition:color var(--tr),border-color var(--tr),background var(--tr)}
+.navlink:hover{color:var(--acc);border-color:var(--acc);background:var(--acc-soft)}
+/* ============ 图标（Lucide mask）============ */
+[class^="ic-"]::before,[class*=" ic-"]::before{
+  content:"";display:inline-block;width:14px;height:14px;flex:none;
+  background-color:currentColor;
+  -webkit-mask:var(--icon) center/contain no-repeat;mask:var(--icon) center/contain no-repeat}
+.ic-scan{--icon:var(--i-scan)}
+.ic-back{--icon:var(--i-back)}
+.ic-save{--icon:var(--i-save)}
+.ic-play{--icon:var(--i-play)}
+.ic-film{--icon:var(--i-film)}
+.ic-power{--icon:var(--i-power)}
+.ic-activity{--icon:var(--i-activity)}
+.ic-list{--icon:var(--i-list)}
+.ic-upload{--icon:var(--i-upload)}
+/* ============ 布局与卡片 ============ */
+main{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:20px 24px 32px;max-width:1400px;margin:0 auto}
 @media(max-width:980px){main{grid-template-columns:1fr}}
-.card{background:var(--panel);border:1px solid var(--bd);border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:6px}
+.card{background:linear-gradient(180deg,rgba(255,255,255,.015),rgba(255,255,255,0) 46px),var(--panel);
+  border:1px solid var(--bd);border-radius:13px;padding:16px 18px;display:flex;flex-direction:column;gap:8px;
+  box-shadow:0 12px 32px -26px rgba(0,0,0,.95);min-width:0;transition:border-color var(--tr)}
+.card:hover{border-color:#35485e}
 .card.wide{grid-column:1/-1}
-.card h2{font-size:13px;margin:0 0 4px;color:var(--tx2);font-weight:600;text-transform:uppercase;letter-spacing:.5px}
-label.fld{display:block;margin:6px 0}
-label.fld .t{display:flex;justify-content:space-between;font-size:12px;color:var(--tx2);margin-bottom:3px}
-input[type=text],input[type=number],input[type=file],select{width:100%;background:var(--panel2);border:1px solid var(--bd);color:var(--tx);border-radius:6px;padding:6px 8px;font-size:13px;font-family:inherit}
-button{background:var(--panel2);color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:7px 14px;font-size:13px;cursor:pointer;font-family:inherit}
-button:hover{border-color:var(--acc);color:var(--acc)}
-button.primary{background:var(--acc);border-color:var(--acc);color:#08131f}
-button.primary:hover{filter:brightness(1.1);color:#08131f}
-.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px}
-.grid4{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}
-.msg{padding:8px 10px;border-radius:6px;margin-top:8px;font-size:12px;display:none}
-.msg.show{display:block}
-.msg.ok{background:#14301f;color:var(--ok);border:1px solid #1f4a30}
+.card h2{display:flex;align-items:center;gap:9px;font-size:12.5px;margin:0 0 10px;padding-bottom:10px;
+  border-bottom:1px solid rgba(44,58,74,.6);color:#c3d1e1;font-weight:700;text-transform:uppercase;letter-spacing:.8px;flex-wrap:wrap}
+/* ============ 表单 ============ */
+label.fld{display:block;margin:10px 0}
+label.fld .t{display:flex;justify-content:space-between;align-items:baseline;gap:10px;font-size:11.5px;color:var(--tx2);margin-bottom:5px;letter-spacing:.2px}
+input[type=text],input[type=number],input[type=file],select{width:100%;background:#141b24;border:1px solid var(--bd);color:var(--tx);border-radius:8px;
+  padding:8px 11px;font-size:13px;font-family:inherit;transition:border-color var(--tr),box-shadow var(--tr)}
+input[type=text]:hover,input[type=number]:hover,input[type=file]:hover,select:hover{border-color:var(--bd-hi)}
+input[type=text]:focus,input[type=number]:focus,input[type=file]:focus,select:focus{outline:none;border-color:var(--acc);box-shadow:var(--focus)}
+::placeholder{color:#5d7086}
+/* ============ 按钮 ============ */
+button{display:inline-flex;align-items:center;justify-content:center;gap:8px;background:var(--panel2);color:var(--tx);
+  border:1px solid var(--bd);border-radius:8px;padding:8px 16px;font-size:13px;cursor:pointer;font-family:inherit;
+  white-space:nowrap;transition:color var(--tr),border-color var(--tr),background-color var(--tr),box-shadow var(--tr),transform var(--tr)}
+button:hover{border-color:var(--bd-hi);background:var(--panel3);color:#cfe4ff}
+button:active{transform:translateY(1px)}
+button:focus-visible{outline:none;box-shadow:var(--focus)}
+button.primary{background:linear-gradient(180deg,#57a7ff,#3d8bee);border-color:#3d8bee;color:#07131f;font-weight:600}
+button.primary:hover{filter:brightness(1.09);color:#07131f;border-color:#5aa0f5}
+/* ============ 行 / 消息 / 表格 / 画布 ============ */
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:12px;padding-top:12px;border-top:1px dashed rgba(44,58,74,.55)}
+.grid4{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px}
+.msg{display:none;align-items:flex-start;gap:9px;padding:9px 13px;border-radius:8px;margin-top:10px;font-size:12px;line-height:1.55}
+.msg.show{display:flex}
+.msg.ok{background:#142c21;color:var(--ok);border:1px solid #1f4a30}
 .msg.err{background:#33191c;color:var(--bad);border:1px solid #5c2c30}
-canvas{max-width:100%;border:1px solid var(--bd);border-radius:8px;background:#0a0e13}
-table{width:100%;border-collapse:collapse;font-size:12px;margin-top:6px}
-th,td{border-bottom:1px solid var(--bd);padding:5px 6px;text-align:left}
-th{color:var(--tx2);font-weight:600;font-size:11px}
-.small{font-size:11px;color:var(--tx2)}
+.msg.show::before{content:"";flex:none;width:14px;height:14px;margin-top:2px;background-color:currentColor;
+  -webkit-mask:var(--m-alert) center/contain no-repeat;mask:var(--m-alert) center/contain no-repeat}
+.msg.ok.show::before{-webkit-mask-image:var(--m-check);mask-image:var(--m-check)}
+canvas{max-width:100%;border:1px solid var(--bd);border-radius:10px;background:#0a0e13}
+table{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px}
+th,td{border-bottom:1px solid rgba(44,58,74,.55);padding:7px 8px;text-align:left}
+th{color:var(--tx2);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.4px}
+tbody tr:hover td{background:rgba(44,58,74,.28)}
+.small{font-size:11.5px;color:var(--tx2);line-height:1.65}
+code{color:var(--acc);word-break:break-all;background:rgba(77,163,255,.08);padding:1px 5px;border-radius:4px;font-size:11.5px}
+/* K-ADMIN-002：组件运行态状态条 */
+.cstat{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:12.5px}
+.cstat .dot{width:9px;height:9px;border-radius:50%;flex:none;background:#63758a;box-shadow:0 0 0 3px rgba(99,117,138,.18)}
+.cstat.on .dot{background:var(--ok);box-shadow:0 0 0 3px rgba(62,207,142,.18)}
+.cstat.half .dot{background:var(--warn);box-shadow:0 0 0 3px rgba(255,176,32,.18)}
+.cstat.err .dot{background:var(--bad);box-shadow:0 0 0 3px rgba(255,107,107,.18)}
+.cstat .txt{color:var(--tx2)}
+.cstat.warnbox{display:block;background:#33290f;border:1px solid #5c4a1f;color:var(--warn);border-radius:8px;padding:8px 12px;font-size:12px;line-height:1.5}
 </style>
 </head>
 <body>
 <header>
-  <h1>YOLO 检测配置</h1>
+  <div class="brand">
+    <span class="mark"></span>
+    <div><h1>YOLO 检测配置</h1><span class="sub">vLLM-KESTREL · EDGE CONSOLE</span></div>
+  </div>
   <span style="flex:1"></span>
-  <a class="navlink" href="/admin/">← 返回管理页 /admin/</a>
+  <a class="navlink ic-back" href="/admin/">返回管理页 /admin/</a>
 </header>
 <main>
   <div class="card wide">
-    <h2>配置（保存后重启引擎生效）</h2>
+    <h2>模型运行状态<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--tx2)">（运行时只读 · 需重启生效）</span></h2>
+    <div class="cstat" id="cstat"><span class="dot"></span><span class="txt" id="cstatTxt">读取中…</span></div>
+    <div class="cstat warnbox" id="cstatWarn" style="display:none"></div>
+    <div class="row">
+      <button class="primary" id="cbtn" onclick="collabToggle()">…</button>
+      <span class="small">启用/停用只改配置，需重启引擎生效（停用后该端点显式 404）</span>
+    </div>
+    <div class="msg" id="cstatMsg"></div>
+  </div>
+  <div class="card wide">
+    <h2 class="ic-scan">配置<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--tx2)">（保存后重启引擎生效）</span></h2>
     <label class="fld"><span class="t"><span>检测模型路径（--yolo-model；VQF v4 或官方 .rknn）</span></span>
       <input type="text" id="f_yolo_model" placeholder="/mnt/VQF/yolo/yolov8n.vqf"></label>
     <div class="grid4">
@@ -62,7 +159,7 @@ th{color:var(--tx2);font-weight:600;font-size:11px}
     </div>
     <label class="fld"><span class="t"><span>默认视频源（--yolo-video-src；本地 .mp4 文件 / 图像序列目录 / http:// MJPEG·快照 / rtsp:// 摄像头）</span></span>
       <input type="text" id="f_yolo_video_src" placeholder="rtsp://192.168.1.64:554/Streaming/Channels/101"></label>
-    <div class="grid4">
+    <div class="grid4" style="max-width:420px">
       <label class="fld"><span class="t"><span>单次抽帧数（--yolo-video-frames，默认 8）</span></span>
         <input type="number" id="f_yolo_video_frames" min="1" max="300" placeholder="8"></label>
       <label class="fld"><span class="t"><span>常驻拉流间隔 ms（--yolo-video-interval-ms，默认 500）</span></span>
@@ -72,14 +169,14 @@ th{color:var(--tx2);font-weight:600;font-size:11px}
       实际抽帧率 ≈ 关键帧率；跳过的非 IDR 在 <code>summary.skipped_non_idr</code> 回报，<b>IDR 但引擎解不出</b>的帧在 <code>summary.decoded_failed</code> 单列回报。
       MJPEG 流与图像序列目录不受此限。</div>
     <div class="row">
-      <button class="primary" onclick="saveCfg()">保存配置（重启生效）</button>
+      <button class="primary ic-save" onclick="saveCfg()">保存配置（重启生效）</button>
       <span class="small" id="cfgPath"></span>
     </div>
     <div class="msg" id="cfgMsg"></div>
   </div>
 
   <div class="card wide">
-    <h2>三种推理模式 · 使用说明</h2>
+    <h2 class="ic-list">三种推理模式 · 使用说明</h2>
     <table>
       <tr><th>模式</th><th>怎么选 / 怎么开</th><th>单图耗时（实测，yolov8n，cats）</th><th>特点 / 边界</th></tr>
       <tr>
@@ -108,13 +205,13 @@ th{color:var(--tx2);font-weight:600;font-size:11px}
   </div>
 
   <div class="card wide">
-    <h2>传图试检测（POST /admin/api/yolo/test，临时加载不入驻）</h2>
-    <div class="row" style="margin-top:0">
+    <h2 class="ic-upload">传图试检测<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--tx2)">（POST /admin/api/yolo/test，临时加载不入驻）</span></h2>
+    <div class="row" style="margin-top:4px">
       <input type="file" id="imgFile" accept="image/*" style="max-width:320px">
-      <button class="primary" onclick="runTest()">开始检测</button>
+      <button class="primary ic-play" onclick="runTest()">开始检测</button>
       <span class="small">未填的项沿用当前配置；试检测走纯 CPU / 临时 RKNN，不改服务状态。</span>
     </div>
-    <div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:8px">
+    <div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:10px">
       <canvas id="cv" width="1" height="1"></canvas>
       <div style="flex:1;min-width:260px">
         <div class="small" id="meta">（尚未检测）</div>
@@ -125,10 +222,10 @@ th{color:var(--tx2);font-weight:600;font-size:11px}
   </div>
 
   <div class="card wide">
-    <h2>视频源试检测（POST /v1/detect_video · 常驻 POST /v1/stream/start|stop · GET /v1/stream/status）</h2>
+    <h2 class="ic-film">视频源试检测<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--tx2)">（POST /v1/detect_video · 常驻 POST /v1/stream/start|stop · GET /v1/stream/status）</span></h2>
     <label class="fld"><span class="t"><span>视频源（留空 = 用配置的默认视频源）</span></span>
       <input type="text" id="vSrc" placeholder="/mnt/VQF/video/demo.mp4 | /mnt/VQF/frames | http://ip/video | rtsp://ip:554/…"></label>
-    <div class="grid4">
+    <div class="grid4" style="max-width:760px">
       <label class="fld"><span class="t"><span>抽帧数（max_frames）</span></span>
         <input type="number" id="vFrames" min="1" max="300" value="8"></label>
       <label class="fld"><span class="t"><span>帧间隔 ms（interval_ms）</span></span>
@@ -139,10 +236,10 @@ th{color:var(--tx2);font-weight:600;font-size:11px}
         <input type="number" id="vStreamInterval" min="0" value="500"></label>
     </div>
     <div class="row">
-      <button class="primary" onclick="runVidTest()">单次抽帧检测</button>
-      <button onclick="streamStart()">启动常驻拉流</button>
-      <button onclick="streamStop()">停止拉流</button>
-      <button onclick="streamStatus()">查状态</button>
+      <button class="primary ic-play" onclick="runVidTest()">单次抽帧检测</button>
+      <button class="ic-power" onclick="streamStart()">启动常驻拉流</button>
+      <button class="ic-power" onclick="streamStop()">停止拉流</button>
+      <button class="ic-activity" onclick="streamStatus()">查状态</button>
       <span class="small">RTSP/MJPEG 的「单次抽帧」会在 timeout 内累积到 max_frames 帧为止。</span>
     </div>
     <div class="small" id="vMeta">（尚未检测）</div>
@@ -358,6 +455,49 @@ function aggFromLast(dets){
   }
   return Object.values(m);
 }
+
+/* ---------- K-ADMIN-002：组件运行态 + 加载/卸载（启用/停用） ---------- */
+const COLLAB_KEY = "yolo_model";    /* 配置键 */
+const COLLAB_NAME = "yolo";  /* collab 字段名 */
+async function collabRefresh(){
+  try{
+    const r = await fetch("/admin/api/status"); const j = await r.json();
+    const c = (j.collab || {})[COLLAB_NAME];
+    const box = $("cstat"), txt = $("cstatTxt"), warn = $("cstatWarn"), btn = $("cbtn");
+    if (!c){ box.className = "cstat"; txt.textContent = "该引擎未上报组件状态（需支持 collab 字段的版本）"; return; }
+    if (c.failed){ box.className = "cstat err"; txt.textContent = "状态：已配置，但加载失败"; }
+    else if (c.loaded){ box.className = "cstat on"; txt.textContent = "状态：已加载（运行态就绪）"; }
+    else if (c.enabled){ box.className = "cstat half"; txt.textContent = "状态：已启用 · 未加载（首次请求时懒加载）"; }
+    else { box.className = "cstat"; txt.textContent = "状态：未启用"; }
+    if (COLLAB_NAME === "embed" && c.mode === "fallback_main"){
+      warn.style.display = ""; warn.className = "cstat warnbox";
+      warn.textContent = "未配置专用向量模型：RAG 将复用主模型出向量，检索质量下降（这是回退，不是停用）。";
+    } else { warn.style.display = "none"; }
+    btn.textContent = c.enabled ? (COLLAB_NAME === "embed" ? "切回复用主模型" : "卸载（停用）") : "加载（启用）";
+  }catch(e){ $("cstatTxt").textContent = "状态读取失败: " + e; }
+}
+async function collabToggle(){
+  let c = {};
+  try{ const r = await fetch("/admin/api/status"); const j = await r.json(); c = (j.collab || {})[COLLAB_NAME] || {}; }catch(e){}
+  if (!c.enabled){
+    showMsg($("cstatMsg"), "启用：请在下方「配置」卡片填写路径并保存，然后重启引擎生效。", true);
+    return;
+  }
+  const isEmb = (COLLAB_NAME === "embed");
+  const q = isEmb
+    ? "切换回\u300c复用主模型\u300d？\n注意：这不是停用——RAG 将改用主模型出向量，检索质量会下降。\n保存后需重启引擎生效。"
+    : "卸载（停用）该组件？\n该端点将返回 404（显式报错，不静默降级）。\n保存后需重启引擎生效。";
+  if (!confirm(q)) return;
+  const body = {}; body[COLLAB_KEY] = "";
+  try{
+    const r = await fetch("/admin/api/config/patch", {method:"POST",
+      headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+    const j = await r.json();
+    showMsg($("cstatMsg"), j.error ? ("失败: " + j.error) : ("已保存到 " + j.path + "（重启引擎生效）"), !j.error);
+    loadCfg(); collabRefresh();
+  }catch(e){ showMsg($("cstatMsg"), "请求失败: " + e, false); }
+}
+collabRefresh();
 </script>
 </body>
 </html>

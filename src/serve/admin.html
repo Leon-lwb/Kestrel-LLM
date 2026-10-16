@@ -6,44 +6,130 @@
 <title data-en="vLLM-Kestrel Edge-Cloud Coordination Platform · Admin">vLLM-Kestrel 边缘云协调平台 · 管理</title>
 <style>
 :root{
-  --bg:#0f1419; --panel:#1a212b; --panel2:#202a36; --bd:#2c3a4a;
+  --bg:#0e131a; --panel:#161d27; --panel2:#1d2734; --bd:#2a3648;
   --tx:#d7e0ea; --tx2:#8ea0b4; --acc:#4da3ff; --ok:#3ecf8e; --bad:#ff6b6b; --warn:#ffb020;
+  --panel3:#243042; --bd-hi:#3a4a63; --tx3:#61748c; --acc-soft:rgba(77,163,255,.12);
+  --focus:rgba(77,163,255,.3); --tr:.18s;
+  /* ---- Lucide icons (inline data-URI, offline-safe) ---- */
+  --i-zap:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolygon points='13 2 3 14 12 14 11 22 21 10 12 10 13 2'/%3E%3C/svg%3E");
+  --i-langs:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m5 8 6 6'/%3E%3Cpath d='m4 14 6-6 2-3'/%3E%3Cpath d='M2 5h12'/%3E%3Cpath d='M7 2h1'/%3E%3Cpath d='m22 22-5-10-5 10'/%3E%3Cpath d='M14 18h6'/%3E%3C/svg%3E");
+  --i-eye:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0'/%3E%3Ccircle cx='12' cy='12' r='3'/%3E%3C/svg%3E");
+  --i-msgsq:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z'/%3E%3C/svg%3E");
+  --i-activity:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2'/%3E%3C/svg%3E");
+  --i-grid:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect width='7' height='7' x='3' y='3' rx='1'/%3E%3Crect width='7' height='7' x='14' y='3' rx='1'/%3E%3Crect width='7' height='7' x='14' y='14' rx='1'/%3E%3Crect width='7' height='7' x='3' y='14' rx='1'/%3E%3C/svg%3E");
+  --i-package:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m7.5 4.27 9 5.15'/%3E%3Cpath d='M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z'/%3E%3Cpath d='m3.3 7 8.7 5 8.7-5'/%3E%3Cpath d='M12 22V12'/%3E%3C/svg%3E");
+  --i-sliders:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cline x1='21' x2='14' y1='4' y2='4'/%3E%3Cline x1='10' x2='3' y1='4' y2='4'/%3E%3Cline x1='21' x2='12' y1='12' y2='12'/%3E%3Cline x1='8' x2='3' y1='12' y2='12'/%3E%3Cline x1='21' x2='16' y1='20' y2='20'/%3E%3Cline x1='12' x2='3' y1='20' y2='20'/%3E%3Cline x1='14' x2='14' y1='2' y2='6'/%3E%3Cline x1='8' x2='8' y1='10' y2='14'/%3E%3Cline x1='16' x2='16' y1='18' y2='22'/%3E%3C/svg%3E");
+  --i-globe:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='10'/%3E%3Cpath d='M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20'/%3E%3Cpath d='M2 12h20'/%3E%3C/svg%3E");
+  --i-cpu:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect width='16' height='16' x='4' y='4' rx='2'/%3E%3Crect width='6' height='6' x='9' y='9' rx='1'/%3E%3Cpath d='M15 2v2'/%3E%3Cpath d='M15 20v2'/%3E%3Cpath d='M2 15h2'/%3E%3Cpath d='M2 9h2'/%3E%3Cpath d='M20 15h2'/%3E%3Cpath d='M20 9h2'/%3E%3Cpath d='M9 2v2'/%3E%3Cpath d='M9 20v2'/%3E%3C/svg%3E");
+  --i-boxes:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M2.97 12.92A2 2 0 0 0 2 14.63v3.24a2 2 0 0 0 .97 1.71l3 1.7a2 2 0 0 0 2.06 0l3-1.7a2 2 0 0 0 .97-1.71v-3.24a2 2 0 0 0-.97-1.71l-3-1.7a2 2 0 0 0-2.06 0l-3 1.7Z'/%3E%3Cpath d='M7 16v-4'/%3E%3Cpath d='m9.5 11.5 5-2.9'/%3E%3Cpath d='M12.97 5.92A2 2 0 0 0 12 7.63v3.24a2 2 0 0 0 .97 1.71l3 1.7a2 2 0 0 0 2.06 0l3-1.7a2 2 0 0 0 .97-1.71V7.63a2 2 0 0 0-.97-1.71l-3-1.7a2 2 0 0 0-2.06 0Z'/%3E%3Cpath d='M17 10.5v-4'/%3E%3Cpath d='m17 2.5 3 1.7'/%3E%3C/svg%3E");
+  --i-layers:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z'/%3E%3Cpath d='m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65'/%3E%3Cpath d='m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65'/%3E%3C/svg%3E");
+  --i-gauge:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m12 14 4-4'/%3E%3Cpath d='M3.34 19a10 10 0 1 1 17.32 0'/%3E%3C/svg%3E");
+  --i-wrench:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z'/%3E%3C/svg%3E");
+  --i-archive:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect width='20' height='5' x='2' y='3' rx='1'/%3E%3Cpath d='M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8'/%3E%3Cpath d='M10 12h4'/%3E%3C/svg%3E");
+  --i-table2:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 3v18'/%3E%3Crect width='18' height='18' x='3' y='3' rx='2'/%3E%3Cpath d='M3 9h18'/%3E%3Cpath d='M3 15h18'/%3E%3C/svg%3E");
+  --i-shield:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1 1 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z'/%3E%3Cpath d='m9 12 2 2 4-4'/%3E%3C/svg%3E");
+  --i-gear:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z'/%3E%3Ccircle cx='12' cy='12' r='3'/%3E%3C/svg%3E");
+  --i-file:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z'/%3E%3Cpath d='M14 2v4a2 2 0 0 0 2 2h4'/%3E%3Cpath d='M10 9H8'/%3E%3Cpath d='M16 13H8'/%3E%3Cpath d='M16 17H8'/%3E%3C/svg%3E");
+  --i-play:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolygon points='6 3 20 12 6 21 6 3'/%3E%3C/svg%3E");
+  --i-refresh:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8'/%3E%3Cpath d='M21 3v5h-5'/%3E%3Cpath d='M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16'/%3E%3Cpath d='M3 21v-5h5'/%3E%3C/svg%3E");
+  --i-power:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 2v10'/%3E%3Cpath d='M18.4 6.6a9 9 0 1 1-12.77.04'/%3E%3C/svg%3E");
+  --i-trash:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 6h18'/%3E%3Cpath d='M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6'/%3E%3Cpath d='M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2'/%3E%3C/svg%3E");
+  --i-save:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z'/%3E%3Cpath d='M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7'/%3E%3Cpath d='M7 3v4a1 1 0 0 0 1 1h7'/%3E%3C/svg%3E");
+  --i-download:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4'/%3E%3Cpolyline points='7 10 12 15 17 10'/%3E%3Cline x1='12' x2='12' y1='15' y2='3'/%3E%3C/svg%3E");
+  --i-search:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='11' cy='11' r='8'/%3E%3Cpath d='m21 21-4.3-4.3'/%3E%3C/svg%3E");
+  --i-copy:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect width='14' height='14' x='8' y='8' rx='2'/%3E%3Cpath d='M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2'/%3E%3C/svg%3E");
+  --i-pause:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='14' y='4' width='4' height='16' rx='1'/%3E%3Crect x='6' y='4' width='4' height='16' rx='1'/%3E%3C/svg%3E");
+  --i-check:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 6 9 17l-5-5'/%3E%3C/svg%3E");
+  --i-alert:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='10'/%3E%3Cline x1='12' x2='12' y1='8' y2='12'/%3E%3Cline x1='12' x2='12.01' y1='16' y2='16'/%3E%3C/svg%3E");
 }
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 "SF Mono",Consolas,"Microsoft YaHei",monospace}
-header{display:flex;align-items:center;gap:10px;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--bd);flex-wrap:wrap}
-header h1{font-size:16px;margin:0;font-weight:600}
-.badge{display:inline-block;padding:2px 10px;border-radius:10px;font-size:12px;border:1px solid var(--bd);background:var(--panel2)}
-.badge.ok{color:var(--ok);border-color:var(--ok)}
+body{margin:0;background:
+  radial-gradient(1100px 480px at 85% -12%,rgba(77,163,255,.07),transparent 60%),
+  var(--bg);
+  color:var(--tx);font:14px/1.5 "SF Mono",Consolas,"Microsoft YaHei",monospace}
+
+/* ---- 图标：CSS mask 伪元素（免疫 textContent/innerHTML 重写） ---- */
+[class^="ic-"]::before,[class*=" ic-"]::before{
+  content:"";display:inline-block;width:14px;height:14px;flex:none;
+  background-color:currentColor;
+  -webkit-mask:var(--icon) center/contain no-repeat;mask:var(--icon) center/contain no-repeat}
+.ic-langs{--icon:var(--i-langs)}
+.ic-eye{--icon:var(--i-eye)}
+.ic-chat{--icon:var(--i-msgsq)}
+.ic-activity{--icon:var(--i-activity)}
+.ic-grid{--icon:var(--i-grid)}
+.ic-package{--icon:var(--i-package)}
+.ic-sliders{--icon:var(--i-sliders)}
+.ic-globe{--icon:var(--i-globe)}
+.ic-cpu{--icon:var(--i-cpu)}
+.ic-boxes{--icon:var(--i-boxes)}
+.ic-layers{--icon:var(--i-layers)}
+.ic-gauge{--icon:var(--i-gauge)}
+.ic-wrench{--icon:var(--i-wrench)}
+.ic-archive{--icon:var(--i-archive)}
+.ic-table2{--icon:var(--i-table2)}
+.ic-shield{--icon:var(--i-shield)}
+.ic-gear{--icon:var(--i-gear)}
+.ic-file{--icon:var(--i-file)}
+.ic-play{--icon:var(--i-play)}
+.ic-refresh{--icon:var(--i-refresh)}
+.ic-power{--icon:var(--i-power)}
+.ic-save{--icon:var(--i-save)}
+.ic-download{--icon:var(--i-download)}
+.ic-search{--icon:var(--i-search)}
+.ic-copy{--icon:var(--i-copy)}
+.ic-pause{--icon:var(--i-pause)}
+.ic-check{--icon:var(--i-check)}
+.ic-zap{--icon:var(--i-zap)}
+
+header{display:flex;align-items:center;gap:11px;padding:11px 18px;background:linear-gradient(180deg,#1a2330,#161d27);border-bottom:1px solid var(--bd);flex-wrap:wrap;position:sticky;top:0;z-index:20;backdrop-filter:blur(8px)}
+.brand{width:33px;height:33px;border-radius:9px;flex:none;background:linear-gradient(135deg,#57a7ff,#2f6fe0);box-shadow:0 4px 16px rgba(77,163,255,.35);-webkit-mask:var(--i-zap) center/18px no-repeat;mask:var(--i-zap) center/18px no-repeat}
+.brandwrap{display:flex;flex-direction:column;gap:1px;min-width:0;margin-right:2px}
+header h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.3px;line-height:1.25}
+.brandwrap .sub{font-size:9.5px;color:var(--tx3);letter-spacing:2px}
+.badge{display:inline-flex;align-items:center;gap:7px;padding:3px 11px;border-radius:10px;font-size:12px;border:1px solid var(--bd);background:var(--panel2);transition:color var(--tr),border-color var(--tr)}
+.badge::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor;flex:none;box-shadow:0 0 8px currentColor}
+.badge.ok{color:var(--ok);border-color:rgba(62,207,142,.55);background:rgba(62,207,142,.08)}
 .badge.stop{color:#7a8ba0;border-color:var(--bd)}
-.badge.warn{color:var(--warn);border-color:var(--warn)}
-.badge.bad{color:var(--bad);border-color:var(--bad)}
+.badge.warn{color:var(--warn);border-color:rgba(255,176,32,.55);background:rgba(255,176,32,.08)}
+.badge.bad{color:var(--bad);border-color:rgba(255,107,107,.55);background:rgba(255,107,107,.08)}
 /* 平台适用性标签：RAM=省内存场景有效 / x86=已在本地 x86 复现 / x86no=x86 上无效或负收益 */
-.ptag{display:inline-block;padding:0 6px;border-radius:8px;font-size:10.5px;line-height:16px;
+.ptag{display:inline-block;padding:0 7px;border-radius:8px;font-size:10.5px;line-height:17px;
       border:1px solid var(--bd);color:var(--tx2);margin-left:5px;vertical-align:1px;white-space:nowrap}
-.ptag.ram{color:var(--warn);border-color:var(--warn)}
-.ptag.x86{color:var(--acc);border-color:var(--acc)}
-.ptag.x86no{color:var(--bad);border-color:var(--bad)}
+.ptag.ram{color:var(--warn);border-color:rgba(255,176,32,.5);background:rgba(255,176,32,.08)}
+.ptag.x86{color:var(--acc);border-color:rgba(77,163,255,.5);background:rgba(77,163,255,.08)}
+.ptag.x86no{color:var(--bad);border-color:rgba(255,107,107,.5);background:rgba(255,107,107,.08)}
 /* 「当前在用」标记：仅当已保存/运行中的配置命中该组合的开关集合时出现 */
-.inuse{display:inline-block;padding:0 6px;border-radius:8px;font-size:10.5px;line-height:16px;
-       border:1px solid var(--ok);color:var(--ok);margin-left:6px;vertical-align:1px;white-space:nowrap}
+.inuse{display:inline-block;padding:0 7px;border-radius:8px;font-size:10.5px;line-height:17px;
+       border:1px solid var(--ok);color:var(--ok);margin-left:6px;vertical-align:1px;white-space:nowrap;background:rgba(62,207,142,.08)}
 /* 有效优化组合表 */
 table.combos{width:100%;border-collapse:collapse;font-size:12px;margin-top:4px}
-table.combos th,table.combos td{border-bottom:1px solid var(--bd);padding:6px 8px;text-align:left;vertical-align:top}
-table.combos th{color:var(--tx2);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.4px}
+table.combos th,table.combos td{border-bottom:1px solid var(--bd);padding:7px 9px;text-align:left;vertical-align:top}
+table.combos th{color:var(--tx2);font-weight:600;font-size:10.5px;text-transform:uppercase;letter-spacing:.6px}
 table.combos tr:last-child td{border-bottom:none}
-table.combos tr:hover td{background:var(--panel2)}
+table.combos tbody tr{transition:background var(--tr)}
+table.combos tbody tr:hover td{background:rgba(77,163,255,.06)}
 table.combos td.ev{color:var(--ok);white-space:nowrap}
 table.combos td.act{white-space:nowrap;text-align:right}
-table.combos button{padding:3px 10px;font-size:12px}
+table.combos button{padding:3px 11px;font-size:12px}
+table.combos button::before{content:"";display:inline-block;width:11px;height:11px;flex:none;background-color:currentColor;-webkit-mask:var(--i-check) center/contain no-repeat;mask:var(--i-check) center/contain no-repeat}
 table.combos .name{font-weight:600}
 table.combos .why{color:var(--tx2)}
-main{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;padding:12px 16px;max-width:1500px;margin:0 auto;align-items:start}
-@media(max-width:860px){main{grid-template-columns:1fr}}
+table.combos code{color:var(--acc);word-break:break-all;background:rgba(77,163,255,.08);padding:1px 5px;border-radius:4px;font-size:11.5px}
+/* ---- 顶部分类选项卡（纯表现层归纳；页内模块按单列纵向排列） ---- */
+.tabbar{display:flex;gap:7px;flex-wrap:wrap;padding:14px 16px 0;max-width:1500px;margin:0 auto}
+.tabbtn{display:inline-flex;align-items:center;gap:8px;background:var(--panel2);color:var(--tx2);border:1px solid var(--bd);border-radius:9px;padding:8px 16px;font-size:13px;cursor:pointer;font-family:inherit;white-space:nowrap;transition:color var(--tr),border-color var(--tr),background var(--tr),filter var(--tr)}
+.tabbtn:hover{color:var(--acc);border-color:var(--acc);background:var(--acc-soft)}
+.tabbtn:focus-visible{outline:none;box-shadow:0 0 0 3px var(--focus)}
+.tabbtn.on{background:linear-gradient(180deg,#57a7ff,#3d8bee);border-color:#3d8bee;color:#07131f;font-weight:600}
+.tabpane{display:none}
+.tabpane.show{display:flex;flex-direction:column;gap:13px}
+main{display:flex;flex-direction:column;padding:13px 16px 26px;max-width:1500px;margin:0 auto;align-items:stretch}
 /* 卡片：统一 padding / 间距；min-width:0 防止内容（宽表/长 token）撑出横向溢出 */
-.card{background:var(--panel);border:1px solid var(--bd);border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:2px;min-width:0}
-.card h2{font-size:12.5px;margin:0 0 8px;padding-bottom:8px;border-bottom:1px solid var(--bd);color:var(--tx2);font-weight:600;text-transform:uppercase;letter-spacing:.5px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.card h2 .sub{font-weight:400;text-transform:none;letter-spacing:0;font-size:11px;color:var(--tx2)}
+.card{background:linear-gradient(180deg,#1a2330,var(--panel));border:1px solid var(--bd);border-radius:12px;padding:13px 15px;display:flex;flex-direction:column;gap:2px;min-width:0;box-shadow:0 6px 24px rgba(0,0,0,.22)}
+.card h2{font-size:12.5px;margin:0 0 9px;padding-bottom:9px;border-bottom:1px solid var(--bd);color:var(--tx2);font-weight:600;text-transform:uppercase;letter-spacing:.6px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.card h2::before{background-color:var(--acc)}
+.card h2 .sub{font-weight:400;text-transform:none;letter-spacing:0;font-size:11px;color:var(--tx3)}
 /* 卡片内逻辑分区（标题与卡片头同样式，形成一致的层级） */
 .sec{font-size:11px;color:var(--acc);text-transform:uppercase;letter-spacing:.6px;margin:10px 0 4px;padding-top:8px;border-top:1px dashed var(--bd);display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .sec:first-of-type{border-top:none;margin-top:0;padding-top:0}
@@ -54,36 +140,44 @@ main{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;padding
 /* 明确两列：用于 4 项一组，排成整齐的 2×2（避免 auto-fit 出现 3+1 的空档） */
 .fldgrid.c2{grid-template-columns:repeat(2,minmax(0,1fr))}
 /* 宽内容（实测台账表）独立横向滚动，不撑破卡片 */
-.tablewrap{overflow-x:auto}
-.kv{background:var(--panel2);border:1px solid var(--bd);border-radius:8px;padding:8px 10px}
-.kv .k{font-size:11px;color:var(--tx2)}
-.kv .v{font-size:15px;margin-top:2px;word-break:break-all}
+.tablewrap{overflow-x:auto;border:1px solid var(--bd);border-radius:9px;background:rgba(0,0,0,.14)}
+.kv{background:var(--panel2);border:1px solid var(--bd);border-radius:8px;padding:9px 11px;transition:border-color var(--tr)}
+.kv:hover{border-color:var(--bd-hi)}
+.kv .k{font-size:11px;color:var(--tx2);text-transform:uppercase;letter-spacing:.4px}
+.kv .v{font-size:15px;margin-top:3px;word-break:break-all}
 .kv .v.small{font-size:13px}
 label.fld{display:block;margin:6px 0}
 label.fld .t{display:flex;justify-content:space-between;align-items:baseline;gap:8px;font-size:12px;color:var(--tx2);margin-bottom:3px}
-input[type=text],input[type=number],select{width:100%;background:var(--panel2);border:1px solid var(--bd);color:var(--tx);border-radius:6px;padding:6px 8px;font-size:13px;font-family:inherit}
+input[type=text],input[type=number],select{width:100%;background:var(--panel2);border:1px solid var(--bd);color:var(--tx);border-radius:7px;padding:6px 8px;font-size:13px;font-family:inherit;transition:border-color var(--tr),box-shadow var(--tr)}
+input[type=text]:focus,input[type=number]:focus,select:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px var(--focus)}
+input::placeholder{color:var(--tx3)}
 /* Model-dir field: highlighted so it is impossible to miss */
 label.fld.hl .t{color:var(--acc);font-weight:600}
 #f_model_dir{background:#12233a;border:1px solid var(--acc);box-shadow:0 0 0 1px rgba(77,163,255,.35);font-weight:600;font-size:13.5px}
 input[type=checkbox]{width:16px;height:16px;accent-color:var(--acc)}
-button{background:var(--panel2);color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:7px 14px;font-size:13px;cursor:pointer;font-family:inherit}
-button:hover{border-color:var(--acc);color:var(--acc)}
-button.primary{background:var(--acc);border-color:var(--acc);color:#08131f}
-button.primary:hover{filter:brightness(1.1);color:#08131f}
-button.danger{background:#3a1f24;border-color:#6b3535;color:#ff9b9b}
-button.danger:hover{border-color:var(--bad);color:var(--bad)}
+button{display:inline-flex;align-items:center;justify-content:center;gap:8px;background:var(--panel2);color:var(--tx);border:1px solid var(--bd);border-radius:7px;padding:7px 14px;font-size:13px;cursor:pointer;font-family:inherit;transition:color var(--tr),border-color var(--tr),background var(--tr),filter var(--tr)}
+button:hover{border-color:var(--acc);color:var(--acc);background:var(--acc-soft)}
+button:focus-visible{outline:none;box-shadow:0 0 0 3px var(--focus)}
+button.primary{background:linear-gradient(180deg,#57a7ff,#3d8bee);border-color:#3d8bee;color:#07131f;font-weight:600}
+button.primary:hover{filter:brightness(1.08);color:#07131f;background:linear-gradient(180deg,#57a7ff,#3d8bee)}
+button.danger{background:#33191d;border-color:#6b3535;color:#ff9b9b}
+button.danger:hover{border-color:var(--bad);color:var(--bad);background:rgba(255,107,107,.09)}
+button.danger::before{content:"";display:inline-block;width:12px;height:12px;flex:none;background-color:currentColor;-webkit-mask:var(--i-power) center/contain no-repeat;mask:var(--i-power) center/contain no-repeat}
+#btn_l3clear::before{-webkit-mask-image:var(--i-trash);mask-image:var(--i-trash)}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px}
 .chkrow{display:flex;gap:8px;align-items:flex-start;margin:5px 0;font-size:13px;line-height:1.5}
 .chkrow input{flex:0 0 auto;margin-top:2px}
-.msg{padding:8px 10px;border-radius:6px;margin-top:8px;font-size:12px;display:none}
-.msg.show{display:block}
-.msg.ok{background:#14301f;color:var(--ok);border:1px solid #1f4a30}
-.msg.err{background:#33191c;color:var(--bad);border:1px solid #5c2c30}
-#log{height:380px;overflow:auto;background:#0a0e13;border:1px solid var(--bd);border-radius:8px;padding:8px 10px;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.msg{display:none;align-items:center;gap:8px;padding:8px 11px;border-radius:7px;margin-top:8px;font-size:12px;line-height:1.6}
+.msg.show{display:flex}
+.msg::before{content:"";width:14px;height:14px;flex:none;background-color:currentColor;-webkit-mask:var(--i-alert) center/contain no-repeat;mask:var(--i-alert) center/contain no-repeat}
+.msg.ok{background:linear-gradient(90deg,rgba(62,207,142,.12),transparent 60%),#12271b;color:var(--ok);border:1px solid #1f4a30}
+.msg.ok::before{-webkit-mask-image:var(--i-check);mask-image:var(--i-check)}
+.msg.err{background:#2e1518;color:var(--bad);border:1px solid #5c2c30}
+#log{height:380px;overflow:auto;background:#0a0e13;border:1px solid var(--bd);border-radius:9px;padding:8px 10px;font-size:12px;white-space:pre-wrap;word-break:break-all}
 #log .tail{color:var(--tx2)}
 .logfilters{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:0 0 8px}
-.logfilters button{font-size:12px;padding:3px 10px}
-.logfilters button.on{border-color:var(--acc);color:var(--acc);background:#16222f}
+.logfilters button{font-size:12px;padding:3px 11px}
+.logfilters button.on{border-color:var(--acc);color:var(--acc);background:var(--acc-soft)}
 .logfilters .lc{opacity:.6;font-size:11px}
 #log > div{white-space:pre-wrap;word-break:break-all;min-height:15px}
 #log > div.lv-error{color:var(--bad)}
@@ -91,46 +185,66 @@ button.danger:hover{border-color:var(--bad);color:var(--bad)}
 #log > div.lv-debug{color:var(--tx2)}
 #log > div.lv-info{color:var(--tx)}
 .progress{height:8px;background:var(--panel2);border:1px solid var(--bd);border-radius:4px;overflow:hidden;margin:6px 0 2px}
-.progress > div{height:100%;background:var(--acc);width:0%;transition:width .6s}
+.progress > div{height:100%;background:linear-gradient(90deg,#3d8bee,#57a7ff);width:0%;transition:width .6s}
 .loadbar-t{font-size:11px;color:var(--tx2)}
 .spinner{display:inline-block;width:12px;height:12px;border:2px solid var(--bd);border-top-color:var(--acc);border-radius:50%;animation:sp .8s linear infinite;vertical-align:-2px}
 @keyframes sp{to{transform:rotate(360deg)}}
-footer{padding:10px 20px;color:#5a6a7c;font-size:12px}
+footer{padding:12px 20px;color:var(--tx3);font-size:12px}
 a{color:var(--acc)}
-.navlink{color:var(--tx2);font-size:12px;text-decoration:none;border:1px solid var(--bd);border-radius:6px;padding:3px 10px}
-.navlink:hover{color:var(--acc);border-color:var(--acc)}
+.navlink{display:inline-flex;align-items:center;gap:7px;color:var(--tx2);font-size:12px;text-decoration:none;border:1px solid var(--bd);border-radius:7px;padding:5px 11px;background:var(--panel2);cursor:pointer;font-family:inherit;transition:color var(--tr),border-color var(--tr),background var(--tr)}
+.navlink:hover{color:var(--acc);border-color:var(--acc);background:var(--acc-soft)}
 /* K-ADMIN-001：组件配置入口（按钮卡片，单独成页 /admin/{kb,laya,yolo}） */
 .compogrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px;margin-top:4px}
-.compo{display:block;text-decoration:none;color:var(--tx);background:var(--panel2);border:1px solid var(--bd);border-radius:10px;padding:14px;transition:border-color .15s}
-.compo:hover{border-color:var(--acc);box-shadow:0 0 0 1px rgba(77,163,255,.35)}
+.compo{display:block;text-decoration:none;color:var(--tx);background:var(--panel2);border:1px solid var(--bd);border-radius:11px;padding:15px;transition:border-color var(--tr),box-shadow var(--tr),transform var(--tr)}
+.compo:hover{border-color:var(--acc);box-shadow:0 0 0 1px rgba(77,163,255,.35),0 8px 24px rgba(0,0,0,.3);transform:translateY(-1px)}
 .compo .tt{font-size:14px;font-weight:600;color:var(--acc)}
-.compo .dd{font-size:12px;color:var(--tx2);margin-top:6px;line-height:1.5}
-.compo .go{margin-top:10px;display:inline-block;font-size:12px;color:var(--tx2);border:1px solid var(--bd);border-radius:6px;padding:3px 10px}
+.compo .dd{font-size:12px;color:var(--tx2);margin-top:6px;line-height:1.6}
+.compo .go{margin-top:10px;display:inline-block;font-size:12px;color:var(--tx2);border:1px solid var(--bd);border-radius:7px;padding:3px 10px;transition:color var(--tr),border-color var(--tr)}
 .compo:hover .go{color:var(--acc);border-color:var(--acc)}
+/* K-ADMIN-002：组件开关按钮（状态灯复用 .badge 的 ok/warn/stop/bad） */
+.cbtn{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:3px 10px;border:1px solid var(--bd);border-radius:7px;background:var(--panel2);color:var(--tx2);cursor:pointer;transition:color var(--tr),border-color var(--tr)}
+.cbtn:hover{border-color:var(--acc);color:var(--acc)}
+.compo .tt .badge{margin-left:8px;font-size:11px;padding:1px 8px}
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-thumb{background:var(--bd);border-radius:5px;border:2px solid var(--bg)}
+::-webkit-scrollbar-thumb:hover{background:var(--bd-hi)}
+::-webkit-scrollbar-track{background:transparent}
 </style>
 </head>
 <body>
 <header>
-  <h1 data-en="vLLM-Kestrel Edge-Cloud Coordination Platform · Admin">vLLM-Kestrel 边缘云协调平台 · 管理</h1>
+  <span class="brand" aria-hidden="true"></span>
+  <div class="brandwrap">
+    <h1 data-en="vLLM-Kestrel Edge-Cloud Coordination Platform · Admin">vLLM-Kestrel 边缘云协调平台 · 管理</h1>
+    <div class="sub">vLLM-KESTREL · ADMIN CONSOLE</div>
+  </div>
   <span id="engBadge" class="badge">引擎: 未知</span>
   <span id="mgrBadge" class="badge">supervisor: 未知</span>
   <span id="cfgBadge" class="badge">配置: -</span>
   <span style="flex:1"></span>
-  <button id="langBtn" class="navlink" type="button" title="切换为中文">EN</button>
-  <a class="navlink" href="/review" data-en="Review console /review">审查台 /review</a>
-  <a class="navlink" href="/chat" target="_blank" data-en="Chat /chat">对话页 /chat</a>
+  <button id="langBtn" class="navlink ic-langs" type="button" title="切换为中文">EN</button>
+  <a class="navlink ic-eye" href="/review" data-en="Review console /review">审查台 /review</a>
+  <a class="navlink ic-chat" href="/chat" target="_blank" data-en="Chat /chat">对话页 /chat</a>
   <span id="clock" style="color:var(--tx2);font-size:12px"></span>
 </header>
+<nav class="tabbar" id="tabbar">
+  <button class="tabbtn ic-activity" data-tab="overview" type="button" data-en="Overview">总览</button>
+  <button class="tabbtn ic-package" data-tab="model" type="button" data-en="Model">模型</button>
+  <button class="tabbtn ic-zap" data-tab="perf" type="button" data-en="Performance">性能优化</button>
+  <button class="tabbtn ic-globe" data-tab="server" type="button" data-en="Server &amp; Security">服务与安全</button>
+  <button class="tabbtn ic-gear" data-tab="cfglog" type="button" data-en="Config &amp; Logs">配置与日志</button>
+</nav>
 <main>
+  <div class="tabpane show" data-pane="overview">
   <!-- 状态 + 引擎控制 -->
   <div class="card" style="grid-column:1/-1">
-    <h2 data-en="Runtime Status">运行状态</h2>
+    <h2 class="ic-activity" data-en="Runtime Status">运行状态</h2>
     <div class="grid" id="stGrid"></div>
     <div id="loadbar" style="display:none;margin-top:10px"></div>
     <div class="sec" data-en="Engine Control">引擎控制</div>
     <div class="row" style="margin-top:2px">
-      <button id="btn_start" class="primary" data-en="Start Engine">启动引擎</button>
-      <button id="btn_restart" data-en="Restart Engine">重启引擎</button>
+      <button id="btn_start" class="primary ic-play" data-en="Start Engine">启动引擎</button>
+      <button id="btn_restart" class="ic-refresh" data-en="Restart Engine">重启引擎</button>
       <button id="btn_stop" class="danger" data-en="Shut Down Engine">关闭引擎</button>
     </div>
     <div style="font-size:12px;color:var(--tx2)">
@@ -141,23 +255,33 @@ a{color:var(--acc)}
 
   <!-- 组件配置入口（K-ADMIN-001：按钮卡片，各自独立成页；云端为可选） -->
   <div class="card" style="grid-column:1/-1">
-    <h2 data-en="Component Configuration">组件配置</h2>
+    <h2 class="ic-grid" data-en="Component Configuration">组件配置</h2>
     <div class="compogrid">
-      <a class="compo" href="/admin/kb">
-        <div class="tt" data-en="Vector Model / Knowledge Base">向量模型知识库</div>
+      <div class="compo">
+        <div class="tt"><span data-en="Vector Model / Knowledge Base">向量模型知识库</span><span class="badge stop" id="cst_embed">-</span></div>
         <div class="dd" data-en="Embedding model path, KB root dir; manage .vkb docs and run retrieval tests.">向量模型目录、知识库根目录；管理 .vkb 文档并可在线检索试查。</div>
-        <span class="go" data-en="Open KB config →">打开知识库配置 →</span>
-      </a>
-      <a class="compo" href="/admin/laya">
-        <div class="tt" data-en="Laya Decision">Laya 决策</div>
+        <div class="dd" id="warn_embed" style="display:none;color:var(--warn)"></div>
+        <div class="row">
+          <a class="go" href="/admin/kb" data-en="Open KB config →">打开知识库配置 →</a>
+          <button class="cbtn" id="cb_embed" type="button"></button>
+        </div>
+      </div>
+      <div class="compo">
+        <div class="tt"><span data-en="Laya Decision">Laya 决策</span><span class="badge stop" id="cst_laya">-</span></div>
         <div class="dd" data-en="Laya decision pack path; construct a request to try a decision online.">Laya 决策权重包目录；构造请求在线试决策。</div>
-        <span class="go" data-en="Open Laya config →">打开 Laya 配置 →</span>
-      </a>
-      <a class="compo" href="/admin/yolo">
-        <div class="tt" data-en="YOLO Detection">YOLO 检测</div>
+        <div class="row">
+          <a class="go" href="/admin/laya" data-en="Open Laya config →">打开 Laya 配置 →</a>
+          <button class="cbtn" id="cb_laya" type="button"></button>
+        </div>
+      </div>
+      <div class="compo">
+        <div class="tt"><span data-en="YOLO Detection">YOLO 检测</span><span class="badge stop" id="cst_yolo">-</span></div>
         <div class="dd" data-en="Detection model / backend (VQF v4 or official RKNN); upload an image to test.">检测模型与后端（VQF v4 或官方 RKNN）；传图试检测。</div>
-        <span class="go" data-en="Open YOLO config →">打开 YOLO 配置 →</span>
-      </a>
+        <div class="row">
+          <a class="go" href="/admin/yolo" data-en="Open YOLO config →">打开 YOLO 配置 →</a>
+          <button class="cbtn" id="cb_yolo" type="button"></button>
+        </div>
+      </div>
       <a class="compo" href="/admin/cloud">
         <div class="tt" data-en="Cloud Model (optional)">云端模型（可选）</div>
         <div class="dd" data-en="Cloud uplink endpoint / model / fallback mode; test connectivity. Off by default (never).">云端回退地址、模型与回退模式；可测试连通。默认关闭（never）。</div>
@@ -166,9 +290,12 @@ a{color:var(--acc)}
     </div>
   </div>
 
+  </div><!-- /tabpane overview -->
+
+  <div class="tabpane" data-pane="model">
   <!-- 模型加载 -->
   <div class="card">
-    <h2 data-en="Model Loading">模型加载</h2>
+    <h2 class="ic-package" data-en="Model Loading">模型加载</h2>
     <div class="sec" data-en="Model Path &amp; Format">模型路径与格式</div>
     <label class="fld hl"><span class="t"><span data-en="Model folder path ">模型文件夹路径 </span><b style="color:var(--warn);font-weight:600" data-en="(required)">（必填）</b></span>
       <input type="text" id="f_model_dir" placeholder="D:\Modl\Qwen3-VL-2B-Instruct"></label>
@@ -195,21 +322,88 @@ a{color:var(--acc)}
         <input type="password" id="f_vqf_key" placeholder="加载加密 VQF 时填写" data-en-ph="Enter when loading an encrypted VQF" autocomplete="off"></label>
     </div>
     <div class="row" style="margin-top:4px">
-      <button id="btn_loadmodel" class="primary" data-en="Load Model">加载模型</button>
-      <button id="btn_unload" style="display:none" data-en="Unload Model">卸载模型</button>
+      <button id="btn_loadmodel" class="primary ic-package" data-en="Load Model">加载模型</button>
+      <button id="btn_unload" class="ic-power" style="display:none" data-en="Unload Model">卸载模型</button>
       <span id="modelInfo" style="font-size:12px;color:var(--tx2);align-self:center"></span>
     </div>
     <div class="msg" id="opmsg"></div>
   </div>
 
+  <!-- 内存驻留策略（档位阶梯 · 运行时动态） -->
+  <div class="card">
+    <h2 class="ic-layers" data-en="Memory Residency Policy (level ladder · runtime dynamic)">内存驻留策略（档位阶梯 · 运行时动态）</h2>
+    <div class="sec" data-en="Current level">当前档位</div>
+    <div style="font-size:12px;line-height:1.8" id="resStatus">-</div>
+    <div class="sec" data-en="Idle auto-downgrade (model-level global idle → step down one level at a time)">空闲自动降级（模型级全局空闲 → 逐级降档）</div>
+    <div class="chkrow"><input type="checkbox" id="f_res_auto"><label for="f_res_auto" data-en="Enable idle step-by-step auto-downgrade (how long since the client interacted: full residency → KV per-layer eviction → weight window → initial layers → KV to disk + exit)">启用空闲逐级自动降级（客户多久没交互：全层驻留 → KV逐层淘汰 → 权重窗口 → 初始层 → KV落盘退出）</label></div>
+    <div class="fldgrid c2">
+      <label class="fld"><span class="t" data-en="L4→L3 KV per-layer eviction: idle wait seconds (0=stay at L4)">L4→L3 KV 逐层淘汰：空闲等待秒 (0=停在 L4)</span><input type="number" id="f_res_idle4" min="0" value="300"></label>
+      <label class="fld"><span class="t" data-en="L3→L2 weight window: idle wait seconds (0=stay at L3)">L3→L2 权重窗口：空闲等待秒 (0=停在 L3)</span><input type="number" id="f_res_idle3" min="0" value="900"></label>
+      <label class="fld"><span class="t" data-en="L2→L1 initial layers: idle wait seconds (0=stay at L2)">L2→L1 初始层：空闲等待秒 (0=停在 L2)</span><input type="number" id="f_res_idle2" min="0" value="1800"></label>
+      <label class="fld"><span class="t" data-en="L1→L0 KV to disk + unload: idle wait seconds (0=stay at L1)">L1→L0 KV落盘+卸载：空闲等待秒 (0=停在 L1)</span><input type="number" id="f_res_idle1" min="0" value="3600"></label>
+    </div>
+    <label class="fld"><span class="t" data-en="L2 weight-window resident layers w_keep (keep layers 0..N)">L2 权重窗口保留层数 w_keep（保留层 0..N）</span><input type="number" id="f_res_wkeep" min="0" value="8"></label>
+    <div class="sec" data-en="Proactive downgrade on memory pressure (soft watermark; drop one level when below)">内存紧张主动降级（软水位，低于自动降一档）</div>
+    <div class="fldgrid">
+      <label class="fld"><span class="t" data-en='Soft watermark MB (0=off; works with the "Core Config - minimum free memory" hard 503)'>软水位 MB（0=关闭；与"核心配置-最低可用内存"硬 503 配合）</span><input type="number" id="f_res_soft" min="0" value="0"></label>
+      <label class="fld"><span class="t" data-en="Lowest level allowed for auto-downgrade (0=unloadable · 3=KV eviction only · 4=no auto-downgrade)">允许自动降到的档位（0=可卸载 · 3=仅KV淘汰 · 4=不自动降）</span><input type="number" id="f_res_lowlvl" min="0" max="4" value="0"></label>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button id="btn_res_cfg" class="primary ic-check" data-en="Apply policy parameters">应用策略参数</button>
+      <button id="btn_res_l4" title="KV 全驻留 + 权重不主动释放" data-en="L4 full-layer residency" data-en-title="KV fully resident + weights not proactively released">L4 全层驻留</button>
+      <button id="btn_res_l3" title="prefill 后按重要性逐层淘汰冷块到磁盘 (需 --sparse-attn 配合自动开)" data-en="L3 KV eviction" data-en-title="After prefill, evict cold blocks to disk layer by layer by importance (auto-enabled with --sparse-attn)">L3 KV淘汰</button>
+      <button id="btn_res_l2" title="释放 layer&gt;w_keep 权重物理页 (需明文 VQF + VLLM_VQF_STREAM)" data-en="L2 weight window" data-en-title="Free physical pages of weights for layer&gt;w_keep (needs plaintext VQF + VLLM_VQF_STREAM)">L2 权重窗口</button>
+      <button id="btn_res_l1" title="从高向低释放到只剩初始层" data-en="L1 initial layers" data-en-title="Release from high to low until only the initial layers remain">L1 初始层</button>
+      <button id="btn_res_l0" class="danger" title="KV 落盘(磁盘KV开时)后整模卸载" data-en="L0 to disk + exit" data-en-title="Persist KV to disk (when disk-KV is on) then unload the whole model">L0 落盘+退出</button>
+    </div>
+    <div class="msg" id="resmsg"></div>
+    <div style="font-size:11px;color:var(--tx2);line-height:1.7" data-en-html="Level notes: <b>L4</b> full-layer residency throughout (default, fastest); <b>L3</b> KV per-layer eviction (prefix reuse is disabled when L3 is on); <b>L2</b> weight window (madvise frees physical pages, page faults auto-restore, zero numerical impact; available only with plaintext VQF + VLLM_VQF_STREAM layered mode); <b>L1</b> only the initial layers of weights remain; <b>L0</b> whole-model unload (the next request/load returns to L4 automatically). Weight levels (L2/L1) are auto-skipped straight to L0 when unavailable; upgrades/downgrades take effect immediately; upgrading only adds memory without losing context, and moving L3→L4 by turning L3 off resets the current context (recoverable when disk-KV is on).">
+      档位说明：<b>L4</b> 全程全层驻留（默认，最快）；<b>L3</b> KV 逐层淘汰（前缀复用随
+      L3 开启而关闭）；<b>L2</b> 权重窗口（madvise 释放物理页，缺页自动回驻，数值零影响，仅明文 VQF +
+      启动 VLLM_VQF_STREAM 分层模式可用）；<b>L1</b> 权重只剩初始层；<b>L0</b> 整模卸载（下次请求/加载自动回 L4）。
+      权重档（L2/L1）不可用时自动跳过直达 L0；升降档即时生效；升档只加内存不丢上下文，L3→L4 关 L3 会重置当前上下文（磁盘 KV 开时可恢复）。
+    </div>
+  </div>
+
+  <!-- 长上下文淘汰 (L3) -->
+  <div class="card">
+    <h2 class="ic-archive" data-en="Long-Context Eviction (L3)">长上下文淘汰 (L3)</h2>
+    <div class="chkrow"><input type="checkbox" id="f_l3_evict"><label for="f_l3_evict"><span data-en="Enable L3 cold-block eviction (--l3-evict, requires sparse attention)">启用 L3 冷块淘汰 (--l3-evict，需配合稀疏注意力)</span><span class="ptag ram" data-en="RAM saver">省 RAM</span></label></div>
+    <div class="chkrow"><input type="checkbox" id="f_l3_prefix_reuse"><label for="f_l3_prefix_reuse"><b data-en="L3 prefix-reuse gate (VLLM_L3_PREFIX_REUSE)">L3 前缀复用门 (VLLM_L3_PREFIX_REUSE)</b><span data-en=" — lets L3 eviction coexist with KV prefix reuse"> — 让 L3 驱逐与 KV 前缀复用共存</span><span class="ptag x86" data-en="x86 review −96.9%">x86 复核 −96.9%</span><span class="ptag ram" data-en="RAM saver">省 RAM</span></label></div>
+    <div class="chkrow" id="p3warn" style="display:none;color:var(--warn);font-size:12px;line-height:1.6" data-en-html="⚠ --l3-evict is on but the P3 gate is off: <code>--prefix-kv</code> is silently dropped and multi-turn follow-ups recompute the full prefill. Turn on the option above.">
+      ⚠ 已开 <code>--l3-evict</code> 但未开 P3 门：<code>--prefix-kv</code> 会被静默打掉，多轮追问将全量重算 prefill。建议开启上面这项。
+    </div>
+    <div class="fldgrid">
+      <label class="fld"><span class="t" data-en="Eviction ratio (--l3-ratio)">淘汰比例 (--l3-ratio)</span><input type="number" id="f_l3_ratio" min="0" max="0.99" step="0.05" value="0.75"></label>
+      <label class="fld"><span class="t" data-en="Trigger: minimum context length (--l3-min-seq)">触发时机: 最小上下文长度 (--l3-min-seq)</span><input type="number" id="f_l3_min_seq" min="0" value="128"></label>
+    </div>
+    <label class="fld"><span class="t" data-en="Eviction cache save path (--l3-path)">淘汰缓存保存路径 (--l3-path)</span><input type="text" id="f_l3_path" placeholder="默认 kv_l3.bin（引擎工作目录）" data-en-ph="default kv_l3.bin (engine working directory)"></label>
+    <div class="fldgrid">
+      <label class="fld"><span class="t" data-en="Max saved size MB (--l3-max-size)">最大保存大小 MB (--l3-max-size)</span><input type="number" id="f_l3_max_size" min="0" value="0"></label>
+      <label class="fld"><span class="t" data-en="Idle TTL minutes for user eviction files (--l3-user-ttl)">用户淘汰文件闲置 TTL 分钟 (--l3-user-ttl)</span><input type="number" id="f_l3_user_ttl" min="0" value="30"></label>
+    </div>
+    <div style="font-size:11px;color:var(--tx2);line-height:1.7" data-en-html='0 = always evict after prefill; N&gt;0 = start evicting when the context reaches N tokens (measured value 128; smaller means more wasted eviction overhead).<br>The path may be an eMMC mount point (e.g. /mnt/emmc/kv_l3.bin); max size 0 = unlimited.<br>Each user has an independent cache file, auto-deleted after TTL idle minutes (0 = never clean up).<br><b style="color:var(--warn)">When --l3-evict is on, be sure to also enable the P3 gate above, otherwise KV prefix reuse is silently dropped.</b>'>
+      0 = prefill 后总是淘汰；N&gt;0 = 上下文达到 N tokens 才启动淘汰（实测口径 128，越小越白付驱逐开销）。<br>
+      路径可填 eMMC 挂载点（如 /mnt/emmc/kv_l3.bin）；最大大小 0 = 不限制。<br>
+      每用户独立缓存文件，闲置超 TTL 分钟自动删除（0 = 不清理）。<br>
+      <b style="color:var(--warn)">开 --l3-evict 时务必同时开上面那项 P3 门，否则 KV 前缀复用会被静默打掉。</b>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button id="btn_l3clear" class="danger" data-en="Clear user cache">清空用户缓存</button>
+      <div class="msg" id="l3msg"></div>
+    </div>
+  </div>
+  </div><!-- /tabpane model -->
+
+  <div class="tabpane" data-pane="perf">
   <!-- 核心配置 -->
   <div class="card">
-    <h2><span data-en="Core Config ">核心配置 </span><span id="devTag" style="margin-left:8px"></span></h2>
+    <h2 class="ic-sliders"><span data-en="Core Config ">核心配置 </span><span id="devTag" style="margin-left:8px"></span></h2>
     <div class="sec" data-en="Device">设备</div>
     <label class="fld"><span class="t" data-en="Device type (arch × class × model)">设备类型（架构 × 类别 × 型号）</span>
       <select id="f_device"></select></label>
     <div class="row" style="margin-top:4px">
-      <button id="btn_applydev" style="padding:4px 10px;font-size:12px" data-en="Apply device-recommended settings">应用设备推荐参数</button>
+      <button id="btn_applydev" class="ic-check" style="padding:4px 10px;font-size:12px" data-en="Apply device-recommended settings">应用设备推荐参数</button>
     </div>
     <div class="sec" data-en="Quantization &amp; Cache">量化与缓存</div>
     <div class="chkrow"><input type="checkbox" id="f_kv_q4"><label for="f_kv_q4"><span data-en="KV quant Q4 (--kv-q4, 1.65x memory compression, decode +28%)">KV 量化 Q4 (--kv-q4, 内存 1.65x 压缩, decode +28%)</span><span class="ptag ram" data-en="RAM saver">省 RAM</span></label></div>
@@ -241,21 +435,9 @@ a{color:var(--acc)}
     </div>
   </div>
 
-  <!-- 服务 -->
-  <div class="card">
-    <h2 data-en="HTTP Server">HTTP 服务</h2>
-    <div class="fldgrid">
-      <label class="fld"><span class="t" data-en="Port (--port)">端口 (--port)</span><input type="number" id="f_port" min="1" max="65535" value="8080"></label>
-      <label class="fld"><span class="t" data-en="Worker threads (--threads)">Worker 线程 (--threads)</span><input type="number" id="f_threads" min="1" max="32" value="8"></label>
-      <label class="fld"><span class="t" data-en="Max queued (--max-queued)">最大排队 (--max-queued)</span><input type="number" id="f_max_queued" min="0" value="16"></label>
-      <label class="fld"><span class="t" data-en="Continuous batching (--batch-max, 0/1 = off, max 32)">连续批处理 (--batch-max，0/1=关，上限 32)</span><input type="number" id="f_batch_max" min="0" max="32" value="0"></label>
-      <label class="fld"><span class="t">OMP_NUM_THREADS</span><input type="text" id="f_omp" value="4"></label>
-    </div>
-  </div>
-
   <!-- 内核优化 (NEON GEMM/GEMV) -->
   <div class="card">
-    <h2 data-en="Kernel Optimization (NEON)">内核优化 (NEON)</h2>
+    <h2 class="ic-cpu" data-en="Kernel Optimization (NEON)">内核优化 (NEON)</h2>
     <div class="sec" data-en="Q8 / Q4 Layout">Q8 / Q4 布局</div>
     <div class="chkrow"><input type="checkbox" id="f_q8_8x8"><label for="f_q8_8x8"><span data-en="Q8 Prefill 8x8 tile ">Q8 Prefill 8x8 tile </span><b>(VLLM_Q8_8X8)</b><span data-en=" — on by default: GEMM 1.6x / GEMV 1.17x, bit-identical"> — 默认开：GEMM 1.6x / GEMV 1.17x，逐位一致</span></label></div>
     <div class="chkrow"><input type="checkbox" id="f_q8_repack"><label for="f_q8_repack"><span data-en="Q8 repack pre-pack ">Q8 repack 预打包 </span><b>(VLLM_DISABLE_Q8_REPACK)</b><span data-en=" — on by default; disabling falls back to the legacy layout"> — 默认开，关闭后回退 legacy 布局</span></label></div>
@@ -272,7 +454,7 @@ a{color:var(--acc)}
 
   <!-- MoE 优化 (Qwen3-30B-A3B 稀疏专家) -->
   <div class="card">
-    <h2 data-en="MoE Optimization (Sparse Experts)">MoE 优化（稀疏专家）</h2>
+    <h2 class="ic-boxes" data-en="MoE Optimization (Sparse Experts)">MoE 优化（稀疏专家）</h2>
     <div class="sec" data-en="Precision / speed track (pick one)">精度 / 速度轨（三选一）</div>
     <label class="fld"><span class="t" data-en="q4-expert compute track">q4 专家计算轨</span>
       <select id="f_moe_track">
@@ -303,7 +485,7 @@ a{color:var(--acc)}
 
   <!-- NPU -->
   <div class="card">
-    <h2 data-en="NPU Offload">NPU 卸载</h2>
+    <h2 class="ic-gauge" data-en="NPU Offload">NPU 卸载</h2>
     <div class="chkrow"><input type="checkbox" id="f_npu"><label for="f_npu" data-en="Enable NPU direct drive (--npu)">启用 NPU 直驱 (--npu)</label></div>
     <label class="fld"><span class="t" data-en="CPU load level (VLLM_NPU_LOAD)">CPU 负载档位 (VLLM_NPU_LOAD)</span>
       <select id="f_npu_load">
@@ -316,53 +498,24 @@ a{color:var(--acc)}
       <label class="fld"><span class="t">VLLM_NPU_TIMING (0/1)</span><input type="number" id="f_npu_timing" min="0" max="1" value="0"></label>
     </div>
     <div class="row">
-      <button id="btn_selftest" data-en="NPU self-test (--npu-calib)">NPU 自测 (--npu-calib)</button>
+      <button id="btn_selftest" class="ic-activity" data-en="NPU self-test (--npu-calib)">NPU 自测 (--npu-calib)</button>
     </div>
   </div>
 
   <!-- NPU 驱动 -->
   <div class="card">
-    <h2><span data-en="NPU Driver ">NPU 驱动 </span><span id="npudrvBadge" class="badge" style="margin-left:6px">未知</span></h2>
+    <h2 class="ic-wrench"><span data-en="NPU Driver ">NPU 驱动 </span><span id="npudrvBadge" class="badge" style="margin-left:6px">未知</span></h2>
     <div id="npudrvGrid" style="font-size:12px;color:var(--tx2);min-height:20px">点击「检测驱动」查看内核 / 设备节点 / DRM 驱动状态。</div>
     <div class="row">
-      <button id="btn_npudrv_check" data-en="Check driver">检测驱动</button>
-      <button id="btn_npudrv_install" data-en="Install / Repair">安装 / 修复</button>
+      <button id="btn_npudrv_check" class="ic-search" data-en="Check driver">检测驱动</button>
+      <button id="btn_npudrv_install" class="ic-wrench" data-en="Install / Repair">安装 / 修复</button>
     </div>
     <div class="msg" id="npudrvMsg"></div>
   </div>
 
-  <!-- 长上下文淘汰 (L3) -->
-  <div class="card">
-    <h2 data-en="Long-Context Eviction (L3)">长上下文淘汰 (L3)</h2>
-    <div class="chkrow"><input type="checkbox" id="f_l3_evict"><label for="f_l3_evict"><span data-en="Enable L3 cold-block eviction (--l3-evict, requires sparse attention)">启用 L3 冷块淘汰 (--l3-evict，需配合稀疏注意力)</span><span class="ptag ram" data-en="RAM saver">省 RAM</span></label></div>
-    <div class="chkrow"><input type="checkbox" id="f_l3_prefix_reuse"><label for="f_l3_prefix_reuse"><b data-en="L3 prefix-reuse gate (VLLM_L3_PREFIX_REUSE)">L3 前缀复用门 (VLLM_L3_PREFIX_REUSE)</b><span data-en=" — lets L3 eviction coexist with KV prefix reuse"> — 让 L3 驱逐与 KV 前缀复用共存</span><span class="ptag x86" data-en="x86 review −96.9%">x86 复核 −96.9%</span><span class="ptag ram" data-en="RAM saver">省 RAM</span></label></div>
-    <div class="chkrow" id="p3warn" style="display:none;color:var(--warn);font-size:12px;line-height:1.6" data-en-html="⚠ --l3-evict is on but the P3 gate is off: <code>--prefix-kv</code> is silently dropped and multi-turn follow-ups recompute the full prefill. Turn on the option above.">
-      ⚠ 已开 <code>--l3-evict</code> 但未开 P3 门：<code>--prefix-kv</code> 会被静默打掉，多轮追问将全量重算 prefill。建议开启上面这项。
-    </div>
-    <div class="fldgrid">
-      <label class="fld"><span class="t" data-en="Eviction ratio (--l3-ratio)">淘汰比例 (--l3-ratio)</span><input type="number" id="f_l3_ratio" min="0" max="0.99" step="0.05" value="0.75"></label>
-      <label class="fld"><span class="t" data-en="Trigger: minimum context length (--l3-min-seq)">触发时机: 最小上下文长度 (--l3-min-seq)</span><input type="number" id="f_l3_min_seq" min="0" value="128"></label>
-    </div>
-    <label class="fld"><span class="t" data-en="Eviction cache save path (--l3-path)">淘汰缓存保存路径 (--l3-path)</span><input type="text" id="f_l3_path" placeholder="默认 kv_l3.bin（引擎工作目录）" data-en-ph="default kv_l3.bin (engine working directory)"></label>
-    <div class="fldgrid">
-      <label class="fld"><span class="t" data-en="Max saved size MB (--l3-max-size)">最大保存大小 MB (--l3-max-size)</span><input type="number" id="f_l3_max_size" min="0" value="0"></label>
-      <label class="fld"><span class="t" data-en="Idle TTL minutes for user eviction files (--l3-user-ttl)">用户淘汰文件闲置 TTL 分钟 (--l3-user-ttl)</span><input type="number" id="f_l3_user_ttl" min="0" value="30"></label>
-    </div>
-    <div style="font-size:11px;color:var(--tx2);line-height:1.7" data-en-html='0 = always evict after prefill; N&gt;0 = start evicting when the context reaches N tokens (measured value 128; smaller means more wasted eviction overhead).<br>The path may be an eMMC mount point (e.g. /mnt/emmc/kv_l3.bin); max size 0 = unlimited.<br>Each user has an independent cache file, auto-deleted after TTL idle minutes (0 = never clean up).<br><b style="color:var(--warn)">When --l3-evict is on, be sure to also enable the P3 gate above, otherwise KV prefix reuse is silently dropped.</b>'>
-      0 = prefill 后总是淘汰；N&gt;0 = 上下文达到 N tokens 才启动淘汰（实测口径 128，越小越白付驱逐开销）。<br>
-      路径可填 eMMC 挂载点（如 /mnt/emmc/kv_l3.bin）；最大大小 0 = 不限制。<br>
-      每用户独立缓存文件，闲置超 TTL 分钟自动删除（0 = 不清理）。<br>
-      <b style="color:var(--warn)">开 --l3-evict 时务必同时开上面那项 P3 门，否则 KV 前缀复用会被静默打掉。</b>
-    </div>
-    <div class="row" style="margin-top:10px">
-      <button id="btn_l3clear" class="danger" data-en="Clear user cache">清空用户缓存</button>
-      <div class="msg" id="l3msg"></div>
-    </div>
-  </div>
-
   <!-- 有效优化组合（实测台账） -->
   <div class="card" style="grid-column:1/-1">
-    <h2><span data-en="Effective Optimization Combos (measured ledger)">有效优化组合（实测台账）</span><span class="sub" data-en="Click Apply to fill the combo into the form; all are single-flag A/B measurements on the same binary">点「套用」把该组合填进表单；全部为同一二进制单开关 A/B 实测</span></h2>
+    <h2 class="ic-table2"><span data-en="Effective Optimization Combos (measured ledger)">有效优化组合（实测台账）</span><span class="sub" data-en="Click Apply to fill the combo into the form; all are single-flag A/B measurements on the same binary">点「套用」把该组合填进表单；全部为同一二进制单开关 A/B 实测</span></h2>
     <div class="tablewrap">
     <table class="combos">
       <thead><tr>
@@ -384,53 +537,31 @@ a{color:var(--acc)}
     </div>
     <div class="msg" id="combomsg"></div>
   </div>
+  </div><!-- /tabpane perf -->
 
-  <!-- 内存驻留策略（档位阶梯 · 运行时动态） -->
+  <div class="tabpane" data-pane="server">
+  <!-- 服务 -->
   <div class="card">
-    <h2 data-en="Memory Residency Policy (level ladder · runtime dynamic)">内存驻留策略（档位阶梯 · 运行时动态）</h2>
-    <div class="sec" data-en="Current level">当前档位</div>
-    <div style="font-size:12px;line-height:1.8" id="resStatus">-</div>
-    <div class="sec" data-en="Idle auto-downgrade (model-level global idle → step down one level at a time)">空闲自动降级（模型级全局空闲 → 逐级降档）</div>
-    <div class="chkrow"><input type="checkbox" id="f_res_auto"><label for="f_res_auto" data-en="Enable idle step-by-step auto-downgrade (how long since the client interacted: full residency → KV per-layer eviction → weight window → initial layers → KV to disk + exit)">启用空闲逐级自动降级（客户多久没交互：全层驻留 → KV逐层淘汰 → 权重窗口 → 初始层 → KV落盘退出）</label></div>
-    <div class="fldgrid c2">
-      <label class="fld"><span class="t" data-en="L4→L3 KV per-layer eviction: idle wait seconds (0=stay at L4)">L4→L3 KV 逐层淘汰：空闲等待秒 (0=停在 L4)</span><input type="number" id="f_res_idle4" min="0" value="300"></label>
-      <label class="fld"><span class="t" data-en="L3→L2 weight window: idle wait seconds (0=stay at L3)">L3→L2 权重窗口：空闲等待秒 (0=停在 L3)</span><input type="number" id="f_res_idle3" min="0" value="900"></label>
-      <label class="fld"><span class="t" data-en="L2→L1 initial layers: idle wait seconds (0=stay at L2)">L2→L1 初始层：空闲等待秒 (0=停在 L2)</span><input type="number" id="f_res_idle2" min="0" value="1800"></label>
-      <label class="fld"><span class="t" data-en="L1→L0 KV to disk + unload: idle wait seconds (0=stay at L1)">L1→L0 KV落盘+卸载：空闲等待秒 (0=停在 L1)</span><input type="number" id="f_res_idle1" min="0" value="3600"></label>
-    </div>
-    <label class="fld"><span class="t" data-en="L2 weight-window resident layers w_keep (keep layers 0..N)">L2 权重窗口保留层数 w_keep（保留层 0..N）</span><input type="number" id="f_res_wkeep" min="0" value="8"></label>
-    <div class="sec" data-en="Proactive downgrade on memory pressure (soft watermark; drop one level when below)">内存紧张主动降级（软水位，低于自动降一档）</div>
+    <h2 class="ic-globe" data-en="HTTP Server">HTTP 服务</h2>
     <div class="fldgrid">
-      <label class="fld"><span class="t" data-en='Soft watermark MB (0=off; works with the "Core Config - minimum free memory" hard 503)'>软水位 MB（0=关闭；与"核心配置-最低可用内存"硬 503 配合）</span><input type="number" id="f_res_soft" min="0" value="0"></label>
-      <label class="fld"><span class="t" data-en="Lowest level allowed for auto-downgrade (0=unloadable · 3=KV eviction only · 4=no auto-downgrade)">允许自动降到的档位（0=可卸载 · 3=仅KV淘汰 · 4=不自动降）</span><input type="number" id="f_res_lowlvl" min="0" max="4" value="0"></label>
-    </div>
-    <div class="row" style="margin-top:10px">
-      <button id="btn_res_cfg" class="primary" data-en="Apply policy parameters">应用策略参数</button>
-      <button id="btn_res_l4" title="KV 全驻留 + 权重不主动释放" data-en="L4 full-layer residency" data-en-title="KV fully resident + weights not proactively released">L4 全层驻留</button>
-      <button id="btn_res_l3" title="prefill 后按重要性逐层淘汰冷块到磁盘 (需 --sparse-attn 配合自动开)" data-en="L3 KV eviction" data-en-title="After prefill, evict cold blocks to disk layer by layer by importance (auto-enabled with --sparse-attn)">L3 KV淘汰</button>
-      <button id="btn_res_l2" title="释放 layer&gt;w_keep 权重物理页 (需明文 VQF + VLLM_VQF_STREAM)" data-en="L2 weight window" data-en-title="Free physical pages of weights for layer&gt;w_keep (needs plaintext VQF + VLLM_VQF_STREAM)">L2 权重窗口</button>
-      <button id="btn_res_l1" title="从高向低释放到只剩初始层" data-en="L1 initial layers" data-en-title="Release from high to low until only the initial layers remain">L1 初始层</button>
-      <button id="btn_res_l0" class="danger" title="KV 落盘(磁盘KV开时)后整模卸载" data-en="L0 to disk + exit" data-en-title="Persist KV to disk (when disk-KV is on) then unload the whole model">L0 落盘+退出</button>
-    </div>
-    <div class="msg" id="resmsg"></div>
-    <div style="font-size:11px;color:var(--tx2);line-height:1.7" data-en-html="Level notes: <b>L4</b> full-layer residency throughout (default, fastest); <b>L3</b> KV per-layer eviction (prefix reuse is disabled when L3 is on); <b>L2</b> weight window (madvise frees physical pages, page faults auto-restore, zero numerical impact; available only with plaintext VQF + VLLM_VQF_STREAM layered mode); <b>L1</b> only the initial layers of weights remain; <b>L0</b> whole-model unload (the next request/load returns to L4 automatically). Weight levels (L2/L1) are auto-skipped straight to L0 when unavailable; upgrades/downgrades take effect immediately; upgrading only adds memory without losing context, and moving L3→L4 by turning L3 off resets the current context (recoverable when disk-KV is on).">
-      档位说明：<b>L4</b> 全程全层驻留（默认，最快）；<b>L3</b> KV 逐层淘汰（前缀复用随
-      L3 开启而关闭）；<b>L2</b> 权重窗口（madvise 释放物理页，缺页自动回驻，数值零影响，仅明文 VQF +
-      启动 VLLM_VQF_STREAM 分层模式可用）；<b>L1</b> 权重只剩初始层；<b>L0</b> 整模卸载（下次请求/加载自动回 L4）。
-      权重档（L2/L1）不可用时自动跳过直达 L0；升降档即时生效；升档只加内存不丢上下文，L3→L4 关 L3 会重置当前上下文（磁盘 KV 开时可恢复）。
+      <label class="fld"><span class="t" data-en="Port (--port)">端口 (--port)</span><input type="number" id="f_port" min="1" max="65535" value="8080"></label>
+      <label class="fld"><span class="t" data-en="Worker threads (--threads)">Worker 线程 (--threads)</span><input type="number" id="f_threads" min="1" max="32" value="8"></label>
+      <label class="fld"><span class="t" data-en="Max queued (--max-queued)">最大排队 (--max-queued)</span><input type="number" id="f_max_queued" min="0" value="16"></label>
+      <label class="fld"><span class="t" data-en="Continuous batching (--batch-max, 0/1 = off, max 32)">连续批处理 (--batch-max，0/1=关，上限 32)</span><input type="number" id="f_batch_max" min="0" max="32" value="0"></label>
+      <label class="fld"><span class="t">OMP_NUM_THREADS</span><input type="text" id="f_omp" value="4"></label>
     </div>
   </div>
 
   <!-- 可验证推理（attest） -->
   <div class="card">
-    <h2><span data-en="Verifiable Inference (attest) ">可验证推理（attest）</span><span id="attBadge" class="badge" style="margin-left:6px">未知</span></h2>
+    <h2 class="ic-shield"><span data-en="Verifiable Inference (attest) ">可验证推理（attest）</span><span id="attBadge" class="badge" style="margin-left:6px">未知</span></h2>
     <div class="chkrow"><input type="checkbox" id="f_attest"><label for="f_attest"><span data-en="Per-response attestation (VLLM_ATTEST): every chat response carries an SM2-signed receipt binding the raw request bytes and the output text">逐响应出证 (VLLM_ATTEST)：每条对话响应附 SM2 签名凭证，绑定请求原文与输出原文</span><span class="ptag" data-en="SM2-SM3">SM2-SM3</span></label></div>
     <label class="fld"><span class="t" data-en="Key / work directory (VLLM_ATTEST_DIR; default = engine cwd; key pair auto-generated on first start. Must be on a filesystem with POSIX permissions, e.g. ext4/f2fs — on vfat/exfat chmod is a no-op and the private key becomes world-readable, with a WARN logged at startup)">密钥 / 工作目录 (VLLM_ATTEST_DIR；缺省=引擎工作目录，首次启动自动生成密钥对；须放在支持 POSIX 权限的文件系统上（ext4/f2fs 等）——vfat/exfat 上 chmod 不生效，私钥会变为世界可读，启动日志打印 WARN)</span><input type="text" id="f_attest_dir" placeholder="."></label>
     <div class="sec" data-en="Device public key (128 hex, safe to publish)">设备公钥（128 hex，可对外发布）</div>
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <code id="attPub" style="word-break:break-all;font-size:11px;flex:1;min-width:240px">-</code>
-      <button id="btn_attcopy" data-en="Copy">复制</button>
-      <button id="btn_attcheck" data-en="Refresh">刷新</button>
+      <button id="btn_attcopy" class="ic-copy" data-en="Copy">复制</button>
+      <button id="btn_attcheck" class="ic-refresh" data-en="Refresh">刷新</button>
     </div>
     <div class="msg" id="attmsg"></div>
     <div style="font-size:11px;color:var(--tx2);line-height:1.7" data-en-html="Verification: the chat page (<b>/chat</b>) marks every reply with a verifiable badge — click it to recompute SM3(request bytes) + SM3(digest) and verify the SM2 signature in-browser, or export proof.json / request.json / output.txt and re-verify offline with <b>tools/security/verify_attest.py</b>. The switch takes effect after saving the config and restarting the engine.">
@@ -440,9 +571,12 @@ a{color:var(--acc)}
     </div>
   </div>
 
+  </div><!-- /tabpane server -->
+
+  <div class="tabpane" data-pane="cfglog">
   <!-- 配置与操作 -->
   <div class="card">
-    <h2 data-en="Config Management">配置管理</h2>
+    <h2 class="ic-gear" data-en="Config Management">配置管理</h2>
     <div class="sec" data-en="Startup &amp; Presets">启动与预设</div>
     <div class="chkrow"><input type="checkbox" id="f_auto_start"><label for="f_auto_start" data-en="Auto start (supervisor starts the engine and loads the model when it detects it is not running)">自动启动 (supervisor 检测到引擎未运行时自动拉起并加载模型)</label></div>
     <label class="fld" style="margin-top:8px"><span class="t" data-en="Quick combo optimization (presets fill the optimization switches below in one click)">快速组合优化（预设一键填充下方优化开关）</span>
@@ -456,13 +590,13 @@ a{color:var(--acc)}
         <option value="long" data-en="Long context + multi-turn: sparse attention + L3 cold-block eviction + P3 prefix-reuse gate (required, decode 3× faster)">长上下文 + 多轮: 稀疏注意力 + L3 冷块淘汰 + P3 前缀复用门（必备，decode 快 3 倍）</option>
       </select></label>
     <div class="row">
-      <button id="btn_preset" data-en="Apply preset">应用预设</button>
+      <button id="btn_preset" class="ic-zap" data-en="Apply preset">应用预设</button>
       <div class="msg" id="presetmsg"></div>
     </div>
     <div class="sec" data-en="Persistence">持久化</div>
     <div class="row">
-      <button id="btn_loadcfg" data-en="Load current config">载入当前配置</button>
-      <button id="btn_savecfg" class="primary" data-en="Save config">保存配置</button>
+      <button id="btn_loadcfg" class="ic-download" data-en="Load current config">载入当前配置</button>
+      <button id="btn_savecfg" class="primary ic-save" data-en="Save config">保存配置</button>
     </div>
     <div class="msg" id="cfgmsg"></div>
   </div>
@@ -471,9 +605,9 @@ a{color:var(--acc)}
 
   <!-- 日志 -->
   <div class="card" style="grid-column:1/-1">
-    <h2 style="display:flex;align-items:center;gap:10px"><span data-en="Engine Log ">引擎日志 </span><span id="logMeta" style="color:var(--tx2);font-weight:400"></span>
+    <h2 class="ic-file" style="display:flex;align-items:center;gap:10px"><span data-en="Engine Log ">引擎日志 </span><span id="logMeta" style="color:var(--tx2);font-weight:400"></span>
       <span style="flex:1"></span>
-      <button id="btn_logpause" style="padding:3px 10px;font-size:12px">暂停</button>
+      <button id="btn_logpause" class="ic-pause" style="padding:3px 10px;font-size:12px">暂停</button>
     </h2>
     <div class="logfilters" id="logFilters">
       <button data-lv="" class="on"><span data-en="All ">全部 </span><span class="lc" id="cnt_all">0</span></button>
@@ -484,6 +618,7 @@ a{color:var(--acc)}
     </div>
     <div id="log"></div>
   </div>
+  </div><!-- /tabpane cfglog -->
 </main>
 <footer><span data-en="vLLM-Kestrel management · Config saved at ">vLLM-Kestrel management · 配置保存在 </span><span id="cfgPath">-</span><span data-en=" · When the engine is not running, start supervisor first, then use &quot;Start Engine&quot; on this page"> · 引擎未运行时请启动 supervisor 后使用本页"启动引擎"</span></footer>
 
@@ -742,6 +877,7 @@ async function loadStatus(){
     $("cfgPath").textContent = s.config_path || "-";
     resRender(s.res);   /* 内存驻留策略：状态 + 表单回填 */
     renderLoadBar(s);
+    collabRender(s.collab);   /* K-ADMIN-002：组件状态灯 + 开关 */
     const mi = $("modelInfo");
     if (s.load_state === 2) mi.textContent = "✓ " + (s.model_name || s.model_id || T("已加载", "loaded"));
     else if (s.load_state === 1) mi.textContent = T("加载中…", "Loading…");
@@ -767,6 +903,73 @@ async function loadStatus(){
   }
   applyLang();
   return ok;
+}
+
+/* ---------- K-ADMIN-002：协作组件状态灯 + 启用/停用开关（保存配置 → 重启生效） ----------
+ * 只读状态来自 /admin/api/status 的 collab 字段；开关只 patch 单个配置键，
+ * 由 supervisor 重启引擎生效——不新增任何运行时动态加载/卸载 API。 */
+function collabBadge(id, txt, cls){ const el=$(id); if(!el) return; el.textContent=txt; el.className="badge "+cls; }
+function collabRender(c){
+  if(!c) return;
+  /* 向量（embed）：未配置 = 复用主模型，不是"停用"，显式警示避免静默降级误读 */
+  const e=c.embed||{};
+  if(e.failed) collabBadge("cst_embed", T("加载失败","load failed"), "bad");
+  else if(e.loaded) collabBadge("cst_embed", T("专用·已加载","dedicated · loaded"), "ok");
+  else if(e.enabled) collabBadge("cst_embed", T("专用·未加载","dedicated · not loaded"), "warn");
+  else collabBadge("cst_embed", T("复用主模型","falls back to main model"), "stop");
+  const we=$("warn_embed");
+  if(we){
+    if(!e.enabled){
+      we.style.display="";
+      we.textContent=T("未配置专用向量模型：RAG 检索将复用主模型出向量，检索质量下降（这是回退，不是停用）。",
+                       "No dedicated embedding model: RAG falls back to the main model for vectors — lower retrieval quality (a fallback, not a disable).");
+    } else we.style.display="none";
+  }
+  const be=$("cb_embed");
+  if(be){
+    be.textContent = e.enabled ? T("切回复用主模型","Fall back to main model") : T("配置专用向量模型 →","Configure dedicated model →");
+    be.onclick = e.enabled ? ()=>collabDisable("embed_model","embed") : ()=>{location.href="/admin/kb";};
+  }
+  /* Laya */
+  const l=c.laya||{};
+  if(l.loaded) collabBadge("cst_laya", T("已加载","loaded"), "ok");
+  else if(l.enabled) collabBadge("cst_laya", T("已启用·未加载","enabled · not loaded"), "warn");
+  else collabBadge("cst_laya", T("未启用","disabled"), "stop");
+  const bl=$("cb_laya");
+  if(bl){
+    bl.textContent = l.enabled ? T("停用","Disable") : T("启用 →","Enable →");
+    bl.onclick = l.enabled ? ()=>collabDisable("laya_pack","laya") : ()=>{location.href="/admin/laya";};
+  }
+  /* YOLO */
+  const y=c.yolo||{};
+  if(y.loaded) collabBadge("cst_yolo", T("已加载","loaded"), "ok");
+  else if(y.enabled) collabBadge("cst_yolo", T("已启用·未加载","enabled · not loaded"), "warn");
+  else collabBadge("cst_yolo", T("未启用","disabled"), "stop");
+  const by=$("cb_yolo");
+  if(by){
+    by.textContent = y.enabled ? T("停用","Disable") : T("启用 →","Enable →");
+    by.onclick = y.enabled ? ()=>collabDisable("yolo_model","yolo") : ()=>{location.href="/admin/yolo";};
+  }
+}
+/* 停用 / 切回复用：只 patch 单个键 → 保存 → 询问是否重启生效 */
+async function collabDisable(key, which){
+  const isEmbed = which==="embed";
+  const q = isEmbed
+    ? T("切换回「复用主模型」？\n注意：这不是停用——RAG 检索将改用主模型出向量，检索质量会下降。\n保存后需重启引擎生效。",
+        "Switch back to 'falls back to the main model'?\nNote: this is NOT a disable — RAG retrieval will use the main model for vectors and quality drops.\nRestart the engine to apply.")
+    : T("停用该组件？\n该组件端点将返回 404（显式报错，不静默降级）。\n保存后需重启引擎生效。",
+        "Disable this component?\nIts endpoint will return 404 (explicit error, no silent fallback).\nRestart the engine to apply.");
+  if(!confirm(q)) return;
+  const patch = {}; patch[key] = "";
+  try {
+    const r = await eng("/admin/api/config/patch", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify(patch)
+    });
+    if(!r.ok){ alert(T("保存失败: ","Save failed: ")+(r.error||"")); return; }
+    if(confirm(T("已保存（需重启引擎生效）。是否立即重启？","Saved (restart required to apply). Restart the engine now?"))) opRestart();
+    else loadStatus();
+  } catch(err){ alert(T("请求失败: ","Request failed: ")+err); }
 }
 
 /* ---------- config ---------- */
@@ -1561,6 +1764,25 @@ applyLang();
 })();
 setInterval(loadStatus, 5000);
 setInterval(() => { $("clock").textContent = new Date().toLocaleString(); }, 1000);
+</script>
+<script>
+/* ---- 顶部分类选项卡切换（纯表现层；不触碰上方主脚本逻辑） ---- */
+(function(){
+  var KEY = "vllm_admtab";
+  var btns = document.querySelectorAll(".tabbtn");
+  var panes = document.querySelectorAll(".tabpane");
+  function show(name){
+    btns.forEach(function(b){ b.classList.toggle("on", b.dataset.tab === name); });
+    panes.forEach(function(p){ p.classList.toggle("show", p.dataset.pane === name); });
+    try { localStorage.setItem(KEY, name); } catch(e){}
+    window.scrollTo(0, 0);
+  }
+  btns.forEach(function(b){ b.onclick = function(){ show(b.dataset.tab); }; });
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch(e){}
+  var valid = Array.prototype.some.call(btns, function(b){ return b.dataset.tab === saved; });
+  show(valid ? saved : "overview");
+})();
 </script>
 </body>
 </html>

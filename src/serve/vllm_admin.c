@@ -685,6 +685,40 @@ static void handle_admin_status(const VLLMServerCtx *ctx, VHttpResponse *resp) {
     json_put_str(o, "audit_log", ctx->audit_log);
     vjson_obj_set(o, "rulebook_hits", vjson_new_number((double)ctx->rulebook_hits));
     vjson_obj_set(o, "session_turns", vjson_new_number((double)ctx->session_turns));
+    /* K-ADMIN-002：协作组件（向量/Laya/YOLO）运行态——只读，供管理页状态灯与开关。
+     * enabled = 启动参数已配；loaded = 运行态句柄已建（Laya/YOLO 首次请求懒加载，
+     * 故 loaded 可滞后 enabled）。embed 未配置专用模型 = 复用主模型（非"停用"），
+     * 用 mode 区分，避免被误读为静默降级（K-COLLAB-001 §13.2）。 */
+    {
+        VJson *collab = vjson_new_object();
+
+        int e_cfg = 0, e_ld = 0, e_fa = 0;
+        vllm_collab_embed_state(ctx, &e_cfg, &e_ld, &e_fa);
+        VJson *e = vjson_new_object();
+        vjson_obj_set(e, "enabled", vjson_new_bool(e_cfg));
+        vjson_obj_set(e, "loaded", vjson_new_bool(e_ld));
+        vjson_obj_set(e, "failed", vjson_new_bool(e_fa));
+        json_put_str(e, "mode", e_cfg ? "dedicated" : "fallback_main");
+        json_put_str(e, "path", e_cfg ? ctx->embed_model_dir : "");
+        vjson_obj_set(collab, "embed", e);
+
+        int l_en = (ctx->laya_pack && ctx->laya_pack[0]) ? 1 : 0;
+        VJson *l = vjson_new_object();
+        vjson_obj_set(l, "enabled", vjson_new_bool(l_en));
+        vjson_obj_set(l, "loaded", vjson_new_bool(l_en && vllm_collab_laya_loaded()));
+        json_put_str(l, "path", ctx->laya_pack ? ctx->laya_pack : "");
+        vjson_obj_set(collab, "laya", l);
+
+        int y_en = (ctx->yolo_model && ctx->yolo_model[0]) ? 1 : 0;
+        VJson *y = vjson_new_object();
+        vjson_obj_set(y, "enabled", vjson_new_bool(y_en));
+        vjson_obj_set(y, "loaded", vjson_new_bool(y_en && vllm_collab_yolo_loaded()));
+        json_put_str(y, "backend", ctx->yolo_backend == 1 ? "rknn" : "vqf");
+        json_put_str(y, "path", ctx->yolo_model ? ctx->yolo_model : "");
+        vjson_obj_set(collab, "yolo", y);
+
+        vjson_obj_set(o, "collab", collab);
+    }
     admin_json_reply(resp, o);
 }
 

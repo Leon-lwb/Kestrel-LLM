@@ -336,6 +336,16 @@ int vllm_serve_load_on_use(VLLMServerCtx *ctx);
  * Impl in vllm_server.c。 */
 int vllm_serve_embed_text(VLLMServerCtx *ctx, const char *txt, float *out);
 
+/* K-ADMIN-002：协作组件（向量/Laya/YOLO）运行态**只读**查询，供管理页状态显示。
+ * 语义：configured/enabled = 启动参数是否已配置；loaded = 运行态句柄是否已建立
+ * （Laya/YOLO 为首次请求懒加载，故 loaded 可能滞后于 enabled）。
+ * 实现持各自锁读取句柄后立即释放（无内存分配、不触发懒加载），对推理热路径零影响。
+ * embed 特例：未配置专用模型 = 复用主模型（并非"停用"），由 mode 字段表达。 */
+void vllm_collab_embed_state(const VLLMServerCtx *ctx,
+                             int *configured, int *loaded, int *failed);
+int  vllm_collab_laya_loaded(void);
+int  vllm_collab_yolo_loaded(void);
+
 /* Free the server-side session state tied to the loaded model: continuous
  * batching scheduler, the in-RAM prefix-KV sequence (last_ids) and the disk
  * KV index. Call on unload so no stale context survives a reload. */

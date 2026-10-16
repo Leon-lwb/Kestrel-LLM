@@ -4,25 +4,25 @@
 
 #include <stddef.h>
 
-/* embedded admin.html (116345 bytes) */
+/* embedded admin.html (139920 bytes) */
 const char *embedded_admin_html(size_t *len);
 
-/* embedded chat.html (46043 bytes) */
+/* embedded chat.html (54690 bytes) */
 const char *embedded_chat_html(size_t *len);
 
-/* embedded review.html (32693 bytes) */
+/* embedded review.html (45095 bytes) */
 const char *embedded_review_html(size_t *len);
 
-/* embedded kb.html (15381 bytes) */
+/* embedded kb.html (28521 bytes) */
 const char *embedded_kb_html(size_t *len);
 
-/* embedded laya.html (6092 bytes) */
+/* embedded laya.html (17157 bytes) */
 const char *embedded_laya_html(size_t *len);
 
-/* embedded yolo.html (20044 bytes) */
+/* embedded yolo.html (32700 bytes) */
 const char *embedded_yolo_html(size_t *len);
 
-/* embedded cloud.html (7772 bytes) */
+/* embedded cloud.html (14343 bytes) */
 const char *embedded_cloud_html(size_t *len);
 
 #endif /* VLLM_EMBEDDED_WEB_H */
