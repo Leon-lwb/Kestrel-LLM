@@ -1,8 +1,8 @@
-# Kestrel（红隼）— ARM(aarch64) 边缘 LLM 推理引擎（RK3588 开发基准）
+# Kestrel（红隼）— ARM(aarch64) 边缘多模型推理引擎（RK3588 开发基准）
 
 [English](README.en.md) | **简体中文**
 
-**纯 C11、零第三方运行时依赖的 ARM（aarch64）CPU LLM 推理引擎。**
+**纯 C11、零第三方运行时依赖的 ARM（aarch64）CPU 多模型推理引擎（LLM / MoE / 向量嵌入 / 决策 / 检测）。**
 
 > **版本：v1.0（测试版 / test release）**。相对上一个公开版本（v0）的主要变化见文末
 > 「v1.0 变更摘要」。文中性能/体积数字按版本分区：**未标注版本的数字为 v1.0 板端实测
@@ -33,17 +33,21 @@
 
 ## 核心优势
 
-一块 ARM 开发板（示例：RK3588 / Orange Pi 5 Plus）+ 一个约 **0.8 MB** 的单文件可执行程序
-= 原生 LLM 推理服务：**自研 VQF v2 权重单文件 mmap 直挂、按需建页**，原生跑 Qwen3-VL
-2B/8B 纯文本与图片/视频多模态，OpenAI 兼容 HTTP API 即刻可用。
+一块 ARM 开发板（示例：RK3588 / Orange Pi 5 Plus）+ 一个约 **1.4 MB** 的单文件可执行程序
+= 原生多模型推理服务：**自研 VQF 权重单文件 mmap 直挂、按需建页**，同一进程承载
+**五类模型**——Qwen3-VL 2B/8B（文本 + 图片/视频）、Qwen3-30B-A3B（MoE）、
+Qwen3-Embedding-0.6B（向量）、Laya（决策）、YOLO v5/v8/v11（检测），
+OpenAI 兼容 HTTP API 与 `/v1/ask` 统一联合入口即刻可用。
 
 | 核心优势 | 一句话指标 |
 |---|---|
+| **五类模型同进程承载** | Qwen3-VL 2B/8B（文本 + 图/视频）、Qwen3-30B-A3B（MoE）、Qwen3-Embedding-0.6B（向量）、Laya（决策）、YOLO v5/v8/v11（检测）。**同一个二进制**；各模型占独立槽位（`--model` / `--embed-model` / `--laya-pack` / `--yolo-model`），可同进程共存、按端点切换，无需为每类模型各带一套运行时 |
+| **统一联合入口 `/v1/ask`** | 一个端点编排四条链，**只认显式字段、不做语义猜测**：带 `image` → scene（YOLO→场景叙事→LLM）、带 `kb_dir` → rag（embedding→top-k→LLM）、带 `questions` → decide（Laya）、否则 → chat；响应回带 `route` 字段说明本次由哪条链作答。可选 `VLLM_ROUTE_POLICY` 策略文件把「仅 `query`」的请求交给 Laya 做语义路由 |
 | **逐层推理**（v1 新增） | 权重常驻与模型体积解耦：**8B 权重常驻 4.19 GB → 0.48 GB（8.7×）**，serve 峰值 **0.82 GB**；远程复测热态 **TTFT 1.73 s / tpot 330 ms**（5 次同请求中位数，见「性能」§4） |
 | **长文本与多轮** | 组合①（L3 驱逐 × 前缀复用）追问轮 prefill **−80% ~ −96%**；30B 再叠 MoE 组合⑤后 t2/t3 仅 **4.7 s / 3.2 s** |
 | **规则包（预置上下文）** | 现场规程 / 术语 / 参数这类**反复使用**的固定手册离线构建成可复用前缀：短手册（5,791 token）命中 **≈82×**（194.3 s → 2.4 s）；**>8K token 手册不落盘**，退回全量 prefill（见 wiki「规则包与预置上下文」） |
 | **稀疏注意力长度门控** | `--sparse-min-ctx`（decode，默认 1024）/ `--sparse-pf-min-ctx`（prefill，默认 3072）。**decode 侧**加门后自 4K 起单调转正：**4K 1.58× / 8K 2.16× / 16K 2.92×**（2B，见 wiki「优化配置与边界」；2026-09-30 板端 8B 复测为 **1.54×**）。**prefill 侧**才是要命的那条：相对精确 prefill 在 ctx 1067 时仍 **+18.4%**，4.4K 才转正（−11.1%）、8.6K −29.0%、16K −45.1%。两条轴**默认都关** |
-| **纯自研格式与内核** | 只认自研 VQF v2 单文件；单产物 **≈0.8 MB**，零第三方运行时；手写 NEON 量化 GEMM/GEMV、自研线程池、自研国密 |
+| **纯自研格式与内核** | 只认自研 VQF 单文件；单产物 **≈1.4 MB**，零第三方运行时；手写 NEON 量化 GEMM/GEMV、自研线程池、自研国密 |
 | **可验证推理** | SM2 供应链签名护权重 + 逐请求 attestation 凭证（schema 3），浏览器内 / 离线零依赖验签 |
 
 ### 逐层推理内存优势（举例）
@@ -485,6 +489,13 @@ curl http://<board>:8080/v1/models
 curl http://<board>:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3-vl","messages":[{"role":"user","content":"你好"}],"max_tokens":64}'
+
+# 统一联合入口（四链按显式字段路由：image→scene / kb_dir→rag / questions→decide / 否则 chat）
+curl http://<board>:8080/v1/ask \
+  -H "Content-Type: application/json" \
+  -d '{"query":"这份手册里散热片的告警阈值是多少？","kb_dir":"<kb-dir>","top_k":3}'
+# 响应回带 "route":"chat" / "rag" / "scene" / "decide"，标明本次由哪条链作答
+# （启用 VLLM_ROUTE_POLICY 时还可能是 "local" / "escalate"）
 ```
 
 - 管理页 / 对话页：`http://<board>:8080/admin/` 、`http://<board>:8080/chat/`
@@ -618,6 +629,10 @@ gcc -O2 -fopenmp -Wno-implicit-function-declaration '-Wl,--stack,33554432' \
 >   后三者为新一轮新增，其适配与优化全过程（含实测数据与复现口径）见
 >   [docs/tutorial/01-总览.md](docs/tutorial/01-总览.md)。
 >
+> **端点对应**：`/v1/chat/completions`（chat，MoE 同走此端点）、`/v1/embeddings`（向量）、
+> `/v1/systemone`（Laya 决策）、`/v1/detect`（YOLO 检测）；编排入口为 `/v1/scene`
+> （感知→叙事→LLM）、`/v1/rag`（检索→LLM）与 `/v1/ask`（按显式字段路由到上述四条链）。
+>
 > **其他架构（Llama、旧版 Qwen / Qwen2 纯文本等）未经适配与验证**：转换可能报错或
 > 输出不可用，请勿据此推定为通用推理引擎。
 >
@@ -639,7 +654,7 @@ gcc -O2 -fopenmp -Wno-implicit-function-declaration '-Wl,--stack,33554432' \
 
 | 项 | 数值 / 口径 |
 |---|---|
-| 可执行文件 | `vllm_kestrel` ≈ **0.8 MB**（RK3588 Release, `-O2 -s`，板端实测 818,872 B，v0 测点）；`-DVLLM_STATIC=ON` 全静态 ≈ 1.5 MB，`ldd` 零 .so 依赖 |
+| 可执行文件 | `vllm_kestrel` ≈ **1.4 MB**（RK3588 Release, `-O2 -s`，v1 板端实测 **1,469,808 B**，三份二进制一致；v0 测点为 818,872 B）；`-DVLLM_STATIC=ON` 全静态 ≈ 1.5 MB（v0 测点，v1 未复测），`ldd` 零 .so 依赖 |
 | 源码 | **28 个 C 文件**（main + core 11 + common 2 + serve 6 + model 6 + npu 2），C11，单工程单产物 |
 | 运行时依赖 | **无第三方运行时**——标准构建仅需 gcc + libm（`-fopenmp` 仅 NPU pack 并行区使用 libgomp，系 gcc 自带；全静态构建一并内联，零 .so） |
 | 代码内第三方 | 仅 `stb_image.h`（MIT, Sean Barrett）与 llama.cpp 派生 4x4 asm 内核（MIT, The ggml authors），见 [LICENSING.md](LICENSING.md) 第三节 |
@@ -722,7 +737,7 @@ gcc -O2 -fopenmp -Wno-implicit-function-declaration '-Wl,--stack,33554432' \
 | [docs/投机解码瓶颈分析与MTP落地方案.md](docs/投机解码瓶颈分析与MTP落地方案.md) | 投机解码瓶颈分析与 MTP 落地路线 |
 | [docs/逐层驻留专家级读取方案.md](docs/逐层驻留专家级读取方案.md) | 逐层驻留下的 MoE 专家级权重读取方案 |
 | [docs/落地台账.md](docs/落地台账.md) | **单一真源台账**：门（env）默认值 / 语义 / 取证位置，立项清单与门禁进度、默认化判定（`perf_axiom_single_source_ledger_v1`）；与正文冲突时以本表为准 |
-| [docs/tutorial/01-总览.md](docs/tutorial/01-总览.md) | **三类模型接入与优化教程**（向量嵌入 / Laya 决策 / YOLO 检测；「原理+实测数据+复现口径」，共 7 篇：适配与优化各半） |
+| [docs/tutorial/01-总览.md](docs/tutorial/01-总览.md) | **新增三类模型接入与优化教程**（向量嵌入 / Laya 决策 / YOLO 检测；「原理+实测数据+复现口径」，共 7 篇：适配与优化各半） |
 | [docs/K-BENCH-*.md](docs/K-BENCH-017-板端8B-vllm-vs-llamacpp对比.md) | **板端基准报告**：8B vs llama.cpp（K-BENCH-017）、MoE-30B-A3B（018）、2B Qwen3-VL vs llama.cpp（019）、多模态 2B/8B（020） |
 | [docs/K-EMB-001-*.md](docs/K-EMB-001-句子向量嵌入-Qwen3-Embedding-0.6B适配与byte-level-BPE分词器.md) | 句子向量嵌入 Qwen3-Embedding-0.6B 适配（含引擎分词器改造为 byte-level BPE） |
 | [docs/K-LAYA-001-*.md](docs/K-LAYA-001-非自回归决策模型-Laya-ModernBERT适配.md) | 非自回归决策模型 Laya（ModernBERT-large + 决策头）适配 |
@@ -745,7 +760,7 @@ gcc -O2 -fopenmp -Wno-implicit-function-declaration '-Wl,--stack,33554432' \
 - **纯 VQF 运行时**：引擎只加载单文件 VQF v2（mmap 直挂），删除内置的 GGUF /
   safetensors 加载与引擎内转换路径；转换职责移交随版发布的独立工具 **`vqf_convert/`**。
 - **源码瘦身**：随纯 VQF 运行时移除 `vllm_gguf.c/.h` 与 `convert.html` 等遗留件；
-  单产物仍约 0.8 MB；`CMakeLists.txt` 版本号提升至 `VERSION 1.0.0`。
+  单产物约 **1.4 MB**（板端实测 1,469,808 B）；`CMakeLists.txt` 版本号提升至 `VERSION 1.0.0`。
 - **x86_64 分支随版**：`vllm_platform.h` 提供 x86-64（MinGW/MSVC）移植层；新增
   `tools/build/build_x64.ps1` / `tools/build/check_x64.ps1`（已参数化，`VLLM_GCC` /
   `VLLM_X64_OUTDIR` 可覆盖）。**x86 仅供功能自检与数值一致性对照，不作性能基准。**

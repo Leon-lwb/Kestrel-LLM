@@ -1,8 +1,8 @@
-# Kestrel — ARM (aarch64) Edge LLM Inference Engine (RK3588 Development Baseline)
+# Kestrel — ARM (aarch64) Edge Multi-Model Inference Engine (RK3588 Development Baseline)
 
 [简体中文](README.md) | **English**
 
-**A pure-C11, zero-third-party-runtime LLM inference engine for ARM (aarch64) CPUs.**
+**A pure-C11, zero-third-party-runtime multi-model inference engine for ARM (aarch64) CPUs (LLM / MoE / embeddings / decision / detection).**
 
 > **Version: v1.0 (test release).** For the diff against the previous public version (v0), see
 > "v1.0 Change Summary" at the end. Performance/size figures in this document are partitioned
@@ -39,18 +39,22 @@
 
 ## Core Strengths
 
-One ARM board (e.g. RK3588 / Orange Pi 5 Plus) + one ~**0.8 MB** single-binary executable
-= a native LLM inference service: **the in-house VQF v2 weight file is mmap-mounted and paged
-in on demand**, Qwen3-VL 2B/8B run natively for text plus image/video input, and an
-OpenAI-compatible HTTP API is available immediately.
+One ARM board (e.g. RK3588 / Orange Pi 5 Plus) + one ~**1.4 MB** single-binary executable
+= a native multi-model inference service: **the in-house VQF weight file is mmap-mounted and
+paged in on demand**, and a single process carries **five model families** — Qwen3-VL 2B/8B
+(text + image/video), Qwen3-30B-A3B (MoE), Qwen3-Embedding-0.6B (embeddings), Laya (decision)
+and YOLO v5/v8/v11 (detection) — with an OpenAI-compatible HTTP API and the `/v1/ask`
+unified entry point available immediately.
 
 | Strength | One-line metric |
 |---|---|
+| **Five model families in one process** | Qwen3-VL 2B/8B (text + image/video), Qwen3-30B-A3B (MoE), Qwen3-Embedding-0.6B (embeddings), Laya (decision), YOLO v5/v8/v11 (detection). **One binary**; each model gets its own slot (`--model` / `--embed-model` / `--laya-pack` / `--yolo-model`) and they can coexist in one process, switched by endpoint — no separate runtime per model family |
+| **Unified entry point `/v1/ask`** | One endpoint orchestrates four chains and **routes only on explicit fields, never by semantic guessing**: `image` → scene (YOLO → scene narration → LLM), `kb_dir` → rag (embedding → top-k → LLM), `questions` → decide (Laya), otherwise → chat; the reply carries a `route` field naming the chain that answered. An optional `VLLM_ROUTE_POLICY` file hands "`query`-only" requests to Laya for semantic routing |
 | **Per-layer residency** (new in v1) | Resident memory decoupled from model size: **8B resident weights 4.19 GB → 0.48 GB (8.7×)**, serve peak **0.82 GB**; warm, remotely re-measured **TTFT 1.73 s / tpot 330 ms** (median of 5 identical requests, see "Performance" §4) |
 | **Long text and multi-turn** | Combo ① (L3 eviction × prefix reuse) cuts follow-up-turn prefill by **−80% ~ −96%**; with MoE combo ⑤ the 30B reaches **4.7 s / 3.2 s** for t2/t3 |
 | **Rulebook (pre-set context)** | A fixed, repeatedly used handbook (field SOPs, terminology, process parameters) is built offline into a reusable prefix: short handbooks (5,791 tokens) hit **≈82×** (194.3 s → 2.4 s); handbooks **over 8K tokens are not snapshotted** and fall back to full prefill (see wiki `规则包与预置上下文`) |
 | **Sparse-attention context gating** | `--sparse-min-ctx` (decode, default 1024) / `--sparse-pf-min-ctx` (prefill, default 3072). **Decode side**: with the gates in place it turns positive from 4K up — **1.58× at 4K / 2.16× at 8K / 2.92× at 16K** (2B, see wiki `优化配置与边界`; a 2026-09-30 board re-test on 8B measured **1.54×**). **Prefill side** is the dangerous one: against exact prefill it still *costs* **+18.4% at ctx 1067**, crossing over only at 4.4K (−11.1%), then −29.0% at 8.6K and −45.1% at 16K. Both axes default **off** |
-| **In-house format and kernels** | Only the in-house VQF v2 single file; single ~0.8 MB binary, zero third-party runtime; hand-written NEON quantized GEMM/GEMV, own thread pool, own SM2/SM3/SM4 |
+| **In-house format and kernels** | Only the in-house VQF single file; single ~**1.4 MB** binary, zero third-party runtime; hand-written NEON quantized GEMM/GEMV, own thread pool, own SM2/SM3/SM4 |
 | **Verifiable inference** | SM2 supply-chain signature protects weights + per-request attestation proof (schema 3), verified in-browser or offline with zero dependencies |
 
 ### The memory advantage of per-layer residency (worked example)
@@ -507,6 +511,13 @@ curl http://<board>:8080/v1/models
 curl http://<board>:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3-vl","messages":[{"role":"user","content":"hello"}],"max_tokens":64}'
+
+# Unified entry point (four chains routed on explicit fields: image→scene / kb_dir→rag / questions→decide / else chat)
+curl http://<board>:8080/v1/ask \
+  -H "Content-Type: application/json" \
+  -d '{"query":"What is the heatsink alarm threshold in this manual?","kb_dir":"<kb-dir>","top_k":3}'
+# The reply carries "route":"chat" / "rag" / "scene" / "decide", naming the chain that answered
+# (with VLLM_ROUTE_POLICY enabled it can also be "local" / "escalate")
 ```
 
 - Admin console / chat page: `http://<board>:8080/admin/` and `http://<board>:8080/chat/`
@@ -644,6 +655,11 @@ attestation**:
 >   The latter three are new in this round; the full adaptation and optimization process (with
 >   measured data and reproduction basis) is in [docs/tutorial/01-总览.md](docs/tutorial/01-总览.md).
 >
+> **Endpoint mapping**: `/v1/chat/completions` (chat; MoE uses the same endpoint),
+> `/v1/embeddings` (embeddings), `/v1/systemone` (Laya decision), `/v1/detect` (YOLO detection);
+> the orchestration entry points are `/v1/scene` (perception → narration → LLM), `/v1/rag`
+> (retrieval → LLM) and `/v1/ask` (routes to the four chains above on explicit fields).
+>
 > **Other architectures (Llama, older Qwen / Qwen2 text models, etc.) are neither adapted nor
 > validated**: conversion may fail or produce unusable output — do not treat this as a
 > general-purpose inference engine.
@@ -670,7 +686,7 @@ attestation**:
 
 | Item | Value / basis |
 |---|---|
-| Executable | `vllm_kestrel` ≈ **0.8 MB** (RK3588 Release, `-O2 -s`, board-measured 818,872 B, v0 measurement); `-DVLLM_STATIC=ON` fully static ≈ 1.5 MB, `ldd` reports zero .so dependencies |
+| Executable | `vllm_kestrel` ≈ **1.4 MB** (RK3588 Release, `-O2 -s`, board-measured **1,469,808 B** on v1, identical across three binaries; the v0 measurement was 818,872 B); `-DVLLM_STATIC=ON` fully static ≈ 1.5 MB (v0 measurement, not re-measured on v1), `ldd` reports zero .so dependencies |
 | Source | **28 C files** (main + core 11 + common 2 + serve 6 + model 6 + npu 2), C11, one project one artifact |
 | Runtime dependencies | **None** — a standard build needs only gcc + libm (`-fopenmp` is used only for the NPU pack parallel region via libgomp, which ships with gcc; fully static builds inline it too, zero .so) |
 | Third-party code inside | Only `stb_image.h` (MIT, Sean Barrett) and the llama.cpp-derived 4x4 asm kernel (MIT, The ggml authors); see [LICENSING.md](LICENSING.md) section 3 |
@@ -760,7 +776,7 @@ third-party project runtime is ever shipped with the engine.
 | [docs/投机解码瓶颈分析与MTP落地方案.md](docs/投机解码瓶颈分析与MTP落地方案.md) | Speculative-decoding bottleneck analysis and the MTP landing plan |
 | [docs/逐层驻留专家级读取方案.md](docs/逐层驻留专家级读取方案.md) | Expert-grained MoE weight reads under per-layer residency |
 | [docs/落地台账.md](docs/落地台账.md) | **Single-source ledger**: env-gate defaults / semantics / provenance, project list with gate progress and defaulting verdicts (`perf_axiom_single_source_ledger_v1`); takes precedence over the main text on conflict |
-| [docs/tutorial/01-总览.md](docs/tutorial/01-总览.md) | **Three-model onboarding + optimization tutorial** (embedding / Laya decision / YOLO detection; "principles + measured data + reproduction basis", 7 parts: adaptation and optimization) |
+| [docs/tutorial/01-总览.md](docs/tutorial/01-总览.md) | **New three-model onboarding + optimization tutorial** (embedding / Laya decision / YOLO detection; "principles + measured data + reproduction basis", 7 parts: adaptation and optimization) |
 | [docs/K-BENCH-*.md](docs/K-BENCH-017-板端8B-vllm-vs-llamacpp对比.md) | **Board-side benchmark reports**: 8B vs llama.cpp (K-BENCH-017), MoE-30B-A3B (018), 2B Qwen3-VL vs llama.cpp (019), multimodal 2B/8B (020) |
 | [docs/K-EMB-001-*.md](docs/K-EMB-001-句子向量嵌入-Qwen3-Embedding-0.6B适配与byte-level-BPE分词器.md) | Sentence-embedding Qwen3-Embedding-0.6B adaptation (including the byte-level BPE tokenizer rework) |
 | [docs/K-LAYA-001-*.md](docs/K-LAYA-001-非自回归决策模型-Laya-ModernBERT适配.md) | Non-autoregressive decision model Laya (ModernBERT-large + decision head) adaptation |
@@ -778,8 +794,8 @@ third-party project runtime is ever shipped with the engine.
   GGUF / safetensors loading and conversion were removed and moved to the shipped standalone
   tool **`vqf_convert/`**.
 - **Source slimming**: `vllm_gguf.c/.h`, `convert.html` and other leftovers were removed along
-  with the pure-VQF runtime; the single artifact is still about 0.8 MB; `CMakeLists.txt` was
-  bumped to `VERSION 1.0.0`.
+  with the pure-VQF runtime; the single artifact is about **1.4 MB** (board-measured 1,469,808 B);
+  `CMakeLists.txt` was bumped to `VERSION 1.0.0`.
 - **x86_64 branch shipped**: `vllm_platform.h` provides an x86-64 (MinGW/MSVC) portability
   layer; `tools/build/build_x64.ps1` / `tools/build/check_x64.ps1` were added (parameterized, overridable
   via `VLLM_GCC` / `VLLM_X64_OUTDIR`). **x86 is for functional self-test and numerical-consistency
